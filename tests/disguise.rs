@@ -197,6 +197,78 @@ async fn disguise_preserves_array_form_system_with_cache_control() {
     upstream_mock.assert_async().await;
 }
 
+#[tokio::test]
+async fn disguise_upgrades_x_api_key_oauth_shape_token() {
+    // New-mur path: the public client always sends `x-api-key: $TOKEN`,
+    // even when $TOKEN is a subscription OAuth token. The proxy must
+    // recognize sk-ant-oat* and apply the full disguise using THAT token,
+    // not whatever the static TokenSource returns.
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("authorization", "Bearer sk-ant-oat-from-client")
+                .header("anthropic-beta", OAUTH_BETAS)
+                .body_contains(expected_prefix())
+                .matches(|req| {
+                    // Original x-api-key must be stripped.
+                    !req.headers
+                        .as_ref()
+                        .map(|hs| hs.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-api-key")))
+                        .unwrap_or(false)
+                });
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), with_token("unused-keychain-token")).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("x-api-key", "sk-ant-oat-from-client")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","max_tokens":1,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    upstream_mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn disguise_passes_through_regular_api_key_x_api_key() {
+    // A real console API key (sk-ant-api03-*) must NOT be touched even
+    // when the path is a Messages endpoint and a TokenSource is configured.
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("x-api-key", "sk-ant-api03-real-key")
+                .matches(|req| {
+                    let body = req
+                        .body
+                        .as_ref()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .unwrap_or_default();
+                    !body.contains(&expected_prefix())
+                });
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), with_token("unused-keychain-token")).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("x-api-key", "sk-ant-api03-real-key")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    upstream_mock.assert_async().await;
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────
 
 fn with_token(t: &str) -> TokenSource {

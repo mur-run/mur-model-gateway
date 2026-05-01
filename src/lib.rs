@@ -130,14 +130,31 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .await
         .context("read incoming body")?;
 
-    // Disguise gate: only when the client provided no auth and the path is
-    // an Anthropic Messages endpoint. Clients that authenticate themselves
-    // are passed through untouched.
-    let has_incoming_auth =
-        parts.headers.contains_key("authorization") || parts.headers.contains_key("x-api-key");
-    let disguise_eligible = !has_incoming_auth && disguise::should_disguise(path_only);
+    // Disguise gate. Three modes on Messages-shape paths (when the
+    // configured TokenSource is NOT Disabled):
+    //
+    //   1. Client supplied an OAuth-shape token (sk-ant-oat*) via x-api-key
+    //      or Bearer Authorization → upgrade THAT token to Bearer + disguise.
+    //      This is the new-mur path: the public client doesn't know how to
+    //      disguise, so it just forwards whatever key it has.
+    //   2. Client supplied no auth at all → resolve a token from the
+    //      configured TokenSource (Keychain / EnvVar / Static) and disguise.
+    //   3. Client supplied a non-OAuth key → passthrough untouched. Don't
+    //      second-guess clients that authenticate themselves.
+    //
+    // TokenSource::Disabled or non-Messages paths → pure passthrough.
+    let disguise_enabled = !matches!(state.token_source, TokenSource::Disabled);
+    let on_messages_path = disguise::should_disguise(path_only);
 
-    let override_token: Option<String> = if disguise_eligible {
+    let override_token: Option<String> = if !disguise_enabled || !on_messages_path {
+        None
+    } else if let Some(tok) = extract_oauth_shape_token(&parts.headers) {
+        // Mode 1: client gave us an OAuth-shape token to use.
+        Some(tok)
+    } else if !parts.headers.contains_key("authorization")
+        && !parts.headers.contains_key("x-api-key")
+    {
+        // Mode 2: no auth on inbound, resolve from TokenSource.
         match state.token_source.resolve() {
             Ok(token) => token,
             Err(e) => {
@@ -146,6 +163,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             }
         }
     } else {
+        // Mode 3: pure passthrough.
         None
     };
 
@@ -219,6 +237,28 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         *h = response_headers;
     }
     builder.body(body).context("build response")
+}
+
+/// If the inbound request supplies an Anthropic OAuth subscription token
+/// (sk-ant-oat*) via either `x-api-key` or `Authorization: Bearer`, return
+/// it so the proxy can upgrade it to a fully-disguised Bearer request.
+/// Returns None if the inbound auth is a regular API key (sk-ant-api03-*)
+/// or absent entirely — pure passthrough in those cases.
+fn extract_oauth_shape_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok())
+        && v.contains("sk-ant-oat")
+    {
+        return Some(v.to_string());
+    }
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(rest) = v
+            .strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+        && rest.contains("sk-ant-oat")
+    {
+        return Some(rest.to_string());
+    }
+    None
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
