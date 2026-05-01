@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+*.log
+*.swp
+.DS_Store
+.env
+.env.*
+secrets/
+*.pem
+*.key
