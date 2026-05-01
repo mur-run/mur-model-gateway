@@ -5,11 +5,24 @@
 //! billing-prefix block prepended to `system`. When the inbound has its
 //! own auth, the upstream sees that auth unchanged.
 
-use cc_proxy::disguise::{OAUTH_BETAS, OAUTH_BILLING_PREFIX};
+use cc_proxy::cc_version::{VersionCache, VersionStrategy};
+use cc_proxy::disguise::{OAUTH_BETAS, billing_prefix};
 use cc_proxy::{AppState, TokenSource, build_router};
 use httpmock::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
+
+const TEST_VERSION: &str = "9.9.9";
+
+fn pinned_version() -> Arc<VersionCache> {
+    Arc::new(VersionCache::new(VersionStrategy::Static(
+        TEST_VERSION.to_string(),
+    )))
+}
+
+fn expected_prefix() -> String {
+    billing_prefix(TEST_VERSION)
+}
 
 #[tokio::test]
 async fn disguise_injects_auth_betas_and_billing_prefix() {
@@ -20,7 +33,7 @@ async fn disguise_injects_auth_betas_and_billing_prefix() {
                 .path("/v1/messages")
                 .header("authorization", "Bearer test-oauth-token")
                 .header("anthropic-beta", OAUTH_BETAS)
-                .body_contains(OAUTH_BILLING_PREFIX);
+                .body_contains(expected_prefix());
             then.status(200).body(r#"{"ok":true}"#);
         })
         .await;
@@ -55,7 +68,7 @@ async fn disguise_does_not_double_inject_when_client_already_authed() {
                         .as_ref()
                         .map(|b| String::from_utf8_lossy(b).into_owned())
                         .unwrap_or_default();
-                    !body.contains(OAUTH_BILLING_PREFIX)
+                    !body.contains(&expected_prefix())
                 });
             then.status(200).body(r#"{"ok":true}"#);
         })
@@ -156,7 +169,7 @@ async fn disguise_preserves_array_form_system_with_cache_control() {
                     None => return false,
                 };
                 arr.len() == 2
-                    && arr[0]["text"] == OAUTH_BILLING_PREFIX
+                    && arr[0]["text"] == expected_prefix()
                     && arr[1]["text"] == "ctxblock"
                     && arr[1]["cache_control"]["type"] == "ephemeral"
             });
@@ -193,7 +206,8 @@ fn with_token(t: &str) -> TokenSource {
 async fn spawn(upstream: String, token_source: TokenSource) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_router(AppState::new(&upstream, token_source).unwrap());
+    let app =
+        build_router(AppState::with_version(&upstream, token_source, pinned_version()).unwrap());
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

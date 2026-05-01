@@ -8,6 +8,7 @@
 //! field. Requests that already authenticate themselves are passed
 //! through untouched.
 
+pub mod cc_version;
 pub mod disguise;
 pub mod keychain;
 
@@ -59,10 +60,23 @@ pub struct AppState {
     pub upstream: String,
     pub client: reqwest::Client,
     pub token_source: TokenSource,
+    pub version_cache: Arc<cc_version::VersionCache>,
 }
 
 impl AppState {
     pub fn new(upstream: impl Into<String>, token_source: TokenSource) -> anyhow::Result<Self> {
+        Self::with_version(
+            upstream,
+            token_source,
+            Arc::new(cc_version::VersionCache::detect_or_fallback()),
+        )
+    }
+
+    pub fn with_version(
+        upstream: impl Into<String>,
+        token_source: TokenSource,
+        version_cache: Arc<cc_version::VersionCache>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             upstream: upstream.into().trim_end_matches('/').to_string(),
             client: reqwest::Client::builder()
@@ -70,6 +84,7 @@ impl AppState {
                 .build()
                 .context("reqwest client")?,
             token_source,
+            version_cache,
         })
     }
 }
@@ -125,9 +140,14 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         None
     };
 
-    let final_body: Vec<u8> = if override_token.is_some() {
-        tracing::debug!(path = %path_only, "applying disguise");
-        disguise::inject_billing_prefix(&body_bytes)?
+    let cc_version = if override_token.is_some() {
+        Some(state.version_cache.get())
+    } else {
+        None
+    };
+    let final_body: Vec<u8> = if let Some(ver) = cc_version.as_deref() {
+        tracing::debug!(path = %path_only, cc_version = %ver, "applying disguise");
+        disguise::inject_billing_prefix(&body_bytes, ver)?
     } else {
         body_bytes.to_vec()
     };
