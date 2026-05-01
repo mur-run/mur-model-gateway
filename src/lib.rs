@@ -29,13 +29,20 @@ pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
-/// Pluggable OAuth token source. Production uses [`TokenSource::Keychain`];
-/// tests can inject [`TokenSource::Static`] to avoid touching the real OS
-/// keychain.
+/// Pluggable OAuth token source.
+///
+/// Production default is [`TokenSource::Keychain`] which reads via the
+/// `keyring` crate (macOS Security framework / Linux libsecret / Windows
+/// Credential Manager). [`TokenSource::EnvVar`] reads from a process env
+/// var for platforms where Claude Code's keychain layout isn't supported.
+/// [`TokenSource::Static`] is a test injection point.
 #[derive(Clone)]
 pub enum TokenSource {
     /// Read from the OS keychain (Claude Code's `Claude Code-credentials`).
     Keychain,
+    /// Read from the named environment variable on every request. `Ok(None)`
+    /// if unset.
+    EnvVar(String),
     /// Always return this token. Used by integration tests.
     Static(Arc<String>),
     /// Never disguise; act as a pure passthrough proxy.
@@ -49,6 +56,7 @@ impl TokenSource {
     pub fn resolve(&self) -> Result<Option<String>, keychain::KeychainError> {
         match self {
             TokenSource::Keychain => keychain::read_claude_code_oauth(),
+            TokenSource::EnvVar(name) => Ok(std::env::var(name).ok()),
             TokenSource::Static(s) => Ok(Some(s.as_ref().clone())),
             TokenSource::Disabled => Ok(None),
         }

@@ -18,12 +18,18 @@ async fn main() -> anyhow::Result<()> {
     let upstream =
         std::env::var("CC_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
 
-    let token_source = match std::env::var("CC_PROXY_DISGUISE")
+    let token_source = match std::env::var("CC_PROXY_TOKEN_SOURCE")
         .unwrap_or_else(|_| "keychain".to_string())
         .as_str()
     {
         "off" | "disabled" => TokenSource::Disabled,
-        _ => TokenSource::Keychain,
+        "keychain" => TokenSource::Keychain,
+        spec if spec.starts_with("env:") => TokenSource::EnvVar(spec[4..].to_string()),
+        other => {
+            anyhow::bail!(
+                "invalid CC_PROXY_TOKEN_SOURCE={other} (expected: keychain | off | env:VAR)"
+            );
+        }
     };
     let state = AppState::new(&upstream, token_source)?;
     let upstream_for_log = state.upstream.clone();

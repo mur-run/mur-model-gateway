@@ -1,14 +1,14 @@
-//! macOS Keychain reader for the OAuth token Claude Code stores.
+//! Cross-platform OS keychain reader for the OAuth token Claude Code stores.
 //!
-//! Claude Code writes a JSON document under generic-password service
-//! `Claude Code-credentials`; the access token lives at
-//! `claudeAiOauth.accessToken`. We read it on every request so the
-//! proxy automatically picks up rotated tokens — Claude Code
-//! refreshes it in the background, the proxy never caches.
+//! Uses the [`keyring`] crate which dispatches to:
+//!   - **macOS**: Security framework (`SecKeychainItem`)
+//!   - **Linux**: libsecret via D-Bus (gnome-keyring / KWallet front-end)
+//!   - **Windows**: Credential Manager (`CredRead`)
 //!
-//! Iter 1 is macOS-only. Iter 3 will replace this with the `keyring`
-//! crate for cross-platform support (Linux libsecret / Windows
-//! Credential Manager).
+//! The token's stored under generic-password service `Claude Code-credentials`
+//! with the OS account = current username. The blob is JSON; we extract
+//! `claudeAiOauth.accessToken`. Read on every request — Claude Code refreshes
+//! the token in the background, the proxy never caches.
 
 use serde_json::Value;
 
@@ -20,36 +20,26 @@ pub enum KeychainError {
     Backend(String),
     #[error("keychain entry malformed: {0}")]
     Malformed(String),
-    #[error("platform not yet supported: {0}")]
-    Unsupported(&'static str),
 }
 
 /// Read the current Claude Code OAuth access token from the OS keychain.
 ///
-/// `Ok(Some(token))` — entry found and parsed.
-/// `Ok(None)` — no entry exists (Claude Code never logged in on this machine).
-/// `Err(_)` — backend / parse error; callers should pass through to upstream
-/// rather than mask the failure.
-#[cfg(target_os = "macos")]
+/// `Ok(Some)` — entry found and parsed.
+/// `Ok(None)` — no entry exists (Claude Code never logged in).
+/// `Err(_)` — backend error (locked keychain / permission denied / parse failure).
 pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
-    use std::process::Command;
-
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", SERVICE, "-w"])
-        .output()
-        .map_err(|e| KeychainError::Backend(format!("spawn `security`: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // exit 44 / "could not be found" → no entry, not an error.
-        if output.status.code() == Some(44) || stderr.contains("could not be found") {
-            return Ok(None);
-        }
-        return Err(KeychainError::Backend(stderr.into_owned()));
+    let user = whoami::username();
+    let entry = keyring::Entry::new(SERVICE, &user)
+        .map_err(|e| KeychainError::Backend(format!("entry::new({SERVICE}, {user}): {e}")))?;
+    match entry.get_password() {
+        Ok(raw) => parse_oauth_blob(&raw),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(KeychainError::Backend(format!("get_password: {e}"))),
     }
+}
 
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|e| KeychainError::Malformed(format!("non-utf8 stdout: {e}")))?;
+/// Extract `claudeAiOauth.accessToken` from a Claude Code keychain blob.
+fn parse_oauth_blob(raw: &str) -> Result<Option<String>, KeychainError> {
     let creds: Value = serde_json::from_str(raw.trim())
         .map_err(|e| KeychainError::Malformed(format!("not JSON: {e}")))?;
     let token = creds
@@ -60,9 +50,34 @@ pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
     Ok(Some(token.to_string()))
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
-    Err(KeychainError::Unsupported(
-        "non-macOS keychain support arrives in Iter 3",
-    ))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_extracts_access_token() {
+        let blob = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","refreshToken":"x"}}"#;
+        assert_eq!(
+            parse_oauth_blob(blob).unwrap().as_deref(),
+            Some("sk-ant-oat01-test")
+        );
+    }
+
+    #[test]
+    fn parse_rejects_non_json() {
+        let r = parse_oauth_blob("not json");
+        assert!(matches!(r, Err(KeychainError::Malformed(_))));
+    }
+
+    #[test]
+    fn parse_rejects_missing_field() {
+        let r = parse_oauth_blob(r#"{"claudeAiOauth":{}}"#);
+        assert!(matches!(r, Err(KeychainError::Malformed(_))));
+    }
+
+    #[test]
+    fn parse_rejects_wrong_shape() {
+        let r = parse_oauth_blob(r#"{"foo":"bar"}"#);
+        assert!(matches!(r, Err(KeychainError::Malformed(_))));
+    }
 }
