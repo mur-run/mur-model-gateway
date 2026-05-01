@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
 futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

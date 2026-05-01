@@ -1,16 +1,54 @@
 use anyhow::Context;
-use cc_proxy::{AppState, DEFAULT_BIND, DEFAULT_UPSTREAM, TokenSource, build_router};
+use cc_proxy::{AppState, DEFAULT_BIND, DEFAULT_UPSTREAM, TokenSource, build_router, install};
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+
+#[derive(Parser)]
+#[command(
+    name = "cc-proxy",
+    about = "Local Anthropic API reverse proxy with Claude Code disguise layer",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the proxy in the foreground (default).
+    Serve,
+    /// Write the platform-specific service descriptor.
+    Install,
+    /// Remove the platform-specific service descriptor.
+    Uninstall,
+    /// Print install paths and presence status.
+    Status,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
+
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => serve().await,
+        Command::Install => install::install(),
+        Command::Uninstall => install::uninstall(),
+        Command::Status => install::status(),
+    }
+}
+
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,cc_proxy=debug")),
         )
         .init();
+}
 
+async fn serve() -> anyhow::Result<()> {
     let bind: SocketAddr = std::env::var("CC_PROXY_BIND")
         .unwrap_or_else(|_| DEFAULT_BIND.to_string())
         .parse()
@@ -31,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     };
+
     let state = AppState::new(&upstream, token_source)?;
     let upstream_for_log = state.upstream.clone();
     let app = build_router(state);

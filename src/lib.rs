@@ -10,6 +10,7 @@
 
 pub mod cc_version;
 pub mod disguise;
+pub mod install;
 pub mod keychain;
 
 use anyhow::Context;
