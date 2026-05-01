@@ -1,0 +1,202 @@
+//! Iter 1 acceptance: disguise layer on `/v1/messages*`.
+//!
+//! When the inbound request has no auth and a token is available, the
+//! upstream sees Bearer auth, the claude-code-* beta header, and a
+//! billing-prefix block prepended to `system`. When the inbound has its
+//! own auth, the upstream sees that auth unchanged.
+
+use cc_proxy::disguise::{OAUTH_BETAS, OAUTH_BILLING_PREFIX};
+use cc_proxy::{AppState, TokenSource, build_router};
+use httpmock::prelude::*;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::test]
+async fn disguise_injects_auth_betas_and_billing_prefix() {
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("authorization", "Bearer test-oauth-token")
+                .header("anthropic-beta", OAUTH_BETAS)
+                .body_contains(OAUTH_BILLING_PREFIX);
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), with_token("test-oauth-token")).await;
+    // Client sends no auth at all — proxy should fill it in.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","max_tokens":1,"system":"hello","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    upstream_mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn disguise_does_not_double_inject_when_client_already_authed() {
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .header("authorization", "Bearer client-supplied-token")
+                .body_contains("client-system")
+                // Crucially: client-supplied request must NOT gain the
+                // billing prefix; the client already did its own disguise.
+                .matches(|req| {
+                    let body = req
+                        .body
+                        .as_ref()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .unwrap_or_default();
+                    !body.contains(OAUTH_BILLING_PREFIX)
+                });
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), with_token("test-oauth-token")).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("authorization", "Bearer client-supplied-token")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","max_tokens":1,"system":"client-system","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    upstream_mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn disguise_skips_non_messages_paths() {
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(GET).path("/v1/files/abc").matches(|req| {
+                // No Bearer should be added on non-Messages paths.
+                !req.headers
+                    .as_ref()
+                    .map(|hs| {
+                        hs.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case("authorization")
+                                && v.starts_with("Bearer test-oauth-token")
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            then.status(200).body("{}");
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), with_token("test-oauth-token")).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/v1/files/abc"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    upstream_mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn disguise_disabled_passthrough_is_lossless() {
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/messages").matches(|req| {
+                // No Authorization should be present (client didn't send one,
+                // and Disabled token source must not synthesize one).
+                !req.headers
+                    .as_ref()
+                    .map(|hs| {
+                        hs.iter()
+                            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    })
+                    .unwrap_or(false)
+            });
+            then.status(401).body(r#"{"error":"no_auth"}"#);
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), TokenSource::Disabled).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    upstream_mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn disguise_preserves_array_form_system_with_cache_control() {
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/messages").matches(|req| {
+                let body = req
+                    .body
+                    .as_ref()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_default();
+                let v: serde_json::Value = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let arr = match v["system"].as_array() {
+                    Some(a) => a,
+                    None => return false,
+                };
+                arr.len() == 2
+                    && arr[0]["text"] == OAUTH_BILLING_PREFIX
+                    && arr[1]["text"] == "ctxblock"
+                    && arr[1]["cache_control"]["type"] == "ephemeral"
+            });
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), with_token("test-oauth-token")).await;
+    let body = serde_json::json!({
+        "model": "x",
+        "max_tokens": 1,
+        "system": [
+            {"type": "text", "text": "ctxblock", "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": []
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    upstream_mock.assert_async().await;
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+fn with_token(t: &str) -> TokenSource {
+    TokenSource::Static(Arc::new(t.to_string()))
+}
+
+async fn spawn(upstream: String, token_source: TokenSource) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_router(AppState::new(&upstream, token_source).unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    addr.to_string()
+}

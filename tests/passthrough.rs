@@ -2,7 +2,7 @@
 //! requests + headers + body to an upstream and stream the
 //! response (status, headers, body) back unchanged.
 
-use cc_proxy::{AppState, build_router};
+use cc_proxy::{AppState, TokenSource, build_router};
 use httpmock::prelude::*;
 use std::time::Duration;
 
@@ -121,7 +121,7 @@ async fn passthrough_handles_get() {
 async fn spawn_proxy(upstream: String) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_router(AppState::new(&upstream).unwrap());
+    let app = build_router(AppState::new(&upstream, TokenSource::Disabled).unwrap());
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

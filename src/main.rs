@@ -1,5 +1,5 @@
 use anyhow::Context;
-use cc_proxy::{AppState, DEFAULT_BIND, DEFAULT_UPSTREAM, build_router};
+use cc_proxy::{AppState, DEFAULT_BIND, DEFAULT_UPSTREAM, TokenSource, build_router};
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -18,7 +18,14 @@ async fn main() -> anyhow::Result<()> {
     let upstream =
         std::env::var("CC_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
 
-    let state = AppState::new(&upstream)?;
+    let token_source = match std::env::var("CC_PROXY_DISGUISE")
+        .unwrap_or_else(|_| "keychain".to_string())
+        .as_str()
+    {
+        "off" | "disabled" => TokenSource::Disabled,
+        _ => TokenSource::Keychain,
+    };
+    let state = AppState::new(&upstream, token_source)?;
     let upstream_for_log = state.upstream.clone();
     let app = build_router(state);
 
