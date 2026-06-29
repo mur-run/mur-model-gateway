@@ -52,6 +52,53 @@ async fn disguise_injects_auth_betas_and_billing_prefix() {
 }
 
 #[tokio::test]
+async fn disguise_merges_client_anthropic_beta_with_oauth_betas() {
+    // Claude Code 4.7 sends its own `anthropic-beta` (e.g. clear-thinking-*)
+    // describing body features it uses. The proxy must merge — not replace —
+    // so the upstream sees both the OAuth-required betas and the client's.
+    let upstream = MockServer::start_async().await;
+    let upstream_mock = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/messages").matches(|req| {
+                let beta = req
+                    .headers
+                    .as_ref()
+                    .and_then(|hs| {
+                        hs.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+                            .map(|(_, v)| v.clone())
+                    })
+                    .unwrap_or_default();
+                let parts: std::collections::HashSet<&str> =
+                    beta.split(',').map(str::trim).collect();
+                parts.contains("claude-code-20250219")
+                    && parts.contains("oauth-2025-04-20")
+                    && parts.contains("interleaved-thinking-2025-05-14")
+                    && parts.contains("compact-2026-01-12")
+                    && parts.contains("clear-thinking-2025-10-15")
+                    && parts.contains("client-only-beta")
+            });
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let proxy_addr = spawn(upstream.base_url(), with_token("test-oauth-token")).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header(
+            "anthropic-beta",
+            "clear-thinking-2025-10-15,client-only-beta,compact-2026-01-12",
+        )
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","max_tokens":1,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    upstream_mock.assert_async().await;
+}
+
+#[tokio::test]
 async fn disguise_does_not_double_inject_when_client_already_authed() {
     let upstream = MockServer::start_async().await;
     let upstream_mock = upstream

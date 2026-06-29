@@ -17,6 +17,27 @@ use serde_json::{Value, json};
 pub const OAUTH_BETAS: &str =
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,compact-2026-01-12";
 
+/// Merge `OAUTH_BETAS` with whatever `anthropic-beta` values the client
+/// already sent, preserving order (OAuth betas first) and deduping. The
+/// client's betas describe body features the request uses (e.g.
+/// `clear-thinking-2025-10-15`). Stripping them in disguise mode causes
+/// the upstream to reject body shapes it would otherwise accept.
+pub fn merge_betas(oauth: &str, client: &[String]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let client_iter = client.iter().flat_map(|s| s.split(','));
+    for token in oauth.split(',').chain(client_iter) {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if seen.insert(t.to_string()) {
+            out.push(t.to_string());
+        }
+    }
+    out.join(",")
+}
+
 /// Build the billing-header text block for a given Claude Code version.
 /// Without this prefix the OAuth path returns 429 rate_limit_error.
 pub fn billing_prefix(cc_version: &str) -> String {
@@ -128,6 +149,35 @@ mod tests {
         let p = billing_prefix("2.1.126");
         assert!(p.contains("cc_version=2.1.126"));
         assert!(p.contains("cc_entrypoint=sdk-cli"));
+    }
+
+    #[test]
+    fn merge_betas_appends_client_values() {
+        let merged = merge_betas("a,b", &["c".to_string(), "d".to_string()]);
+        assert_eq!(merged, "a,b,c,d");
+    }
+
+    #[test]
+    fn merge_betas_dedupes_and_preserves_oauth_order() {
+        let merged = merge_betas(
+            "claude-code-20250219,compact-2026-01-12",
+            &["compact-2026-01-12,clear-thinking-2025-10-15".to_string()],
+        );
+        assert_eq!(
+            merged,
+            "claude-code-20250219,compact-2026-01-12,clear-thinking-2025-10-15"
+        );
+    }
+
+    #[test]
+    fn merge_betas_handles_empty_client() {
+        assert_eq!(merge_betas(OAUTH_BETAS, &[]), OAUTH_BETAS);
+    }
+
+    #[test]
+    fn merge_betas_trims_whitespace() {
+        let merged = merge_betas("a,b", &[" c , d ".to_string()]);
+        assert_eq!(merged, "a,b,c,d");
     }
 
     #[test]

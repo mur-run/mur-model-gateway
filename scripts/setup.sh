@@ -122,6 +122,8 @@ fi
 # ─── build ──────────────────────────────────────────────────────────
 
 log "building cc-proxy (release)"
+# ponytail: source cargo env so script works when invoked outside a login shell
+[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 cd "$REPO_ROOT"
 cargo build --release
 

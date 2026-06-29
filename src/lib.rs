@@ -148,9 +148,16 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
 
     let override_token: Option<String> = if !disguise_enabled || !on_messages_path {
         None
-    } else if let Some(tok) = extract_oauth_shape_token(&parts.headers) {
-        // Mode 1: client gave us an OAuth-shape token to use.
-        Some(tok)
+    } else if extract_oauth_shape_token(&parts.headers).is_some() {
+        // Mode 1: client signals OAuth intent (sk-ant-oat*) — use the fresh
+        // Keychain token instead of the client's copy, which may be stale.
+        match state.token_source.resolve() {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(error = %e, "token source failed, passing through");
+                None
+            }
+        }
     } else if !parts.headers.contains_key("authorization")
         && !parts.headers.contains_key("x-api-key")
     {
@@ -181,26 +188,39 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
 
     let mut upstream_req = state.client.request(parts.method.clone(), &target_url);
 
+    let mut client_betas: Vec<String> = Vec::new();
     for (name, value) in parts.headers.iter() {
         if is_hop_by_hop(name) || name == "host" || name == "content-length" {
             continue;
         }
-        // When disguising we own these headers — drop client copies.
-        if override_token.is_some()
-            && (name == "authorization" || name == "x-api-key" || name == "anthropic-beta")
-        {
+        // When disguising we own auth headers — drop client copies — and
+        // capture client-supplied `anthropic-beta` values so we can merge
+        // them with OAUTH_BETAS rather than overwriting (Claude Code 4.7+
+        // sends betas like `clear-thinking-2025-10-15` that the upstream
+        // needs to accept the request body).
+        if override_token.is_some() && (name == "authorization" || name == "x-api-key") {
+            continue;
+        }
+        if override_token.is_some() && name == "anthropic-beta" {
+            if let Ok(s) = value.to_str() {
+                client_betas.push(s.to_string());
+            }
             continue;
         }
         upstream_req = upstream_req.header(name, value);
     }
 
     if let Some(tok) = override_token.as_deref() {
+        let merged_betas = disguise::merge_betas(disguise::OAUTH_BETAS, &client_betas);
         upstream_req = upstream_req
             .header(
                 "Authorization",
                 HeaderValue::from_str(&format!("Bearer {tok}")).context("invalid Bearer token")?,
             )
-            .header("anthropic-beta", disguise::OAUTH_BETAS);
+            .header(
+                "anthropic-beta",
+                HeaderValue::from_str(&merged_betas).context("invalid anthropic-beta")?,
+            );
         if !parts.headers.contains_key("anthropic-version") {
             upstream_req = upstream_req.header("anthropic-version", "2023-06-01");
         }
