@@ -71,6 +71,9 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub token_source: TokenSource,
     pub version_cache: Arc<cc_version::VersionCache>,
+    /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
+    /// Env-gated: CC_PROXY_COMPRESS=1. Tests flip the field directly.
+    pub compress: bool,
 }
 
 impl AppState {
@@ -95,6 +98,7 @@ impl AppState {
                 .context("reqwest client")?,
             token_source,
             version_cache,
+            compress: std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1"),
         })
     }
 }
@@ -130,6 +134,24 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     let body_bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
         .await
         .context("read incoming body")?;
+
+    // Wire-level compression (opt-in): rewrite fat tool_result blocks
+    // before disguise. Fail-open — None means forward the original.
+    let body_bytes = if state.compress && compress::should_compress(path_only) {
+        match compress::rewrite_request_body(&body_bytes) {
+            Some(rewritten) => {
+                tracing::debug!(
+                    before = body_bytes.len(),
+                    after = rewritten.len(),
+                    "compressed tool_result blocks"
+                );
+                axum::body::Bytes::from(rewritten)
+            }
+            None => body_bytes,
+        }
+    } else {
+        body_bytes
+    };
 
     // Disguise gate. Three modes on Messages-shape paths (when the
     // configured TokenSource is NOT Disabled):

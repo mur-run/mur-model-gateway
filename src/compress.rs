@@ -31,8 +31,9 @@ pub fn has_retrieve_marker(text: &str) -> bool {
     false
 }
 
-use mur_compress::{CompressEngine, auto_compress, retrieval_note};
+use mur_compress::{CompressConfig, CompressEngine, auto_compress, retrieval_note};
 use serde_json::Value;
+use std::path::PathBuf;
 
 /// Compress oversized `tool_result` text in `body`. Returns `Some(bytes)`
 /// iff at least one block was replaced; `None` means "forward the original".
@@ -94,6 +95,38 @@ fn compress_text(engine: &CompressEngine, min_tokens: usize, s: &mut String) -> 
         None => out.text,
     };
     true
+}
+
+/// mur's home resolution, mirrored: `MUR_HOME` env else `~/.mur`.
+fn mur_home() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("MUR_HOME") {
+        return Some(PathBuf::from(v));
+    }
+    directories::BaseDirs::new().map(|b| b.home_dir().join(".mur"))
+}
+
+/// Per-request engine rooted at `<mur_home>/compress` — the same store mur
+/// itself uses, so `mur_retrieve` recovers proxy-compressed blocks. Returns
+/// `None` (→ passthrough) when mur config disables compression or the
+/// store can't be opened. Per-request construction matches mur's own
+/// call sites (MCP server); cost is negligible next to an LLM round trip.
+fn build_engine() -> Option<(CompressEngine, usize)> {
+    let home = mur_home()?;
+    let cfg = CompressConfig::load(&home);
+    if !cfg.enabled || !cfg.auto.enabled {
+        return None;
+    }
+    let min_tokens = cfg.auto.min_tokens;
+    CompressEngine::new(home.join("compress"), cfg)
+        .ok()
+        .map(|e| (e, min_tokens))
+}
+
+/// Fail-open entry point for `forward()`: `Some(rewritten)` or `None` to
+/// forward the original body untouched.
+pub fn rewrite_request_body(body: &[u8]) -> Option<Vec<u8>> {
+    let (engine, min_tokens) = build_engine()?;
+    rewrite_tool_results(&engine, min_tokens, body)
 }
 
 #[cfg(test)]
