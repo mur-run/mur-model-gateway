@@ -1,7 +1,7 @@
 # cc-proxy × mur-compress: wire-level tool_result compression
 
 **Date:** 2026-07-03
-**Status:** Approved design, pending implementation
+**Status:** Implemented (env-gated `CC_PROXY_COMPRESS=1`, default off)
 **Scope:** cc-proxy only. Zero changes to the mur repo.
 
 ## Problem
