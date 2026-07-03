@@ -9,6 +9,7 @@
 //! through untouched.
 
 pub mod cc_version;
+pub mod compress;
 pub mod disguise;
 pub mod install;
 pub mod keychain;
