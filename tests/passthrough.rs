@@ -121,7 +121,15 @@ async fn passthrough_handles_get() {
 async fn spawn_proxy(upstream: String) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_router(AppState::new(&upstream, TokenSource::Disabled).unwrap());
+    let app = build_router(
+        AppState::new(
+            &upstream,
+            "https://api.openai.com",
+            "https://generativelanguage.googleapis.com",
+            TokenSource::Disabled,
+        )
+        .unwrap(),
+    );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
