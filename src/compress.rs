@@ -2,12 +2,20 @@
 //! bodies through mur-compress before they leave for the upstream.
 //! Fail-open — any parse or engine failure forwards the original bytes.
 
-/// Paths whose bodies we compress: message sends only. `count_tokens` is
-/// deliberately excluded — its body never reaches the model, and it runs on
-/// a hot path. The client over-counting context (vs the compressed send) is
-/// the fail-safe direction.
-pub fn should_compress(path: &str) -> bool {
-    path == "/v1/messages" || path.starts_with("/v1/messages?")
+/// Paths whose bodies we compress, per provider.
+/// `count_tokens` is deliberately excluded for Anthropic — its body never
+/// reaches the model, and it runs on a hot path. The client over-counting
+/// context (vs the compressed send) is the fail-safe direction.
+pub fn should_compress(path: &str, provider: Provider) -> bool {
+    match provider {
+        Provider::Anthropic => {
+            path == "/v1/messages" || path.starts_with("/v1/messages?")
+        }
+        Provider::OpenAI => {
+            path == "/v1/chat/completions" || path.starts_with("/v1/chat/completions?")
+        }
+        Provider::Gemini => path.starts_with("/v1beta/models/"),
+    }
 }
 
 /// True if `text` already carries a mur-compress retrieval marker
@@ -31,6 +39,7 @@ pub fn has_retrieve_marker(text: &str) -> bool {
     false
 }
 
+use crate::Provider;
 use mur_compress::{CompressConfig, CompressEngine, auto_compress, retrieval_note};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -39,7 +48,7 @@ use std::path::PathBuf;
 /// iff at least one block was replaced; `None` means "forward the original".
 /// Sibling fields (`tool_use_id`, `is_error`, `cache_control`) survive
 /// because mutation is in place — only text payloads are swapped.
-pub fn rewrite_tool_results(
+fn rewrite_tool_results_anthropic(
     engine: &CompressEngine,
     min_tokens: usize,
     body: &[u8],
@@ -72,6 +81,44 @@ pub fn rewrite_tool_results(
                 }
                 _ => {}
             }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_vec(&root).ok()
+}
+
+/// Compress oversized `content` fields in OpenAI `role: "tool"` messages.
+/// Sibling fields (`role`, `tool_call_id`) are preserved in-place.
+fn rewrite_tool_results_openai(
+    engine: &CompressEngine,
+    min_tokens: usize,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    let mut root: Value = serde_json::from_slice(body).ok()?;
+    let messages = root.get_mut("messages")?.as_array_mut()?;
+    let mut changed = false;
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            continue;
+        }
+        let Some(content) = msg.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::String(s) => changed |= compress_text(engine, min_tokens, s),
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    if item.get("type").and_then(|t| t.as_str()) != Some("text") {
+                        continue;
+                    }
+                    if let Some(Value::String(s)) = item.get_mut("text") {
+                        changed |= compress_text(engine, min_tokens, s);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     if !changed {
@@ -124,9 +171,13 @@ fn build_engine() -> Option<(CompressEngine, usize)> {
 
 /// Fail-open entry point for `forward()`: `Some(rewritten)` or `None` to
 /// forward the original body untouched.
-pub fn rewrite_request_body(body: &[u8]) -> Option<Vec<u8>> {
+pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Option<Vec<u8>> {
     let (engine, min_tokens) = build_engine()?;
-    rewrite_tool_results(&engine, min_tokens, body)
+    match provider {
+        Provider::Anthropic => rewrite_tool_results_anthropic(&engine, min_tokens, body),
+        Provider::OpenAI => rewrite_tool_results_openai(&engine, min_tokens, body),
+        Provider::Gemini => None, // Task 3 will add the Gemini extractor
+    }
 }
 
 #[cfg(test)]
@@ -134,12 +185,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_compress_matches_messages_send_only() {
-        assert!(should_compress("/v1/messages"));
-        assert!(should_compress("/v1/messages?beta=true"));
-        assert!(!should_compress("/v1/messages/count_tokens"));
-        assert!(!should_compress("/v1/models"));
-        assert!(!should_compress("/"));
+    fn should_compress_per_provider() {
+        // Anthropic
+        assert!(should_compress("/v1/messages", Provider::Anthropic));
+        assert!(should_compress("/v1/messages?beta=true", Provider::Anthropic));
+        assert!(!should_compress("/v1/messages/count_tokens", Provider::Anthropic));
+
+        // OpenAI
+        assert!(should_compress("/v1/chat/completions", Provider::OpenAI));
+        assert!(should_compress("/v1/chat/completions?stream=true", Provider::OpenAI));
+        assert!(!should_compress("/v1/chat/completions/messages", Provider::OpenAI));
+
+        // Gemini — any /v1beta/models/ path
+        assert!(should_compress(
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            Provider::Gemini
+        ));
     }
 
     #[test]
@@ -202,7 +263,7 @@ mod tests {
     fn compresses_fat_string_tool_result_and_preserves_siblings() {
         let (_dir, engine) = test_engine();
         let body = body_with_tool_result(json!(fat_log()));
-        let out = rewrite_tool_results(&engine, 800, &body).expect("should fire");
+        let out = rewrite_tool_results_anthropic(&engine, 800, &body).expect("should fire");
         assert!(out.len() < body.len(), "rewritten body must be smaller");
 
         let v: Value = serde_json::from_slice(&out).unwrap();
@@ -225,7 +286,7 @@ mod tests {
             {"type": "text", "text": fat_log()},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
         ]));
-        let out = rewrite_tool_results(&engine, 800, &body).expect("should fire");
+        let out = rewrite_tool_results_anthropic(&engine, 800, &body).expect("should fire");
         let v: Value = serde_json::from_slice(&out).unwrap();
         let items = v["messages"][1]["content"][0]["content"]
             .as_array()
@@ -240,7 +301,7 @@ mod tests {
         let (_dir, engine) = test_engine();
         // Small block: under min_tokens → no rewrite at all.
         let body = body_with_tool_result(json!("short output"));
-        assert!(rewrite_tool_results(&engine, 800, &body).is_none());
+        assert!(rewrite_tool_results_anthropic(&engine, 800, &body).is_none());
 
         // Already-marked block, padded fat so the size gate alone can't save it.
         let marked = format!(
@@ -248,16 +309,16 @@ mod tests {
             fat_log()
         );
         let body = body_with_tool_result(json!(marked));
-        assert!(rewrite_tool_results(&engine, 800, &body).is_none());
+        assert!(rewrite_tool_results_anthropic(&engine, 800, &body).is_none());
     }
 
     #[test]
     fn idempotent_second_pass_is_noop() {
         let (_dir, engine) = test_engine();
         let body = body_with_tool_result(json!(fat_log()));
-        let once = rewrite_tool_results(&engine, 800, &body).expect("first pass fires");
+        let once = rewrite_tool_results_anthropic(&engine, 800, &body).expect("first pass fires");
         assert!(
-            rewrite_tool_results(&engine, 800, &once).is_none(),
+            rewrite_tool_results_anthropic(&engine, 800, &once).is_none(),
             "second pass must not double-compress"
         );
     }
@@ -265,13 +326,88 @@ mod tests {
     #[test]
     fn malformed_or_foreign_bodies_pass_through() {
         let (_dir, engine) = test_engine();
-        assert!(rewrite_tool_results(&engine, 800, b"not json {").is_none());
-        assert!(rewrite_tool_results(&engine, 800, br#"{"no_messages": true}"#).is_none());
+        assert!(rewrite_tool_results_anthropic(&engine, 800, b"not json {").is_none());
+        assert!(rewrite_tool_results_anthropic(&engine, 800, br#"{"no_messages": true}"#).is_none());
         // string-content user message (no tool_result) untouched
         let plain = serde_json::to_vec(&json!({
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
-        assert!(rewrite_tool_results(&engine, 800, &plain).is_none());
+        assert!(rewrite_tool_results_anthropic(&engine, 800, &plain).is_none());
+    }
+
+    // ── OpenAI extractor tests ──────────────────────────────────────────
+
+    fn body_with_openai_tool_result(content: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": content}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn openai_compresses_string_tool_content() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_openai_tool_result(json!(fat_log()));
+        let out = rewrite_tool_results_openai(&engine, 800, &body).expect("should fire");
+        assert!(out.len() < body.len(), "rewritten body must be smaller");
+
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let tool_msg = &v["messages"][1];
+        assert_eq!(tool_msg["tool_call_id"], "call_1");
+        assert!(has_retrieve_marker(tool_msg["content"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn openai_skips_small_blocks() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_openai_tool_result(json!("short output"));
+        assert!(rewrite_tool_results_openai(&engine, 800, &body).is_none());
+    }
+
+    #[test]
+    fn openai_idempotent_second_pass_is_noop() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_openai_tool_result(json!(fat_log()));
+        let once = rewrite_tool_results_openai(&engine, 800, &body).expect("first pass fires");
+        assert!(
+            rewrite_tool_results_openai(&engine, 800, &once).is_none(),
+            "second pass must not double-compress"
+        );
+    }
+
+    #[test]
+    fn openai_skips_non_tool_roles() {
+        let (_dir, engine) = test_engine();
+        // A body with no role=tool messages — should pass through.
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": fat_log()},
+                {"role": "user", "content": fat_log()},
+                {"role": "assistant", "content": fat_log()}
+            ]
+        }))
+        .unwrap();
+        assert!(rewrite_tool_results_openai(&engine, 800, &body).is_none());
+    }
+
+    #[test]
+    fn openai_array_form_text_blocks() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_openai_tool_result(json!([
+            {"type": "text", "text": fat_log()}
+        ]));
+        let out = rewrite_tool_results_openai(&engine, 800, &body).expect("should fire");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let content = &v["messages"][1]["content"];
+        let items = content.as_array().unwrap();
+        assert!(has_retrieve_marker(items[0]["text"].as_str().unwrap()));
     }
 }
