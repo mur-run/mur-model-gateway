@@ -56,7 +56,7 @@ impl InstallPaths {
     }
 }
 
-pub fn install() -> Result<()> {
+pub fn install(compress: Option<bool>) -> Result<()> {
     let paths = InstallPaths::resolve()?;
     std::fs::create_dir_all(&paths.log_dir)
         .with_context(|| format!("mkdir {}", paths.log_dir.display()))?;
@@ -65,9 +65,12 @@ pub fn install() -> Result<()> {
     }
 
     let log_file = paths.log_dir.join("proxy.log");
+    // Flag wins; otherwise capture the install-time env opt-in (default off).
+    let compress = compress
+        .unwrap_or_else(|| std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1"));
 
     if cfg!(target_os = "macos") {
-        let plist = render_macos_plist(&paths.binary, &log_file);
+        let plist = render_macos_plist(&paths.binary, &log_file, compress);
         std::fs::write(&paths.service_file, plist)
             .with_context(|| format!("write {}", paths.service_file.display()))?;
         println!("wrote {}", paths.service_file.display());
@@ -78,7 +81,7 @@ pub fn install() -> Result<()> {
         println!("      launchctl enable gui/$(id -u)/{SERVICE_LABEL}");
         println!("      tail -f {}", log_file.display());
     } else if cfg!(target_os = "linux") {
-        let unit = render_linux_unit(&paths.binary);
+        let unit = render_linux_unit(&paths.binary, compress);
         std::fs::write(&paths.service_file, unit)
             .with_context(|| format!("write {}", paths.service_file.display()))?;
         println!("wrote {}", paths.service_file.display());
@@ -86,7 +89,7 @@ pub fn install() -> Result<()> {
         println!("      systemctl --user enable --now cc-proxy.service");
         println!("      journalctl --user -u cc-proxy.service -f");
     } else {
-        let cmd = render_windows_cmd(&paths.binary);
+        let cmd = render_windows_cmd(&paths.binary, compress);
         std::fs::write(&paths.service_file, cmd)
             .with_context(|| format!("write {}", paths.service_file.display()))?;
         println!("wrote {}", paths.service_file.display());
@@ -137,9 +140,14 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-pub fn render_macos_plist(binary: &Path, log_file: &Path) -> String {
+pub fn render_macos_plist(binary: &Path, log_file: &Path, compress: bool) -> String {
     let bin = binary.display();
     let log = log_file.display();
+    let compress_env = if compress {
+        "\n        <key>CC_PROXY_COMPRESS</key>\n        <string>1</string>"
+    } else {
+        ""
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -164,7 +172,7 @@ pub fn render_macos_plist(binary: &Path, log_file: &Path) -> String {
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <string>info,cc_proxy=debug</string>
+        <string>info,cc_proxy=debug</string>{compress_env}
     </dict>
 </dict>
 </plist>
@@ -172,7 +180,12 @@ pub fn render_macos_plist(binary: &Path, log_file: &Path) -> String {
     )
 }
 
-pub fn render_linux_unit(binary: &Path) -> String {
+pub fn render_linux_unit(binary: &Path, compress: bool) -> String {
+    let compress_env = if compress {
+        "\nEnvironment=CC_PROXY_COMPRESS=1"
+    } else {
+        ""
+    };
     let bin = binary.display();
     format!(
         r#"[Unit]
@@ -184,7 +197,7 @@ Wants=network-online.target
 ExecStart={bin}
 Restart=on-failure
 RestartSec=2
-Environment=RUST_LOG=info,cc_proxy=debug
+Environment=RUST_LOG=info,cc_proxy=debug{compress_env}
 StandardOutput=journal
 StandardError=journal
 
@@ -194,9 +207,14 @@ WantedBy=default.target
     )
 }
 
-pub fn render_windows_cmd(binary: &Path) -> String {
+pub fn render_windows_cmd(binary: &Path, compress: bool) -> String {
+    let compress_env = if compress {
+        "set CC_PROXY_COMPRESS=1\r\n"
+    } else {
+        ""
+    };
     let bin = binary.display();
-    format!("@echo off\r\nset RUST_LOG=info,cc_proxy=debug\r\n\"{bin}\"\r\n")
+    format!("@echo off\r\nset RUST_LOG=info,cc_proxy=debug\r\n{compress_env}\"{bin}\"\r\n")
 }
 
 #[cfg(test)]
@@ -209,25 +227,46 @@ mod tests {
         let p = render_macos_plist(
             &PathBuf::from("/usr/local/bin/cc-proxy"),
             &PathBuf::from("/tmp/proxy.log"),
+            false,
         );
         assert!(p.contains("<string>/usr/local/bin/cc-proxy</string>"));
         assert!(p.contains("<string>/tmp/proxy.log</string>"));
         assert!(p.contains(&format!("<string>{SERVICE_LABEL}</string>")));
         assert!(p.contains("<key>KeepAlive</key>"));
         assert!(p.contains("<key>RunAtLoad</key>"));
+        assert!(!p.contains("CC_PROXY_COMPRESS"));
+    }
+
+    #[test]
+    fn compress_env_passes_through_when_opted_in() {
+        let p = render_macos_plist(
+            &PathBuf::from("/usr/local/bin/cc-proxy"),
+            &PathBuf::from("/tmp/proxy.log"),
+            true,
+        );
+        assert!(p.contains("<key>CC_PROXY_COMPRESS</key>"));
+        assert!(p.contains("<string>1</string>"));
+
+        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), true);
+        assert!(u.contains("Environment=CC_PROXY_COMPRESS=1"));
+
+        let c = render_windows_cmd(&PathBuf::from(r"C:\Users\u\cc-proxy.exe"), true);
+        assert!(c.contains("set CC_PROXY_COMPRESS=1"));
     }
 
     #[test]
     fn linux_unit_embeds_binary() {
-        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"));
+        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), false);
         assert!(u.contains("ExecStart=/home/u/.local/bin/cc-proxy"));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains("WantedBy=default.target"));
+        assert!(!u.contains("CC_PROXY_COMPRESS"));
     }
 
     #[test]
     fn windows_cmd_quotes_binary() {
-        let c = render_windows_cmd(&PathBuf::from(r"C:\Users\u\cc-proxy.exe"));
+        let c = render_windows_cmd(&PathBuf::from(r"C:\Users\u\cc-proxy.exe"), false);
         assert!(c.contains(r#""C:\Users\u\cc-proxy.exe""#));
+        assert!(!c.contains("CC_PROXY_COMPRESS"));
     }
 }
