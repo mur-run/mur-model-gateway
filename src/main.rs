@@ -1,5 +1,5 @@
 use anyhow::Context;
-use cc_proxy::{AppState, DEFAULT_BIND, DEFAULT_UPSTREAM, TokenSource, build_router, install};
+use cc_proxy::{AppState, DEFAULT_BIND, DEFAULT_UPSTREAM_ANTHROPIC, DEFAULT_UPSTREAM_OPENAI, DEFAULT_UPSTREAM_GEMINI, TokenSource, build_router, install};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 
@@ -19,7 +19,14 @@ enum Command {
     /// Run the proxy in the foreground (default).
     Serve,
     /// Write the platform-specific service descriptor.
-    Install,
+    Install {
+        /// Bake CC_PROXY_COMPRESS=1 into the service (wire-level tool_result compression).
+        #[arg(long, conflicts_with = "no_compress")]
+        compress: bool,
+        /// Force compression off, even if CC_PROXY_COMPRESS=1 is set in the environment.
+        #[arg(long)]
+        no_compress: bool,
+    },
     /// Remove the platform-specific service descriptor.
     Uninstall,
     /// Print install paths and presence status.
@@ -33,7 +40,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve().await,
-        Command::Install => install::install(),
+        Command::Install {
+            compress,
+            no_compress,
+        } => install::install(if compress {
+            Some(true)
+        } else if no_compress {
+            Some(false)
+        } else {
+            None // fall back to CC_PROXY_COMPRESS env sniff
+        }),
         Command::Uninstall => install::uninstall(),
         Command::Status => install::status(),
     }
@@ -53,8 +69,18 @@ async fn serve() -> anyhow::Result<()> {
         .unwrap_or_else(|_| DEFAULT_BIND.to_string())
         .parse()
         .context("invalid CC_PROXY_BIND")?;
-    let upstream =
-        std::env::var("CC_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
+    let upstream_anthropic =
+        std::env::var("CC_PROXY_UPSTREAM_ANTHROPIC")
+            .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
+            .unwrap_or_else(|_| DEFAULT_UPSTREAM_ANTHROPIC.to_string());
+    let upstream_openai =
+        std::env::var("CC_PROXY_UPSTREAM_OPENAI")
+            .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
+            .unwrap_or_else(|_| DEFAULT_UPSTREAM_OPENAI.to_string());
+    let upstream_gemini =
+        std::env::var("CC_PROXY_UPSTREAM_GEMINI")
+            .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
+            .unwrap_or_else(|_| DEFAULT_UPSTREAM_GEMINI.to_string());
 
     let token_source = match std::env::var("CC_PROXY_TOKEN_SOURCE")
         .unwrap_or_else(|_| "keychain".to_string())
@@ -70,14 +96,13 @@ async fn serve() -> anyhow::Result<()> {
         }
     };
 
-    let state = AppState::new(&upstream, token_source)?;
-    let upstream_for_log = state.upstream.clone();
+    let state = AppState::new(&upstream_anthropic, &upstream_openai, &upstream_gemini, token_source)?;
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
-    tracing::info!(addr = %bind, upstream = %upstream_for_log, "cc-proxy listening");
+    tracing::info!(addr = %bind, "cc-proxy listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
