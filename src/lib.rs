@@ -27,9 +27,45 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8088";
-pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
+pub const DEFAULT_UPSTREAM_ANTHROPIC: &str = "https://api.anthropic.com";
+pub const DEFAULT_UPSTREAM_OPENAI: &str = "https://api.openai.com";
+pub const DEFAULT_UPSTREAM_GEMINI: &str = "https://generativelanguage.googleapis.com";
+/// Backward-compatible alias — points to Anthropic.
+pub const DEFAULT_UPSTREAM: &str = DEFAULT_UPSTREAM_ANTHROPIC;
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Which LLM API provider a request targets, derived from its path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provider {
+    Anthropic,
+    OpenAI,
+    Gemini,
+}
+
+/// Map a request path to its provider. Falls back to Anthropic for unrecognised paths.
+pub fn detect_provider(path: &str) -> Provider {
+    if path == "/v1/messages"
+        || path.starts_with("/v1/messages/")
+        || path.starts_with("/v1/messages?")
+    {
+        return Provider::Anthropic;
+    }
+    if path.starts_with("/v1/chat/completions")
+        || path.starts_with("/v1/embeddings")
+        || path.starts_with("/v1/models")
+        || path.starts_with("/v1/images")
+        || path.starts_with("/v1/files")
+        || path.starts_with("/v1/threads")
+        || path.starts_with("/v1/assistants")
+    {
+        return Provider::OpenAI;
+    }
+    if path.starts_with("/v1beta/models") {
+        return Provider::Gemini;
+    }
+    Provider::Anthropic
+}
 
 /// Pluggable OAuth token source.
 ///
@@ -67,7 +103,9 @@ impl TokenSource {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub upstream: String,
+    pub upstream_anthropic: String,
+    pub upstream_openai: String,
+    pub upstream_gemini: String,
     pub client: reqwest::Client,
     pub token_source: TokenSource,
     pub version_cache: Arc<cc_version::VersionCache>,
@@ -77,21 +115,32 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(upstream: impl Into<String>, token_source: TokenSource) -> anyhow::Result<Self> {
+    pub fn new(
+        upstream_anthropic: impl Into<String>,
+        upstream_openai: impl Into<String>,
+        upstream_gemini: impl Into<String>,
+        token_source: TokenSource,
+    ) -> anyhow::Result<Self> {
         Self::with_version(
-            upstream,
+            upstream_anthropic,
+            upstream_openai,
+            upstream_gemini,
             token_source,
             Arc::new(cc_version::VersionCache::detect_or_fallback()),
         )
     }
 
     pub fn with_version(
-        upstream: impl Into<String>,
+        upstream_anthropic: impl Into<String>,
+        upstream_openai: impl Into<String>,
+        upstream_gemini: impl Into<String>,
         token_source: TokenSource,
         version_cache: Arc<cc_version::VersionCache>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            upstream: upstream.into().trim_end_matches('/').to_string(),
+            upstream_anthropic: upstream_anthropic.into().trim_end_matches('/').to_string(),
+            upstream_openai: upstream_openai.into().trim_end_matches('/').to_string(),
+            upstream_gemini: upstream_gemini.into().trim_end_matches('/').to_string(),
             client: reqwest::Client::builder()
                 .timeout(UPSTREAM_TIMEOUT)
                 .build()
@@ -100,6 +149,15 @@ impl AppState {
             version_cache,
             compress: std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1"),
         })
+    }
+
+    /// Return the upstream URL for the provider inferred from `path`.
+    pub fn upstream_for(&self, path: &str) -> &str {
+        match detect_provider(path) {
+            Provider::Anthropic => &self.upstream_anthropic,
+            Provider::OpenAI => &self.upstream_openai,
+            Provider::Gemini => &self.upstream_gemini,
+        }
     }
 }
 
@@ -128,7 +186,8 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .map(|p| p.as_str())
         .unwrap_or("/");
     let path_only = parts.uri.path();
-    let target_url = format!("{}{}", state.upstream, path_and_query);
+    let provider = detect_provider(path_only);
+    let target_url = format!("{}{}", state.upstream_for(path_only), path_and_query);
     let _: Uri = target_url.parse().context("target uri parse")?;
 
     let body_bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
@@ -137,8 +196,8 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
 
     // Wire-level compression (opt-in): rewrite fat tool_result blocks
     // before disguise. Fail-open — None means forward the original.
-    let body_bytes = if state.compress && compress::should_compress(path_only) {
-        match compress::rewrite_request_body(&body_bytes) {
+    let body_bytes = if state.compress && compress::should_compress(path_only, provider) {
+        match compress::rewrite_request_body(&body_bytes, provider) {
             Some(rewritten) => {
                 tracing::debug!(
                     before = body_bytes.len(),
@@ -169,7 +228,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     let disguise_enabled = !matches!(state.token_source, TokenSource::Disabled);
     let on_messages_path = disguise::should_disguise(path_only);
 
-    let override_token: Option<String> = if !disguise_enabled || !on_messages_path {
+    let override_token: Option<String> = if !disguise_enabled || !on_messages_path || provider != Provider::Anthropic {
         None
     } else if extract_oauth_shape_token(&parts.headers).is_some() {
         // Mode 1: client signals OAuth intent (sk-ant-oat*) — use the fresh
@@ -268,6 +327,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         method = %parts.method,
         path = %path_and_query,
         status = %status,
+        provider = ?provider,
         disguise = override_token.is_some(),
         "proxied"
     );
@@ -338,8 +398,16 @@ mod tests {
 
     #[test]
     fn appstate_strips_trailing_slash() {
-        let s = AppState::new("https://api.anthropic.com/", TokenSource::Disabled).unwrap();
-        assert_eq!(s.upstream, "https://api.anthropic.com");
+        let s = AppState::new(
+            "https://api.anthropic.com/",
+            "https://api.openai.com/",
+            "https://generativelanguage.googleapis.com/",
+            TokenSource::Disabled,
+        )
+        .unwrap();
+        assert_eq!(s.upstream_anthropic, "https://api.anthropic.com");
+        assert_eq!(s.upstream_openai, "https://api.openai.com");
+        assert_eq!(s.upstream_gemini, "https://generativelanguage.googleapis.com");
     }
 
     #[test]
@@ -352,5 +420,49 @@ mod tests {
     fn token_source_disabled_returns_none() {
         let ts = TokenSource::Disabled;
         assert_eq!(ts.resolve().unwrap(), None);
+    }
+
+    #[test]
+    fn detect_provider_anthropic() {
+        assert_eq!(detect_provider("/v1/messages"), Provider::Anthropic);
+        assert_eq!(detect_provider("/v1/messages?beta=true"), Provider::Anthropic);
+        assert_eq!(detect_provider("/v1/messages/count_tokens"), Provider::Anthropic);
+    }
+
+    #[test]
+    fn detect_provider_openai() {
+        assert_eq!(detect_provider("/v1/chat/completions"), Provider::OpenAI);
+        assert_eq!(detect_provider("/v1/chat/completions?stream=true"), Provider::OpenAI);
+        assert_eq!(detect_provider("/v1/embeddings"), Provider::OpenAI);
+        assert_eq!(detect_provider("/v1/models"), Provider::OpenAI);
+    }
+
+    #[test]
+    fn detect_provider_gemini() {
+        assert_eq!(detect_provider("/v1beta/models/gemini-2.5-flash:generateContent"), Provider::Gemini);
+        assert_eq!(detect_provider("/v1beta/models/gemini-2.5-flash:streamGenerateContent"), Provider::Gemini);
+    }
+
+    #[test]
+    fn detect_provider_fallback() {
+        assert_eq!(detect_provider("/"), Provider::Anthropic);
+        assert_eq!(detect_provider("/v1/unknown"), Provider::Anthropic);
+    }
+
+    #[test]
+    fn upstream_for_resolves_correctly() {
+        let s = AppState::new(
+            "https://api.anthropic.com",
+            "https://api.openai.com",
+            "https://generativelanguage.googleapis.com",
+            TokenSource::Disabled,
+        )
+        .unwrap();
+        assert_eq!(s.upstream_for("/v1/messages"), "https://api.anthropic.com");
+        assert_eq!(s.upstream_for("/v1/chat/completions"), "https://api.openai.com");
+        assert_eq!(
+            s.upstream_for("/v1beta/models/gemini-2.5-flash:generateContent"),
+            "https://generativelanguage.googleapis.com"
+        );
     }
 }
