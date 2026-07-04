@@ -2,6 +2,11 @@
 //! request bodies through mur-compress before they leave for the upstream.
 //! Fail-open — any parse or engine failure forwards the original bytes.
 
+use crate::Provider;
+use mur_compress::{CompressConfig, CompressEngine, auto_compress, retrieval_note};
+use serde_json::Value;
+use std::path::PathBuf;
+
 /// Paths whose bodies we compress, per provider.
 /// `count_tokens` (and Gemini's `:countTokens`) are deliberately excluded —
 /// their bodies never reach the model, and they run on a hot path.
@@ -41,11 +46,6 @@ pub fn has_retrieve_marker(text: &str) -> bool {
     }
     false
 }
-
-use crate::Provider;
-use mur_compress::{CompressConfig, CompressEngine, auto_compress, retrieval_note};
-use serde_json::Value;
-use std::path::PathBuf;
 
 /// Compress oversized `tool_result` text in `body`. Returns `Some(bytes)`
 /// iff at least one block was replaced; `None` means "forward the original".
@@ -452,6 +452,33 @@ mod tests {
     }
 
     #[test]
+    fn gemini_mixed_parts_survive_compression() {
+        let (_dir, engine) = test_engine();
+        // A functionResponse alongside a non-functionResponse part —
+        // only the functionResponse text is compressed; sibling survives.
+        let body = serde_json::to_vec(&json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "bash", "response": {"result": fat_log()}}},
+                    {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let out = rewrite_tool_results_gemini(&engine, 800, &body).expect("should fire");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let parts = v["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        // First part: functionResponse.response.result was compressed.
+        assert!(has_retrieve_marker(
+            parts[0]["functionResponse"]["response"]["result"].as_str().unwrap()
+        ));
+        // Second part: non-functionResponse sibling untouched.
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "AAAA");
+    }
+
+    #[test]
     fn gemini_skips_non_function_response_parts() {
         let (_dir, engine) = test_engine();
         // A body with no functionResponse — text parts only — should pass through.
@@ -533,12 +560,16 @@ mod tests {
     fn openai_array_form_text_blocks() {
         let (_dir, engine) = test_engine();
         let body = body_with_openai_tool_result(json!([
-            {"type": "text", "text": fat_log()}
+            {"type": "text", "text": fat_log()},
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
         ]));
         let out = rewrite_tool_results_openai(&engine, 800, &body).expect("should fire");
         let v: Value = serde_json::from_slice(&out).unwrap();
         let content = &v["messages"][1]["content"];
         let items = content.as_array().unwrap();
         assert!(has_retrieve_marker(items[0]["text"].as_str().unwrap()));
+        // Non-text sibling must survive unchanged.
+        assert_eq!(items[1]["type"], "image_url");
+        assert_eq!(items[1]["image_url"]["url"], "https://example.com/img.png");
     }
 }

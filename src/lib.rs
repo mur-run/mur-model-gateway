@@ -37,6 +37,7 @@ pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 /// Which LLM API provider a request targets, derived from its path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum Provider {
     Anthropic,
     OpenAI,
