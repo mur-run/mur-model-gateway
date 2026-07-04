@@ -247,9 +247,10 @@ async fn disguise_preserves_array_form_system_with_cache_control() {
 #[tokio::test]
 async fn disguise_upgrades_x_api_key_oauth_shape_token() {
     // New-mur path: the public client always sends `x-api-key: $TOKEN`,
-    // even when $TOKEN is a subscription OAuth token. The proxy must
-    // recognize sk-ant-oat* and apply the full disguise using THAT token,
-    // not whatever the static TokenSource returns.
+    // even when $TOKEN is a subscription OAuth token. The proxy recognizes
+    // sk-ant-oat* as an OAuth intent signal, then resolves a fresh token
+    // from the configured TokenSource (Keychain in production). The client's
+    // token is never used as the upstream bearer — it is only the signal.
     let upstream = MockServer::start_async().await;
     let upstream_mock = upstream
         .mock_async(|when, then| {

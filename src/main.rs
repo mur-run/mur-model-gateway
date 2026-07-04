@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 #[derive(Parser)]
 #[command(
     name = "cc-proxy",
-    about = "Local Anthropic API reverse proxy with Claude Code disguise layer",
+    about = "Multi-provider LLM API reverse proxy (Anthropic / OpenAI / Gemini) with Claude Code disguise layer",
     version
 )]
 struct Cli {
@@ -69,18 +69,9 @@ async fn serve() -> anyhow::Result<()> {
         .unwrap_or_else(|_| DEFAULT_BIND.to_string())
         .parse()
         .context("invalid CC_PROXY_BIND")?;
-    let upstream_anthropic =
-        std::env::var("CC_PROXY_UPSTREAM_ANTHROPIC")
-            .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
-            .unwrap_or_else(|_| DEFAULT_UPSTREAM_ANTHROPIC.to_string());
-    let upstream_openai =
-        std::env::var("CC_PROXY_UPSTREAM_OPENAI")
-            .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
-            .unwrap_or_else(|_| DEFAULT_UPSTREAM_OPENAI.to_string());
-    let upstream_gemini =
-        std::env::var("CC_PROXY_UPSTREAM_GEMINI")
-            .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
-            .unwrap_or_else(|_| DEFAULT_UPSTREAM_GEMINI.to_string());
+    let upstream_anthropic = resolve_upstream("CC_PROXY_UPSTREAM_ANTHROPIC", DEFAULT_UPSTREAM_ANTHROPIC);
+    let upstream_openai = resolve_upstream("CC_PROXY_UPSTREAM_OPENAI", DEFAULT_UPSTREAM_OPENAI);
+    let upstream_gemini = resolve_upstream("CC_PROXY_UPSTREAM_GEMINI", DEFAULT_UPSTREAM_GEMINI);
 
     let token_source = match std::env::var("CC_PROXY_TOKEN_SOURCE")
         .unwrap_or_else(|_| "keychain".to_string())
@@ -115,6 +106,13 @@ async fn serve() -> anyhow::Result<()> {
         .await
         .context("axum serve")?;
     Ok(())
+}
+
+/// Resolve an upstream URL: provider-specific var → generic CC_PROXY_UPSTREAM → default.
+fn resolve_upstream(provider_var: &str, default: &str) -> String {
+    std::env::var(provider_var)
+        .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
+        .unwrap_or_else(|_| default.to_string())
 }
 
 async fn shutdown_signal() {

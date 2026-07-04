@@ -1,12 +1,12 @@
-//! cc-proxy — local Anthropic API reverse proxy.
+//! cc-proxy — multi-provider LLM API reverse proxy (Anthropic, OpenAI, Gemini).
 //!
-//! Iter 1: byte-passthrough plus an optional disguise layer for
-//! `/v1/messages*`. When the inbound request carries no auth, the proxy
-//! resolves an OAuth token from the configured [`TokenSource`], adds
-//! `Authorization: Bearer …`, the claude-code-* `anthropic-beta` header,
-//! and prepends a billing-header text block to the request's `system`
-//! field. Requests that already authenticate themselves are passed
-//! through untouched.
+//! Path-based routing: `/v1/messages*` → Anthropic, `/v1/chat/completions*` → OpenAI,
+//! `/v1beta/models/*` → Gemini. A disguise layer applies to Anthropic traffic only:
+//! when the inbound request carries no auth, the proxy resolves an OAuth token from
+//! the configured [`TokenSource`], adds `Authorization: Bearer …`, the claude-code-*
+//! `anthropic-beta` header, and prepends a billing-header text block to the request's
+//! `system` field. Wire-level CCR compression (opt-in via `CC_PROXY_COMPRESS=1`)
+//! applies to tool_result blocks for all three providers.
 
 pub mod cc_version;
 pub mod compress;
@@ -44,6 +44,8 @@ pub enum Provider {
 }
 
 /// Map a request path to its provider. Falls back to Anthropic for unrecognised paths.
+// N.B. `/v1/models` is deliberately NOT in the OpenAI list — both Anthropic and OpenAI
+// expose that endpoint, so we let it fall through to the Anthropic default.
 pub fn detect_provider(path: &str) -> Provider {
     if path == "/v1/messages"
         || path.starts_with("/v1/messages/")
@@ -51,19 +53,34 @@ pub fn detect_provider(path: &str) -> Provider {
     {
         return Provider::Anthropic;
     }
-    if path.starts_with("/v1/chat/completions")
-        || path.starts_with("/v1/embeddings")
-        || path.starts_with("/v1/models")
-        || path.starts_with("/v1/images")
-        || path.starts_with("/v1/files")
-        || path.starts_with("/v1/threads")
-        || path.starts_with("/v1/assistants")
+    if (path.starts_with("/v1/chat/completions/")
+        || path == "/v1/chat/completions"
+        || path.starts_with("/v1/chat/completions?"))
+        || (path.starts_with("/v1/embeddings/")
+            || path == "/v1/embeddings"
+            || path.starts_with("/v1/embeddings?"))
+        || (path.starts_with("/v1/images/")
+            || path == "/v1/images"
+            || path.starts_with("/v1/images?"))
+        || (path.starts_with("/v1/files/")
+            || path == "/v1/files"
+            || path.starts_with("/v1/files?"))
+        || (path.starts_with("/v1/threads/")
+            || path == "/v1/threads"
+            || path.starts_with("/v1/threads?"))
+        || (path.starts_with("/v1/assistants/")
+            || path == "/v1/assistants"
+            || path.starts_with("/v1/assistants?"))
     {
         return Provider::OpenAI;
     }
-    if path.starts_with("/v1beta/models") {
+    if path.starts_with("/v1beta/models/")
+        || path == "/v1beta/models"
+        || path.starts_with("/v1beta/models?")
+    {
         return Provider::Gemini;
     }
+    tracing::debug!(path = %path, "unrecognised path, falling back to Anthropic");
     Provider::Anthropic
 }
 
@@ -151,9 +168,9 @@ impl AppState {
         })
     }
 
-    /// Return the upstream URL for the provider inferred from `path`.
-    pub fn upstream_for(&self, path: &str) -> &str {
-        match detect_provider(path) {
+    /// Return the upstream URL for the given provider.
+    pub fn upstream_for(&self, provider: Provider) -> &str {
+        match provider {
             Provider::Anthropic => &self.upstream_anthropic,
             Provider::OpenAI => &self.upstream_openai,
             Provider::Gemini => &self.upstream_gemini,
@@ -187,7 +204,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .unwrap_or("/");
     let path_only = parts.uri.path();
     let provider = detect_provider(path_only);
-    let target_url = format!("{}{}", state.upstream_for(path_only), path_and_query);
+    let target_url = format!("{}{}", state.upstream_for(provider), path_and_query);
     let _: Uri = target_url.parse().context("target uri parse")?;
 
     let body_bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
@@ -434,7 +451,7 @@ mod tests {
         assert_eq!(detect_provider("/v1/chat/completions"), Provider::OpenAI);
         assert_eq!(detect_provider("/v1/chat/completions?stream=true"), Provider::OpenAI);
         assert_eq!(detect_provider("/v1/embeddings"), Provider::OpenAI);
-        assert_eq!(detect_provider("/v1/models"), Provider::OpenAI);
+        assert_eq!(detect_provider("/v1/images/generations"), Provider::OpenAI);
     }
 
     #[test]
@@ -447,6 +464,21 @@ mod tests {
     fn detect_provider_fallback() {
         assert_eq!(detect_provider("/"), Provider::Anthropic);
         assert_eq!(detect_provider("/v1/unknown"), Provider::Anthropic);
+        // /v1/models is ambiguous (both Anthropic and OpenAI expose it);
+        // deliberate fallback to Anthropic default.
+        assert_eq!(detect_provider("/v1/models"), Provider::Anthropic);
+    }
+
+    #[test]
+    fn detect_provider_boundary_prefixes() {
+        // Paths that look like OpenAI prefixes but aren't must not match.
+        assert_eq!(detect_provider("/v1/images-tools"), Provider::Anthropic);
+        assert_eq!(detect_provider("/v1/files-legacy"), Provider::Anthropic);
+        assert_eq!(detect_provider("/v1/threads-v2"), Provider::Anthropic);
+        assert_eq!(detect_provider("/v1/assistants-old"), Provider::Anthropic);
+        assert_eq!(detect_provider("/v1/embeddings-legacy"), Provider::Anthropic);
+        // Gemini boundary
+        assert_eq!(detect_provider("/v1beta/models-config"), Provider::Anthropic);
     }
 
     #[test]
@@ -458,10 +490,10 @@ mod tests {
             TokenSource::Disabled,
         )
         .unwrap();
-        assert_eq!(s.upstream_for("/v1/messages"), "https://api.anthropic.com");
-        assert_eq!(s.upstream_for("/v1/chat/completions"), "https://api.openai.com");
+        assert_eq!(s.upstream_for(Provider::Anthropic), "https://api.anthropic.com");
+        assert_eq!(s.upstream_for(Provider::OpenAI), "https://api.openai.com");
         assert_eq!(
-            s.upstream_for("/v1beta/models/gemini-2.5-flash:generateContent"),
+            s.upstream_for(Provider::Gemini),
             "https://generativelanguage.googleapis.com"
         );
     }

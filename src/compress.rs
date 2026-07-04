@@ -1,11 +1,11 @@
-//! Wire-level tool_result compression: rewrites `/v1/messages` request
-//! bodies through mur-compress before they leave for the upstream.
+//! Wire-level tool_result compression: rewrites Anthropic, OpenAI, and Gemini
+//! request bodies through mur-compress before they leave for the upstream.
 //! Fail-open — any parse or engine failure forwards the original bytes.
 
 /// Paths whose bodies we compress, per provider.
-/// `count_tokens` is deliberately excluded for Anthropic — its body never
-/// reaches the model, and it runs on a hot path. The client over-counting
-/// context (vs the compressed send) is the fail-safe direction.
+/// `count_tokens` (and Gemini's `:countTokens`) are deliberately excluded —
+/// their bodies never reach the model, and they run on a hot path.
+/// The client over-counting context (vs the compressed send) is the fail-safe direction.
 pub fn should_compress(path: &str, provider: Provider) -> bool {
     match provider {
         Provider::Anthropic => {
@@ -14,7 +14,10 @@ pub fn should_compress(path: &str, provider: Provider) -> bool {
         Provider::OpenAI => {
             path == "/v1/chat/completions" || path.starts_with("/v1/chat/completions?")
         }
-        Provider::Gemini => path.starts_with("/v1beta/models/"),
+        Provider::Gemini => {
+            path.starts_with("/v1beta/models/")
+                && (path.contains(":generateContent") || path.contains(":streamGenerateContent"))
+        }
     }
 }
 
@@ -235,9 +238,22 @@ mod tests {
         assert!(should_compress("/v1/chat/completions?stream=true", Provider::OpenAI));
         assert!(!should_compress("/v1/chat/completions/messages", Provider::OpenAI));
 
-        // Gemini — any /v1beta/models/ path
+        // Gemini — only :generateContent and :streamGenerateContent
         assert!(should_compress(
             "/v1beta/models/gemini-2.5-flash:generateContent",
+            Provider::Gemini
+        ));
+        assert!(should_compress(
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            Provider::Gemini
+        ));
+        // countTokens and other non-chat endpoints excluded
+        assert!(!should_compress(
+            "/v1beta/models/gemini-2.5-flash:countTokens",
+            Provider::Gemini
+        ));
+        assert!(!should_compress(
+            "/v1beta/models/gemini-2.5-flash:embedContent",
             Provider::Gemini
         ));
     }

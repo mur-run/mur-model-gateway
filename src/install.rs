@@ -66,8 +66,16 @@ pub fn install(compress: Option<bool>) -> Result<()> {
 
     let log_file = paths.log_dir.join("proxy.log");
     // Flag wins; otherwise capture the install-time env opt-in (default off).
-    let compress = compress
-        .unwrap_or_else(|| std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1"));
+    let compress = compress.unwrap_or_else(|| {
+        let env_on = std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1");
+        if env_on {
+            eprintln!(
+                "note: CC_PROXY_COMPRESS=1 detected in environment, baking into service descriptor.\n\
+                 \x20      Pass --no-compress to override."
+            );
+        }
+        env_on
+    });
 
     if cfg!(target_os = "macos") {
         let plist = render_macos_plist(&paths.binary, &log_file, compress);

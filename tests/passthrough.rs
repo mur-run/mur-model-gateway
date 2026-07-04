@@ -136,3 +136,86 @@ async fn spawn_proxy(upstream: String) -> String {
     tokio::time::sleep(Duration::from_millis(20)).await;
     addr.to_string()
 }
+
+/// Spawn cc-proxy with distinct upstreams per provider.
+async fn spawn_proxy_distinct(
+    upstream_anthropic: String,
+    upstream_openai: String,
+    upstream_gemini: String,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_router(
+        AppState::new(
+            &upstream_anthropic,
+            &upstream_openai,
+            &upstream_gemini,
+            TokenSource::Disabled,
+        )
+        .unwrap(),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    addr.to_string()
+}
+
+#[tokio::test]
+async fn routes_to_correct_upstream_per_provider() {
+    let anthropic_mock = MockServer::start_async().await;
+    let openai_mock = MockServer::start_async().await;
+    let gemini_mock = MockServer::start_async().await;
+
+    let anthropic_hit = anthropic_mock
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(200).body(r#"{"type":"anthropic"}"#);
+        })
+        .await;
+    let openai_hit = openai_mock
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).body(r#"{"type":"openai"}"#);
+        })
+        .await;
+    let gemini_hit = gemini_mock
+        .mock_async(|when, then| {
+            when.method(POST).path_contains("generateContent");
+            then.status(200).body(r#"{"type":"gemini"}"#);
+        })
+        .await;
+
+    let addr = spawn_proxy_distinct(
+        anthropic_mock.base_url(),
+        openai_mock.base_url(),
+        gemini_mock.base_url(),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+
+    // Anthropic
+    let resp = client
+        .post(format!("http://{addr}/v1/messages"))
+        .json(&serde_json::json!({"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    anthropic_hit.assert_async().await;
+
+    // OpenAI
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    openai_hit.assert_async().await;
+
+    // Gemini
+    let resp = client
+        .post(format!("http://{addr}/v1beta/models/gemini-2.5-flash:generateContent"))
+        .json(&serde_json::json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    gemini_hit.assert_async().await;
+}
