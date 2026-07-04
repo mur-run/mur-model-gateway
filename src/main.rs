@@ -102,7 +102,13 @@ async fn serve() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
-    tracing::info!(addr = %bind, "cc-proxy listening");
+    tracing::info!(
+        addr = %bind,
+        upstream_anthropic = %upstream_anthropic,
+        upstream_openai = %upstream_openai,
+        upstream_gemini = %upstream_gemini,
+        "cc-proxy listening"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

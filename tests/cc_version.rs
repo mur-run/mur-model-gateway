@@ -82,8 +82,8 @@ async fn spawn_with(upstream: String, version_cache: Arc<VersionCache>) -> Strin
     let app = build_router(
         AppState::with_version(
             &upstream,
-            "https://api.openai.com",
-            "https://generativelanguage.googleapis.com",
+            &upstream,
+            &upstream,
             token,
             version_cache,
         )

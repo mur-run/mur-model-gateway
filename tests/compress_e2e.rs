@@ -11,8 +11,8 @@ async fn spawn_proxy(upstream: String, compress: bool) -> String {
     let addr = listener.local_addr().unwrap();
     let mut state = AppState::new(
         &upstream,
-        "https://api.openai.com",
-        "https://generativelanguage.googleapis.com",
+        &upstream,
+        &upstream,
         TokenSource::Disabled,
     )
     .unwrap();

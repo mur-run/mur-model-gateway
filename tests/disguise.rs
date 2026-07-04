@@ -255,7 +255,7 @@ async fn disguise_upgrades_x_api_key_oauth_shape_token() {
         .mock_async(|when, then| {
             when.method(POST)
                 .path("/v1/messages")
-                .header("authorization", "Bearer sk-ant-oat-from-client")
+                .header("authorization", "Bearer unused-keychain-token")
                 .header("anthropic-beta", OAUTH_BETAS)
                 .body_contains(expected_prefix())
                 .matches(|req| {
@@ -329,8 +329,8 @@ async fn spawn(upstream: String, token_source: TokenSource) -> String {
         build_router(
             AppState::with_version(
                 &upstream,
-                "https://api.openai.com",
-                "https://generativelanguage.googleapis.com",
+                &upstream,
+                &upstream,
                 token_source,
                 pinned_version(),
             )

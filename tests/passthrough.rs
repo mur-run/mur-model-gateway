@@ -124,8 +124,8 @@ async fn spawn_proxy(upstream: String) -> String {
     let app = build_router(
         AppState::new(
             &upstream,
-            "https://api.openai.com",
-            "https://generativelanguage.googleapis.com",
+            &upstream,
+            &upstream,
             TokenSource::Disabled,
         )
         .unwrap(),
