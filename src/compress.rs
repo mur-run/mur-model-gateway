@@ -127,6 +127,45 @@ fn rewrite_tool_results_openai(
     serde_json::to_vec(&root).ok()
 }
 
+/// Compress oversized `functionResponse` parts in Gemini request bodies.
+/// The `functionResponse.response` field is either a string or an object
+/// with a `result` key — both are handled. Sibling fields (`name`) survive.
+fn rewrite_tool_results_gemini(
+    engine: &CompressEngine,
+    min_tokens: usize,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    let mut root: Value = serde_json::from_slice(body).ok()?;
+    let contents = root.get_mut("contents")?.as_array_mut()?;
+    let mut changed = false;
+    for content_item in contents.iter_mut() {
+        let Some(parts) = content_item.get_mut("parts").and_then(|p| p.as_array_mut()) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let Some(fr) = part.get_mut("functionResponse") else {
+                continue;
+            };
+            let Some(response) = fr.get_mut("response") else {
+                continue;
+            };
+            match response {
+                Value::String(s) => changed |= compress_text(engine, min_tokens, s),
+                Value::Object(obj) => {
+                    if let Some(Value::String(s)) = obj.get_mut("result") {
+                        changed |= compress_text(engine, min_tokens, s);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_vec(&root).ok()
+}
+
 /// Replace `s` with its compressed form when compression fires.
 /// Returns true iff replaced.
 fn compress_text(engine: &CompressEngine, min_tokens: usize, s: &mut String) -> bool {
@@ -176,7 +215,7 @@ pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Option<Vec<u8>> 
     match provider {
         Provider::Anthropic => rewrite_tool_results_anthropic(&engine, min_tokens, body),
         Provider::OpenAI => rewrite_tool_results_openai(&engine, min_tokens, body),
-        Provider::Gemini => None, // Task 3 will add the Gemini extractor
+        Provider::Gemini => rewrite_tool_results_gemini(&engine, min_tokens, body),
     }
 }
 
@@ -334,6 +373,82 @@ mod tests {
         }))
         .unwrap();
         assert!(rewrite_tool_results_anthropic(&engine, 800, &plain).is_none());
+    }
+
+    // ── Gemini extractor tests ──────────────────────────────────────────
+
+    fn body_with_gemini_function_response(response: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "bash", "args": {}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "bash", "response": response}}
+                ]}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn gemini_compresses_object_result() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_gemini_function_response(json!({"result": fat_log()}));
+        let out = rewrite_tool_results_gemini(&engine, 800, &body).expect("should fire");
+        assert!(out.len() < body.len(), "rewritten body must be smaller");
+
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let fr = &v["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "bash");
+        assert!(has_retrieve_marker(fr["response"]["result"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn gemini_compresses_string_response() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_gemini_function_response(json!(fat_log()));
+        let out = rewrite_tool_results_gemini(&engine, 800, &body).expect("should fire");
+        assert!(out.len() < body.len());
+
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let fr = &v["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "bash");
+        assert!(has_retrieve_marker(fr["response"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn gemini_skips_small_blocks() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_gemini_function_response(json!({"result": "short"}));
+        assert!(rewrite_tool_results_gemini(&engine, 800, &body).is_none());
+    }
+
+    #[test]
+    fn gemini_idempotent_second_pass_is_noop() {
+        let (_dir, engine) = test_engine();
+        let body = body_with_gemini_function_response(json!({"result": fat_log()}));
+        let once = rewrite_tool_results_gemini(&engine, 800, &body).expect("first pass fires");
+        assert!(
+            rewrite_tool_results_gemini(&engine, 800, &once).is_none(),
+            "second pass must not double-compress"
+        );
+    }
+
+    #[test]
+    fn gemini_skips_non_function_response_parts() {
+        let (_dir, engine) = test_engine();
+        // A body with no functionResponse — text parts only — should pass through.
+        let body = serde_json::to_vec(&json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"text": fat_log()},
+                    {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(rewrite_tool_results_gemini(&engine, 800, &body).is_none());
     }
 
     // ── OpenAI extractor tests ──────────────────────────────────────────
