@@ -265,7 +265,11 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
                 .get("arguments")
                 .and_then(|a| a.as_str())
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .and_then(|v| v.get("file_path").and_then(|p| p.as_str()).map(String::from));
+                .and_then(|v| {
+                    v.get("file_path")
+                        .and_then(|p| p.as_str())
+                        .map(String::from)
+                });
             tool_meta.insert(id.to_string(), (name, path));
         }
     }
@@ -311,7 +315,10 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
     for (i, &msg_idx) in locators.iter().enumerate() {
         let Some(r) = &reasons[i] else { continue };
         let stub = stale_stub(engine, r, &candidates[i].text);
-        if let Some(content_field) = messages_mut.get_mut(msg_idx).and_then(|m| m.get_mut("content")) {
+        if let Some(content_field) = messages_mut
+            .get_mut(msg_idx)
+            .and_then(|m| m.get_mut("content"))
+        {
             *content_field = Value::String(stub);
             changed = true;
         }
@@ -424,9 +431,7 @@ fn collapse_stale_tool_results_gemini(engine: &CompressEngine, root: &mut Value)
 /// The client over-counting context (vs the compressed send) is the fail-safe direction.
 pub fn should_compress(path: &str, provider: Provider) -> bool {
     match provider {
-        Provider::Anthropic => {
-            path == "/v1/messages" || path.starts_with("/v1/messages?")
-        }
+        Provider::Anthropic => path == "/v1/messages" || path.starts_with("/v1/messages?"),
         Provider::OpenAI => {
             path == "/v1/chat/completions" || path.starts_with("/v1/chat/completions?")
         }
@@ -647,13 +652,25 @@ mod tests {
     fn should_compress_per_provider() {
         // Anthropic
         assert!(should_compress("/v1/messages", Provider::Anthropic));
-        assert!(should_compress("/v1/messages?beta=true", Provider::Anthropic));
-        assert!(!should_compress("/v1/messages/count_tokens", Provider::Anthropic));
+        assert!(should_compress(
+            "/v1/messages?beta=true",
+            Provider::Anthropic
+        ));
+        assert!(!should_compress(
+            "/v1/messages/count_tokens",
+            Provider::Anthropic
+        ));
 
         // OpenAI
         assert!(should_compress("/v1/chat/completions", Provider::OpenAI));
-        assert!(should_compress("/v1/chat/completions?stream=true", Provider::OpenAI));
-        assert!(!should_compress("/v1/chat/completions/messages", Provider::OpenAI));
+        assert!(should_compress(
+            "/v1/chat/completions?stream=true",
+            Provider::OpenAI
+        ));
+        assert!(!should_compress(
+            "/v1/chat/completions/messages",
+            Provider::OpenAI
+        ));
 
         // Gemini — only :generateContent and :streamGenerateContent
         assert!(should_compress(
@@ -819,10 +836,15 @@ mod tests {
                 .clone(),
         );
         messages.extend(
-            tool_use_and_result("toolu_read2", "Read", "src/main.rs", "fn main() { changed(); }")
-                .as_array()
-                .unwrap()
-                .clone(),
+            tool_use_and_result(
+                "toolu_read2",
+                "Read",
+                "src/main.rs",
+                "fn main() { changed(); }",
+            )
+            .as_array()
+            .unwrap()
+            .clone(),
         );
         let body =
             serde_json::to_vec(&json!({"messages": messages, "model": "x", "max_tokens": 16}))
@@ -853,10 +875,15 @@ mod tests {
                 .clone(),
         );
         messages.extend(
-            tool_use_and_result("toolu_r2", "Read", "src/math.rs", "fn add(a: i32, b: i32) -> i32 { a + b }")
-                .as_array()
-                .unwrap()
-                .clone(),
+            tool_use_and_result(
+                "toolu_r2",
+                "Read",
+                "src/math.rs",
+                "fn add(a: i32, b: i32) -> i32 { a + b }",
+            )
+            .as_array()
+            .unwrap()
+            .clone(),
         );
         let body =
             serde_json::to_vec(&json!({"messages": messages, "model": "x", "max_tokens": 16}))
@@ -963,10 +990,15 @@ mod tests {
                 .clone(),
         );
         messages.extend(
-            tool_use_and_result("toolu_r2", "Read", "src/foo.rs", "struct Foo { x: i32, y: i32 }")
-                .as_array()
-                .unwrap()
-                .clone(),
+            tool_use_and_result(
+                "toolu_r2",
+                "Read",
+                "src/foo.rs",
+                "struct Foo { x: i32, y: i32 }",
+            )
+            .as_array()
+            .unwrap()
+            .clone(),
         );
         let body =
             serde_json::to_vec(&json!({"messages": messages, "model": "x", "max_tokens": 16}))
@@ -1010,8 +1042,13 @@ mod tests {
         let out = rewrite_tool_results_anthropic(&engine, 800, &body);
         if let Some(out) = out {
             let v: Value = serde_json::from_slice(&out).unwrap();
-            let items = v["messages"][1]["content"][0]["content"].as_array().unwrap();
-            assert_eq!(items[0]["text"], "some code", "mixed-content read left intact");
+            let items = v["messages"][1]["content"][0]["content"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                items[0]["text"], "some code",
+                "mixed-content read left intact"
+            );
             assert_eq!(items[1]["type"], "image");
         }
     }
@@ -1020,7 +1057,9 @@ mod tests {
     fn malformed_or_foreign_bodies_pass_through() {
         let (_dir, engine) = test_engine();
         assert!(rewrite_tool_results_anthropic(&engine, 800, b"not json {").is_none());
-        assert!(rewrite_tool_results_anthropic(&engine, 800, br#"{"no_messages": true}"#).is_none());
+        assert!(
+            rewrite_tool_results_anthropic(&engine, 800, br#"{"no_messages": true}"#).is_none()
+        );
         // string-content user message (no tool_result) untouched
         let plain = serde_json::to_vec(&json!({
             "messages": [{"role": "user", "content": "hello"}]
@@ -1055,7 +1094,9 @@ mod tests {
         let v: Value = serde_json::from_slice(&out).unwrap();
         let fr = &v["contents"][1]["parts"][0]["functionResponse"];
         assert_eq!(fr["name"], "bash");
-        assert!(has_retrieve_marker(fr["response"]["result"].as_str().unwrap()));
+        assert!(has_retrieve_marker(
+            fr["response"]["result"].as_str().unwrap()
+        ));
     }
 
     #[test]
@@ -1109,7 +1150,9 @@ mod tests {
         assert_eq!(parts.len(), 2);
         // First part: functionResponse.response.result was compressed.
         assert!(has_retrieve_marker(
-            parts[0]["functionResponse"]["response"]["result"].as_str().unwrap()
+            parts[0]["functionResponse"]["response"]["result"]
+                .as_str()
+                .unwrap()
         ));
         // Second part: non-functionResponse sibling untouched.
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
