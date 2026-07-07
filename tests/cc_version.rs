@@ -80,14 +80,7 @@ async fn spawn_with(upstream: String, version_cache: Arc<VersionCache>) -> Strin
     let addr = listener.local_addr().unwrap();
     let token = TokenSource::Static(Arc::new("test-token".to_string()));
     let app = build_router(
-        AppState::with_version(
-            &upstream,
-            &upstream,
-            &upstream,
-            token,
-            version_cache,
-        )
-        .unwrap(),
+        AppState::with_version(&upstream, &upstream, &upstream, token, version_cache).unwrap(),
     );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

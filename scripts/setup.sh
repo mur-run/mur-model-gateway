@@ -9,6 +9,10 @@
 #   ./scripts/setup.sh              # build + install + start
 #   ./scripts/setup.sh --no-service # build + install binary only
 #   ./scripts/setup.sh --uninstall  # tear down service, leave binary
+#   ./scripts/setup.sh --musl       # static musl build (old-GLIBC hosts, e.g. Ubuntu 20.04)
+#   ./scripts/setup.sh --system     # Linux: system-level unit (boots headless; needs sudo)
+#   ./scripts/setup.sh -- --token-source env:CC_PROXY_OAUTH_TOKEN --bind 127.0.0.1:9099
+#                                   # everything after -- goes to `cc-proxy install`
 #   INSTALL_DIR=~/bin ./scripts/setup.sh   # override install location
 
 set -euo pipefail
@@ -39,7 +43,11 @@ teardown_service() {
       fi
       ;;
     linux)
-      systemctl --user disable --now cc-proxy.service 2>/dev/null || true
+      if [[ "${SYSTEM:-0}" == 1 ]]; then
+        sudo systemctl disable --now cc-proxy.service 2>/dev/null || true
+      else
+        systemctl --user disable --now cc-proxy.service 2>/dev/null || true
+      fi
       ;;
   esac
 }
@@ -51,8 +59,13 @@ start_service() {
       launchctl enable "gui/$(id -u)/$SERVICE_LABEL"
       ;;
     linux)
-      systemctl --user daemon-reload
-      systemctl --user enable --now cc-proxy.service
+      if [[ "${SYSTEM:-0}" == 1 ]]; then
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now cc-proxy.service
+      else
+        systemctl --user daemon-reload
+        systemctl --user enable --now cc-proxy.service
+      fi
       ;;
   esac
 }
@@ -84,10 +97,17 @@ Stop : launchctl bootout gui/\$(id -u)/$SERVICE_LABEL
 EOF
       ;;
     linux)
-      cat <<EOF
+      if [[ "${SYSTEM:-0}" == 1 ]]; then
+        cat <<EOF
+Logs : journalctl -u cc-proxy.service -f
+Stop : sudo systemctl disable --now cc-proxy.service
+EOF
+      else
+        cat <<EOF
 Logs : journalctl --user -u cc-proxy.service -f
 Stop : systemctl --user disable --now cc-proxy.service
 EOF
+      fi
       ;;
   esac
 }
@@ -95,17 +115,28 @@ EOF
 # ─── argv parsing ───────────────────────────────────────────────────
 
 ACTION=install
-for arg in "$@"; do
-  case "$arg" in
+MUSL=0
+SYSTEM=0
+INSTALL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --no-service)  ACTION=binary_only ;;
     --uninstall)   ACTION=uninstall ;;
+    --musl)        MUSL=1 ;;
+    --system)      SYSTEM=1 ;;
+    --)            shift; INSTALL_ARGS=("$@"); break ;;
     -h|--help)
       awk 'NR==1 { next } /^[^#]/ { exit } { sub(/^# ?/, ""); print }' "$0"
       exit 0
       ;;
-    *) err "unknown flag: $arg"; exit 2 ;;
+    *) err "unknown flag: $1"; exit 2 ;;
   esac
+  shift
 done
+
+if [[ "$SYSTEM" == 1 && "$PLATFORM" != linux ]]; then
+  err "--system is Linux-only"; exit 2
+fi
 
 # ─── uninstall path ─────────────────────────────────────────────────
 
@@ -121,17 +152,32 @@ fi
 
 # ─── build ──────────────────────────────────────────────────────────
 
-log "building cc-proxy (release)"
 # ponytail: source cargo env so script works when invoked outside a login shell
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 cd "$REPO_ROOT"
-cargo build --release
+if [[ "$MUSL" == 1 ]]; then
+  MUSL_TARGET=x86_64-unknown-linux-musl
+  log "building cc-proxy (release, static $MUSL_TARGET)"
+  if ! cargo build --release --target "$MUSL_TARGET"; then
+    err "musl build failed. On a glibc host you need:"
+    err "  rustup target add $MUSL_TARGET && apt-get install musl-tools"
+    err "or build via Docker:"
+    err "  docker run --rm -v \"$REPO_ROOT\":/src -w /src rust:1.91-bookworm bash -c \\"
+    err "    'rustup target add $MUSL_TARGET && apt-get update && apt-get install -y musl-tools && cargo build --release --target $MUSL_TARGET'"
+    exit 1
+  fi
+  BUILD_OUT="$REPO_ROOT/target/$MUSL_TARGET/release/cc-proxy"
+else
+  log "building cc-proxy (release)"
+  cargo build --release
+  BUILD_OUT="$REPO_ROOT/target/release/cc-proxy"
+fi
 
 # ─── install binary ────────────────────────────────────────────────
 
 mkdir -p "$INSTALL_DIR"
 log "installing binary → $INSTALL_PATH"
-install -m 755 "$REPO_ROOT/target/release/cc-proxy" "$INSTALL_PATH"
+install -m 755 "$BUILD_OUT" "$INSTALL_PATH"
 ok "binary installed"
 
 if [[ "$ACTION" == "binary_only" ]]; then
@@ -145,7 +191,11 @@ log "stopping any existing $SERVICE_LABEL"
 teardown_service
 
 log "writing service descriptor"
-"$INSTALL_PATH" install >/dev/null
+if [[ "$SYSTEM" == 1 ]]; then
+  sudo "$INSTALL_PATH" install --system "${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}"
+else
+  "$INSTALL_PATH" install "${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}" >/dev/null
+fi
 
 log "starting service"
 start_service

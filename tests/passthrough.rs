@@ -122,13 +122,7 @@ async fn spawn_proxy(upstream: String) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = build_router(
-        AppState::new(
-            &upstream,
-            &upstream,
-            &upstream,
-            TokenSource::Disabled,
-        )
-        .unwrap(),
+        AppState::new(&upstream, &upstream, &upstream, TokenSource::Disabled).unwrap(),
     );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -207,15 +201,21 @@ async fn routes_to_correct_upstream_per_provider() {
     let resp = client
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     openai_hit.assert_async().await;
 
     // Gemini
     let resp = client
-        .post(format!("http://{addr}/v1beta/models/gemini-2.5-flash:generateContent"))
+        .post(format!(
+            "http://{addr}/v1beta/models/gemini-2.5-flash:generateContent"
+        ))
         .json(&serde_json::json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     gemini_hit.assert_async().await;
 }

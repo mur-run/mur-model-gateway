@@ -326,17 +326,16 @@ fn with_token(t: &str) -> TokenSource {
 async fn spawn(upstream: String, token_source: TokenSource) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app =
-        build_router(
-            AppState::with_version(
-                &upstream,
-                &upstream,
-                &upstream,
-                token_source,
-                pinned_version(),
-            )
-            .unwrap(),
-        );
+    let app = build_router(
+        AppState::with_version(
+            &upstream,
+            &upstream,
+            &upstream,
+            token_source,
+            pinned_version(),
+        )
+        .unwrap(),
+    );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

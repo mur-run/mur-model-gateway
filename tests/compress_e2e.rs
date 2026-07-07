@@ -11,13 +11,7 @@ use std::time::Duration;
 async fn spawn_proxy(upstream: String, compress: bool) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut state = AppState::new(
-        &upstream,
-        &upstream,
-        &upstream,
-        TokenSource::Disabled,
-    )
-    .unwrap();
+    let mut state = AppState::new(&upstream, &upstream, &upstream, TokenSource::Disabled).unwrap();
     state.compress = compress;
     let app = build_router(state);
     tokio::spawn(async move {

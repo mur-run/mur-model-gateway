@@ -63,9 +63,7 @@ pub fn detect_provider(path: &str) -> Provider {
         || (path.starts_with("/v1/images/")
             || path == "/v1/images"
             || path.starts_with("/v1/images?"))
-        || (path.starts_with("/v1/files/")
-            || path == "/v1/files"
-            || path.starts_with("/v1/files?"))
+        || (path.starts_with("/v1/files/") || path == "/v1/files" || path.starts_with("/v1/files?"))
         || (path.starts_with("/v1/threads/")
             || path == "/v1/threads"
             || path.starts_with("/v1/threads?"))
@@ -99,6 +97,10 @@ pub enum TokenSource {
     /// Read from the named environment variable on every request. `Ok(None)`
     /// if unset.
     EnvVar(String),
+    /// Read `claudeAiOauth.accessToken` from a Claude Code credentials JSON
+    /// file (Linux/Windows installs write `~/.claude/.credentials.json`
+    /// instead of the OS keychain). Re-read on every request.
+    CredentialsFile(std::path::PathBuf),
     /// Always return this token. Used by integration tests.
     Static(Arc<String>),
     /// Never disguise; act as a pure passthrough proxy.
@@ -111,7 +113,23 @@ impl TokenSource {
     /// `Err` → backend error, passthrough with a warning logged by the caller.
     pub fn resolve(&self) -> Result<Option<String>, keychain::KeychainError> {
         match self {
-            TokenSource::Keychain => keychain::read_claude_code_oauth(),
+            TokenSource::Keychain => {
+                let from_keychain = keychain::read_claude_code_oauth();
+                // Non-macOS Claude Code installs usually skip the OS keychain
+                // and write ~/.claude/.credentials.json instead; fall back so
+                // the zero-config default works there too.
+                if cfg!(target_os = "macos") {
+                    return from_keychain;
+                }
+                match from_keychain {
+                    Ok(Some(t)) => Ok(Some(t)),
+                    keychain_miss => match keychain::default_credentials_path() {
+                        Some(p) if p.exists() => keychain::read_credentials_file(&p),
+                        _ => keychain_miss,
+                    },
+                }
+            }
+            TokenSource::CredentialsFile(path) => keychain::read_credentials_file(path),
             TokenSource::EnvVar(name) => Ok(std::env::var(name).ok()),
             TokenSource::Static(s) => Ok(Some(s.as_ref().clone())),
             TokenSource::Disabled => Ok(None),
@@ -246,33 +264,34 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     let disguise_enabled = !matches!(state.token_source, TokenSource::Disabled);
     let on_messages_path = disguise::should_disguise(path_only);
 
-    let override_token: Option<String> = if !disguise_enabled || !on_messages_path || provider != Provider::Anthropic {
-        None
-    } else if extract_oauth_shape_token(&parts.headers).is_some() {
-        // Mode 1: client signals OAuth intent (sk-ant-oat*) — use the fresh
-        // Keychain token instead of the client's copy, which may be stale.
-        match state.token_source.resolve() {
-            Ok(token) => token,
-            Err(e) => {
-                tracing::warn!(error = %e, "token source failed, passing through");
-                None
+    let override_token: Option<String> =
+        if !disguise_enabled || !on_messages_path || provider != Provider::Anthropic {
+            None
+        } else if extract_oauth_shape_token(&parts.headers).is_some() {
+            // Mode 1: client signals OAuth intent (sk-ant-oat*) — use the fresh
+            // Keychain token instead of the client's copy, which may be stale.
+            match state.token_source.resolve() {
+                Ok(token) => token,
+                Err(e) => {
+                    tracing::warn!(error = %e, "token source failed, passing through");
+                    None
+                }
             }
-        }
-    } else if !parts.headers.contains_key("authorization")
-        && !parts.headers.contains_key("x-api-key")
-    {
-        // Mode 2: no auth on inbound, resolve from TokenSource.
-        match state.token_source.resolve() {
-            Ok(token) => token,
-            Err(e) => {
-                tracing::warn!(error = %e, "token source failed, passing through");
-                None
+        } else if !parts.headers.contains_key("authorization")
+            && !parts.headers.contains_key("x-api-key")
+        {
+            // Mode 2: no auth on inbound, resolve from TokenSource.
+            match state.token_source.resolve() {
+                Ok(token) => token,
+                Err(e) => {
+                    tracing::warn!(error = %e, "token source failed, passing through");
+                    None
+                }
             }
-        }
-    } else {
-        // Mode 3: pure passthrough.
-        None
-    };
+        } else {
+            // Mode 3: pure passthrough.
+            None
+        };
 
     let cc_version = if override_token.is_some() {
         Some(state.version_cache.get())
@@ -425,7 +444,10 @@ mod tests {
         .unwrap();
         assert_eq!(s.upstream_anthropic, "https://api.anthropic.com");
         assert_eq!(s.upstream_openai, "https://api.openai.com");
-        assert_eq!(s.upstream_gemini, "https://generativelanguage.googleapis.com");
+        assert_eq!(
+            s.upstream_gemini,
+            "https://generativelanguage.googleapis.com"
+        );
     }
 
     #[test]
@@ -443,22 +465,37 @@ mod tests {
     #[test]
     fn detect_provider_anthropic() {
         assert_eq!(detect_provider("/v1/messages"), Provider::Anthropic);
-        assert_eq!(detect_provider("/v1/messages?beta=true"), Provider::Anthropic);
-        assert_eq!(detect_provider("/v1/messages/count_tokens"), Provider::Anthropic);
+        assert_eq!(
+            detect_provider("/v1/messages?beta=true"),
+            Provider::Anthropic
+        );
+        assert_eq!(
+            detect_provider("/v1/messages/count_tokens"),
+            Provider::Anthropic
+        );
     }
 
     #[test]
     fn detect_provider_openai() {
         assert_eq!(detect_provider("/v1/chat/completions"), Provider::OpenAI);
-        assert_eq!(detect_provider("/v1/chat/completions?stream=true"), Provider::OpenAI);
+        assert_eq!(
+            detect_provider("/v1/chat/completions?stream=true"),
+            Provider::OpenAI
+        );
         assert_eq!(detect_provider("/v1/embeddings"), Provider::OpenAI);
         assert_eq!(detect_provider("/v1/images/generations"), Provider::OpenAI);
     }
 
     #[test]
     fn detect_provider_gemini() {
-        assert_eq!(detect_provider("/v1beta/models/gemini-2.5-flash:generateContent"), Provider::Gemini);
-        assert_eq!(detect_provider("/v1beta/models/gemini-2.5-flash:streamGenerateContent"), Provider::Gemini);
+        assert_eq!(
+            detect_provider("/v1beta/models/gemini-2.5-flash:generateContent"),
+            Provider::Gemini
+        );
+        assert_eq!(
+            detect_provider("/v1beta/models/gemini-2.5-flash:streamGenerateContent"),
+            Provider::Gemini
+        );
     }
 
     #[test]
@@ -477,9 +514,15 @@ mod tests {
         assert_eq!(detect_provider("/v1/files-legacy"), Provider::Anthropic);
         assert_eq!(detect_provider("/v1/threads-v2"), Provider::Anthropic);
         assert_eq!(detect_provider("/v1/assistants-old"), Provider::Anthropic);
-        assert_eq!(detect_provider("/v1/embeddings-legacy"), Provider::Anthropic);
+        assert_eq!(
+            detect_provider("/v1/embeddings-legacy"),
+            Provider::Anthropic
+        );
         // Gemini boundary
-        assert_eq!(detect_provider("/v1beta/models-config"), Provider::Anthropic);
+        assert_eq!(
+            detect_provider("/v1beta/models-config"),
+            Provider::Anthropic
+        );
     }
 
     #[test]
@@ -491,7 +534,10 @@ mod tests {
             TokenSource::Disabled,
         )
         .unwrap();
-        assert_eq!(s.upstream_for(Provider::Anthropic), "https://api.anthropic.com");
+        assert_eq!(
+            s.upstream_for(Provider::Anthropic),
+            "https://api.anthropic.com"
+        );
         assert_eq!(s.upstream_for(Provider::OpenAI), "https://api.openai.com");
         assert_eq!(
             s.upstream_for(Provider::Gemini),

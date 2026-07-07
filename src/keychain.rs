@@ -38,6 +38,25 @@ pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
     }
 }
 
+/// Default path of Claude Code's on-disk credentials file (Linux/Windows/WSL
+/// installs that don't use the OS keychain): `~/.claude/.credentials.json`.
+pub fn default_credentials_path() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|d| d.home_dir().join(".claude/.credentials.json"))
+}
+
+/// Read the OAuth token from a Claude Code credentials JSON file.
+/// Same blob shape as the keychain entry. `Ok(None)` if the file doesn't exist.
+pub fn read_credentials_file(path: &std::path::Path) -> Result<Option<String>, KeychainError> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => parse_oauth_blob(&raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(KeychainError::Backend(format!(
+            "read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// Extract `claudeAiOauth.accessToken` from a Claude Code keychain blob.
 fn parse_oauth_blob(raw: &str) -> Result<Option<String>, KeychainError> {
     let creds: Value = serde_json::from_str(raw.trim())
@@ -79,5 +98,41 @@ mod tests {
     fn parse_rejects_wrong_shape() {
         let r = parse_oauth_blob(r#"{"foo":"bar"}"#);
         assert!(matches!(r, Err(KeychainError::Malformed(_))));
+    }
+
+    #[test]
+    fn credentials_file_reads_token() {
+        let dir = std::env::temp_dir().join("cc-proxy-cred-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("creds.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-file"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_credentials_file(&path).unwrap().as_deref(),
+            Some("sk-ant-oat01-file")
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn credentials_file_missing_is_none() {
+        let r = read_credentials_file(std::path::Path::new("/nonexistent/creds.json"));
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn credentials_file_garbage_is_malformed() {
+        let dir = std::env::temp_dir().join("cc-proxy-cred-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("garbage.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(matches!(
+            read_credentials_file(&path),
+            Err(KeychainError::Malformed(_))
+        ));
+        std::fs::remove_file(&path).ok();
     }
 }

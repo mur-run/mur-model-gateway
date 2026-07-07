@@ -1,72 +1,142 @@
 //! Platform-specific service installation.
 //!
-//! Writes a launchd plist (macOS), a systemd user unit (Linux), or
-//! prints Task Scheduler instructions (Windows). The exact path of
-//! the currently-running binary is captured via `current_exe()` and
-//! embedded in the service file, so `install` works whether the
-//! binary lives in `~/.local/bin`, `/opt/homebrew/bin`, or a cargo
-//! target dir.
+//! Writes a launchd plist (macOS), a systemd unit (Linux, user-level by
+//! default or system-level with `--system`), or a `.cmd` wrapper + Task
+//! Scheduler command (Windows). The exact path of the currently-running
+//! binary is captured via `current_exe()` and embedded in the service file,
+//! so `install` works whether the binary lives in `~/.local/bin`,
+//! `/opt/homebrew/bin`, or a cargo target dir.
+//!
+//! Config flags (`--token-source`, `--bind`, `--upstream`) are rendered into
+//! the descriptor as environment variables — the runtime already reads
+//! CC_PROXY_TOKEN_SOURCE / CC_PROXY_BIND / CC_PROXY_UPSTREAM, so nothing else
+//! is needed. In `--system` mode the env goes to a root-owned, mode-600
+//! `/etc/cc-proxy.env` (referenced via `EnvironmentFile=`) so secrets like an
+//! `env:VAR` token can be appended there without living in the unit file.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 pub const SERVICE_LABEL: &str = "run.cc-proxy";
+pub const LINUX_SYSTEM_UNIT: &str = "/etc/systemd/system/cc-proxy.service";
+pub const LINUX_SYSTEM_ENV_FILE: &str = "/etc/cc-proxy.env";
 
-/// Service-file location returned by [`install_paths`].
+/// Install-time configuration collected from CLI flags.
+#[derive(Default)]
+pub struct InstallOpts {
+    /// `--compress` / `--no-compress`; `None` = sniff CC_PROXY_COMPRESS env.
+    pub compress: Option<bool>,
+    /// CC_PROXY_TOKEN_SOURCE to bake in (already validated by the caller).
+    pub token_source: Option<String>,
+    /// CC_PROXY_BIND to bake in.
+    pub bind: Option<String>,
+    /// CC_PROXY_UPSTREAM to bake in.
+    pub upstream: Option<String>,
+    /// Linux only: system-level unit + /etc/cc-proxy.env instead of user unit.
+    pub system: bool,
+}
+
+/// Service-file locations returned by [`InstallPaths::resolve`].
 pub struct InstallPaths {
-    /// Service descriptor (launchd plist / systemd unit / etc.)
+    /// Service descriptor (launchd plist / systemd unit / windows .cmd)
     pub service_file: PathBuf,
-    /// Where the proxy writes stdout+stderr.
+    /// Where the proxy writes stdout+stderr (journal on Linux; dir still used
+    /// for macOS/Windows log files).
     pub log_dir: PathBuf,
     /// Resolved absolute path to the running binary (becomes ProgramArguments[0]).
     pub binary: PathBuf,
+    /// Linux `--system` mode only: EnvironmentFile the unit references.
+    pub env_file: Option<PathBuf>,
 }
 
 impl InstallPaths {
-    pub fn resolve() -> Result<Self> {
+    pub fn resolve(system: bool) -> Result<Self> {
         let binary = std::env::current_exe().context("current_exe")?;
         let dirs = directories::BaseDirs::new().context("BaseDirs::new")?;
         let home = dirs.home_dir();
-        let (service_file, log_dir) = if cfg!(target_os = "macos") {
+        let (service_file, log_dir, env_file) = if cfg!(target_os = "macos") {
             (
                 home.join("Library/LaunchAgents")
                     .join(format!("{SERVICE_LABEL}.plist")),
                 home.join("Library/Logs/cc-proxy"),
+                None,
             )
         } else if cfg!(target_os = "linux") {
-            let cfg = dirs.config_dir();
-            let state = dirs.state_dir().unwrap_or(cfg);
-            (
-                cfg.join("systemd/user/cc-proxy.service"),
-                state.join("cc-proxy"),
-            )
+            if system {
+                (
+                    PathBuf::from(LINUX_SYSTEM_UNIT),
+                    PathBuf::from("/var/log/cc-proxy"),
+                    Some(PathBuf::from(LINUX_SYSTEM_ENV_FILE)),
+                )
+            } else {
+                let cfg = dirs.config_dir();
+                let state = dirs.state_dir().unwrap_or(cfg);
+                (
+                    cfg.join("systemd/user/cc-proxy.service"),
+                    state.join("cc-proxy"),
+                    None,
+                )
+            }
         } else {
             // Windows / other — fall back to %LOCALAPPDATA%\cc-proxy\.
             let local = dirs.config_local_dir();
             (
                 local.join("cc-proxy/cc-proxy.cmd"),
                 local.join("cc-proxy/logs"),
+                None,
             )
         };
         Ok(Self {
             service_file,
             log_dir,
             binary,
+            env_file,
         })
     }
 }
 
-pub fn install(compress: Option<bool>) -> Result<()> {
-    let paths = InstallPaths::resolve()?;
-    std::fs::create_dir_all(&paths.log_dir)
-        .with_context(|| format!("mkdir {}", paths.log_dir.display()))?;
+/// The env lines a descriptor carries: RUST_LOG plus every opted-in var.
+/// Single source of truth for all three render formats.
+pub fn env_pairs(opts: &InstallOpts, compress: bool) -> Result<Vec<(String, String)>> {
+    let mut pairs = vec![("RUST_LOG".to_string(), "info,cc_proxy=debug".to_string())];
+    if compress {
+        pairs.push(("CC_PROXY_COMPRESS".to_string(), "1".to_string()));
+    }
+    for (key, val) in [
+        ("CC_PROXY_TOKEN_SOURCE", &opts.token_source),
+        ("CC_PROXY_BIND", &opts.bind),
+        ("CC_PROXY_UPSTREAM", &opts.upstream),
+    ] {
+        if let Some(v) = val {
+            // Injection guard: these values get spliced verbatim into plist
+            // XML / unit files / cmd scripts.
+            if v.chars()
+                .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '&'))
+            {
+                bail!("invalid {key} value {v:?}: whitespace and <>\"& are not allowed");
+            }
+            pairs.push((key.to_string(), v.clone()));
+        }
+    }
+    Ok(pairs)
+}
+
+pub fn install(opts: InstallOpts) -> Result<()> {
+    if opts.system && !cfg!(target_os = "linux") {
+        bail!("--system is only supported on Linux (systemd)");
+    }
+    let paths = InstallPaths::resolve(opts.system)?;
     if let Some(parent) = paths.service_file.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    if !opts.system {
+        std::fs::create_dir_all(&paths.log_dir)
+            .with_context(|| format!("mkdir {}", paths.log_dir.display()))?;
     }
 
     let log_file = paths.log_dir.join("proxy.log");
     // Flag wins; otherwise capture the install-time env opt-in (default off).
-    let compress = compress.unwrap_or_else(|| {
+    let compress = opts.compress.unwrap_or_else(|| {
         let env_on = std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1");
         if env_on {
             eprintln!(
@@ -76,9 +146,10 @@ pub fn install(compress: Option<bool>) -> Result<()> {
         }
         env_on
     });
+    let env = env_pairs(&opts, compress)?;
 
     if cfg!(target_os = "macos") {
-        let plist = render_macos_plist(&paths.binary, &log_file, compress);
+        let plist = render_macos_plist(&paths.binary, &log_file, &env);
         std::fs::write(&paths.service_file, plist)
             .with_context(|| format!("write {}", paths.service_file.display()))?;
         println!("wrote {}", paths.service_file.display());
@@ -89,43 +160,127 @@ pub fn install(compress: Option<bool>) -> Result<()> {
         println!("      launchctl enable gui/$(id -u)/{SERVICE_LABEL}");
         println!("      tail -f {}", log_file.display());
     } else if cfg!(target_os = "linux") {
-        let unit = render_linux_unit(&paths.binary, compress);
-        std::fs::write(&paths.service_file, unit)
-            .with_context(|| format!("write {}", paths.service_file.display()))?;
-        println!("wrote {}", paths.service_file.display());
-        println!("next: systemctl --user daemon-reload");
-        println!("      systemctl --user enable --now cc-proxy.service");
-        println!("      journalctl --user -u cc-proxy.service -f");
+        if opts.system {
+            let env_file = paths.env_file.as_ref().expect("system mode sets env_file");
+            let user = whoami::username();
+            let unit = render_linux_system_unit(&paths.binary, &user, env_file);
+            write_root_owned(env_file, &render_env_file(&env), 0o600)?;
+            write_root_owned(&paths.service_file, &unit, 0o644)?;
+            println!("wrote {}", paths.service_file.display());
+            println!("wrote {} (mode 600)", env_file.display());
+            if let Some(var) = opts
+                .token_source
+                .as_deref()
+                .and_then(|spec| spec.strip_prefix("env:"))
+            {
+                println!(
+                    "token: append `{var}=<your sk-ant-oat01-… token>` to {} yourself \
+                     (never echo it through a shared shell history)",
+                    env_file.display()
+                );
+            }
+            println!("next: sudo systemctl daemon-reload");
+            println!("      sudo systemctl enable --now cc-proxy.service");
+            println!("      journalctl -u cc-proxy.service -f");
+        } else {
+            let unit = render_linux_unit(&paths.binary, &env);
+            std::fs::write(&paths.service_file, unit)
+                .with_context(|| format!("write {}", paths.service_file.display()))?;
+            println!("wrote {}", paths.service_file.display());
+            println!("next: systemctl --user daemon-reload");
+            println!("      systemctl --user enable --now cc-proxy.service");
+            println!("      journalctl --user -u cc-proxy.service -f");
+            println!(
+                "note: user units only run while you're logged in; for headless/boot\n\
+                 \x20     start use `cc-proxy install --system` or `loginctl enable-linger $USER`"
+            );
+        }
     } else {
-        let cmd = render_windows_cmd(&paths.binary, compress);
+        let cmd = render_windows_cmd(&paths.binary, &log_file, &env);
         std::fs::write(&paths.service_file, cmd)
             .with_context(|| format!("write {}", paths.service_file.display()))?;
         println!("wrote {}", paths.service_file.display());
-        println!("next: register a Task Scheduler entry to run that command at logon,");
+        println!("next (run in an elevated prompt to register the logon task):");
         println!(
-            "      e.g.  schtasks /Create /SC ONLOGON /TN cc-proxy /TR \"{}\"",
+            "      schtasks /Create /F /SC ONLOGON /TN cc-proxy /TR \"\\\"{}\\\"\"",
             paths.service_file.display()
         );
+        println!("      schtasks /Run /TN cc-proxy");
+        println!("      logs: {}", log_file.display());
     }
     Ok(())
 }
 
+/// Write a file that may live under /etc. Plain write first; on permission
+/// denied, fail with a sudo hint instead of trying to escalate ourselves.
+fn write_root_owned(path: &Path, content: &str, mode: u32) -> Result<()> {
+    match std::fs::write(path, content) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("chmod {mode:o} {}", path.display()))?;
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            bail!(
+                "cannot write {} (permission denied) — re-run with sudo: \
+                 sudo {} install --system …",
+                path.display(),
+                std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "cc-proxy".into())
+            );
+        }
+        Err(e) => Err(e).with_context(|| format!("write {}", path.display())),
+    }
+}
+
 pub fn uninstall() -> Result<()> {
-    let paths = InstallPaths::resolve()?;
-    if paths.service_file.exists() {
-        std::fs::remove_file(&paths.service_file)
-            .with_context(|| format!("remove {}", paths.service_file.display()))?;
-        println!("removed {}", paths.service_file.display());
-    } else {
-        println!(
-            "nothing to remove ({} not present)",
-            paths.service_file.display()
-        );
+    // Probe both user and system paths on Linux; only one exists elsewhere.
+    let mut removed_any = false;
+    for system in [false, true] {
+        if system && !cfg!(target_os = "linux") {
+            break;
+        }
+        let paths = InstallPaths::resolve(system)?;
+        let mut targets = vec![paths.service_file];
+        if let Some(env_file) = paths.env_file {
+            targets.push(env_file);
+        }
+        for f in targets {
+            if f.exists() {
+                match std::fs::remove_file(&f) {
+                    Ok(()) => {
+                        println!("removed {}", f.display());
+                        removed_any = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        println!(
+                            "cannot remove {} — run: sudo rm {}",
+                            f.display(),
+                            f.display()
+                        );
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("remove {}", f.display()));
+                    }
+                }
+            }
+        }
+    }
+    if !removed_any {
+        println!("nothing to remove (no service files present)");
     }
     if cfg!(target_os = "macos") {
         println!("next: launchctl bootout gui/$(id -u)/{SERVICE_LABEL}");
     } else if cfg!(target_os = "linux") {
         println!("next: systemctl --user disable --now cc-proxy.service");
+        println!("      (system mode: sudo systemctl disable --now cc-proxy.service)");
     } else {
         println!("next: schtasks /Delete /TN cc-proxy /F");
     }
@@ -133,29 +288,39 @@ pub fn uninstall() -> Result<()> {
 }
 
 pub fn status() -> Result<()> {
-    let paths = InstallPaths::resolve()?;
+    let paths = InstallPaths::resolve(false)?;
     println!("binary       : {}", paths.binary.display());
+    print_file_status("service file", &paths.service_file);
+    if cfg!(target_os = "linux") {
+        let sys = InstallPaths::resolve(true)?;
+        print_file_status("system unit ", &sys.service_file);
+        if let Some(env_file) = sys.env_file {
+            print_file_status("system env  ", &env_file);
+        }
+    }
+    println!("log dir      : {}", paths.log_dir.display());
+    Ok(())
+}
+
+fn print_file_status(label: &str, path: &Path) {
     println!(
-        "service file : {}{}",
-        paths.service_file.display(),
-        if paths.service_file.exists() {
+        "{label} : {}{}",
+        path.display(),
+        if path.exists() {
             " ✓"
         } else {
             " (not installed)"
         }
     );
-    println!("log dir      : {}", paths.log_dir.display());
-    Ok(())
 }
 
-pub fn render_macos_plist(binary: &Path, log_file: &Path, compress: bool) -> String {
+pub fn render_macos_plist(binary: &Path, log_file: &Path, env: &[(String, String)]) -> String {
     let bin = binary.display();
     let log = log_file.display();
-    let compress_env = if compress {
-        "\n        <key>CC_PROXY_COMPRESS</key>\n        <string>1</string>"
-    } else {
-        ""
-    };
+    let env_entries: String = env
+        .iter()
+        .map(|(k, v)| format!("\n        <key>{k}</key>\n        <string>{v}</string>"))
+        .collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -178,9 +343,7 @@ pub fn render_macos_plist(binary: &Path, log_file: &Path, compress: bool) -> Str
     <key>StandardErrorPath</key>
     <string>{log}</string>
     <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key>
-        <string>info,cc_proxy=debug</string>{compress_env}
+    <dict>{env_entries}
     </dict>
 </dict>
 </plist>
@@ -188,12 +351,11 @@ pub fn render_macos_plist(binary: &Path, log_file: &Path, compress: bool) -> Str
     )
 }
 
-pub fn render_linux_unit(binary: &Path, compress: bool) -> String {
-    let compress_env = if compress {
-        "\nEnvironment=CC_PROXY_COMPRESS=1"
-    } else {
-        ""
-    };
+pub fn render_linux_unit(binary: &Path, env: &[(String, String)]) -> String {
+    let env_lines: String = env
+        .iter()
+        .map(|(k, v)| format!("Environment={k}={v}\n"))
+        .collect();
     let bin = binary.display();
     format!(
         r#"[Unit]
@@ -205,8 +367,7 @@ Wants=network-online.target
 ExecStart={bin}
 Restart=on-failure
 RestartSec=2
-Environment=RUST_LOG=info,cc_proxy=debug{compress_env}
-StandardOutput=journal
+{env_lines}StandardOutput=journal
 StandardError=journal
 
 [Install]
@@ -215,14 +376,45 @@ WantedBy=default.target
     )
 }
 
-pub fn render_windows_cmd(binary: &Path, compress: bool) -> String {
-    let compress_env = if compress {
-        "set CC_PROXY_COMPRESS=1\r\n"
-    } else {
-        ""
-    };
+/// System-level unit: boots without a login session, runs as `user`, and
+/// pulls all env (including secrets) from a root-owned mode-600 env file.
+pub fn render_linux_system_unit(binary: &Path, user: &str, env_file: &Path) -> String {
     let bin = binary.display();
-    format!("@echo off\r\nset RUST_LOG=info,cc_proxy=debug\r\n{compress_env}\"{bin}\"\r\n")
+    let envf = env_file.display();
+    format!(
+        r#"[Unit]
+Description=cc-proxy local Anthropic API proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={bin}
+Restart=on-failure
+RestartSec=2
+User={user}
+EnvironmentFile={envf}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"#
+    )
+}
+
+/// KEY=VALUE lines for the systemd EnvironmentFile.
+pub fn render_env_file(env: &[(String, String)]) -> String {
+    env.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
+}
+
+pub fn render_windows_cmd(binary: &Path, log_file: &Path, env: &[(String, String)]) -> String {
+    let set_lines: String = env
+        .iter()
+        .map(|(k, v)| format!("set {k}={v}\r\n"))
+        .collect();
+    let bin = binary.display();
+    let log = log_file.display();
+    format!("@echo off\r\n{set_lines}\"{bin}\" >> \"{log}\" 2>&1\r\n")
 }
 
 #[cfg(test)]
@@ -230,51 +422,132 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn base_env() -> Vec<(String, String)> {
+        vec![("RUST_LOG".to_string(), "info,cc_proxy=debug".to_string())]
+    }
+
     #[test]
-    fn macos_plist_embeds_binary_and_log_paths() {
+    fn env_pairs_orders_and_includes_opted_in_vars() {
+        let opts = InstallOpts {
+            token_source: Some("env:CC_PROXY_OAUTH_TOKEN".into()),
+            bind: Some("127.0.0.1:9099".into()),
+            upstream: Some("https://api.example.com".into()),
+            ..Default::default()
+        };
+        let env = env_pairs(&opts, true).unwrap();
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "RUST_LOG",
+                "CC_PROXY_COMPRESS",
+                "CC_PROXY_TOKEN_SOURCE",
+                "CC_PROXY_BIND",
+                "CC_PROXY_UPSTREAM"
+            ]
+        );
+    }
+
+    #[test]
+    fn env_pairs_rejects_injection() {
+        for bad in ["a b", "a<b", "a\"b", "a&b", "a\nb"] {
+            let opts = InstallOpts {
+                bind: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(env_pairs(&opts, false).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn macos_plist_embeds_binary_log_and_env() {
+        let mut env = base_env();
+        env.push(("CC_PROXY_TOKEN_SOURCE".into(), "file".into()));
         let p = render_macos_plist(
             &PathBuf::from("/usr/local/bin/cc-proxy"),
             &PathBuf::from("/tmp/proxy.log"),
-            false,
+            &env,
         );
         assert!(p.contains("<string>/usr/local/bin/cc-proxy</string>"));
         assert!(p.contains("<string>/tmp/proxy.log</string>"));
         assert!(p.contains(&format!("<string>{SERVICE_LABEL}</string>")));
         assert!(p.contains("<key>KeepAlive</key>"));
         assert!(p.contains("<key>RunAtLoad</key>"));
+        assert!(p.contains("<key>CC_PROXY_TOKEN_SOURCE</key>"));
+        assert!(p.contains("<string>file</string>"));
         assert!(!p.contains("CC_PROXY_COMPRESS"));
     }
 
     #[test]
     fn compress_env_passes_through_when_opted_in() {
+        let opts = InstallOpts::default();
+        let env = env_pairs(&opts, true).unwrap();
+
         let p = render_macos_plist(
             &PathBuf::from("/usr/local/bin/cc-proxy"),
             &PathBuf::from("/tmp/proxy.log"),
-            true,
+            &env,
         );
         assert!(p.contains("<key>CC_PROXY_COMPRESS</key>"));
         assert!(p.contains("<string>1</string>"));
 
-        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), true);
+        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), &env);
         assert!(u.contains("Environment=CC_PROXY_COMPRESS=1"));
 
-        let c = render_windows_cmd(&PathBuf::from(r"C:\Users\u\cc-proxy.exe"), true);
+        let c = render_windows_cmd(
+            &PathBuf::from(r"C:\Users\u\cc-proxy.exe"),
+            &PathBuf::from(r"C:\Users\u\logs\proxy.log"),
+            &env,
+        );
         assert!(c.contains("set CC_PROXY_COMPRESS=1"));
     }
 
     #[test]
-    fn linux_unit_embeds_binary() {
-        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), false);
+    fn linux_unit_embeds_binary_and_env() {
+        let mut env = base_env();
+        env.push(("CC_PROXY_BIND".into(), "127.0.0.1:9099".into()));
+        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), &env);
         assert!(u.contains("ExecStart=/home/u/.local/bin/cc-proxy"));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains("WantedBy=default.target"));
+        assert!(u.contains("Environment=CC_PROXY_BIND=127.0.0.1:9099"));
         assert!(!u.contains("CC_PROXY_COMPRESS"));
     }
 
     #[test]
-    fn windows_cmd_quotes_binary() {
-        let c = render_windows_cmd(&PathBuf::from(r"C:\Users\u\cc-proxy.exe"), false);
+    fn linux_system_unit_runs_as_user_with_env_file() {
+        let u = render_linux_system_unit(
+            &PathBuf::from("/usr/local/bin/cc-proxy"),
+            "karajan",
+            &PathBuf::from(LINUX_SYSTEM_ENV_FILE),
+        );
+        assert!(u.contains("ExecStart=/usr/local/bin/cc-proxy"));
+        assert!(u.contains("User=karajan"));
+        assert!(u.contains("EnvironmentFile=/etc/cc-proxy.env"));
+        assert!(u.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn env_file_renders_key_value_lines() {
+        let env = vec![
+            ("RUST_LOG".to_string(), "info".to_string()),
+            ("CC_PROXY_TOKEN_SOURCE".to_string(), "env:T".to_string()),
+        ];
+        assert_eq!(
+            render_env_file(&env),
+            "RUST_LOG=info\nCC_PROXY_TOKEN_SOURCE=env:T\n"
+        );
+    }
+
+    #[test]
+    fn windows_cmd_quotes_binary_and_redirects_log() {
+        let c = render_windows_cmd(
+            &PathBuf::from(r"C:\Users\u\cc-proxy.exe"),
+            &PathBuf::from(r"C:\Users\u\logs\proxy.log"),
+            &base_env(),
+        );
         assert!(c.contains(r#""C:\Users\u\cc-proxy.exe""#));
+        assert!(c.contains(r#">> "C:\Users\u\logs\proxy.log" 2>&1"#));
         assert!(!c.contains("CC_PROXY_COMPRESS"));
     }
 }
