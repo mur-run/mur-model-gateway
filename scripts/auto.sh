@@ -25,8 +25,12 @@ if [[ "$(uname -s)" == Linux ]]; then
     echo "[auto] GLIBC $glibc < 2.34 → static musl build"
     FLAGS+=(--musl)
   fi
-  # no graphical/user session bus → user units won't start at boot; go system
-  if [[ -z "${XDG_RUNTIME_DIR:-}" ]] || ! systemctl --user is-system-running >/dev/null 2>&1; then
+  # existing system unit → this host runs system-level; upgrade in place
+  if [[ -f /etc/systemd/system/cc-proxy.service ]]; then
+    echo "[auto] existing /etc/systemd/system/cc-proxy.service → system-level unit"
+    FLAGS+=(--system)
+  # no user session bus → user units won't start at boot; go system
+  elif [[ -z "${XDG_RUNTIME_DIR:-}" ]] || ! systemctl --user is-system-running >/dev/null 2>&1; then
     echo "[auto] no user session bus → system-level unit (sudo)"
     FLAGS+=(--system)
   fi

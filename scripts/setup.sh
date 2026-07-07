@@ -203,8 +203,11 @@ fi
 log "starting service"
 start_service
 
-# brief settle
-sleep 1
+# settle: give systemd/launchd up to 5s to bring the listener up
+for _ in 1 2 3 4 5; do
+  is_listening && break
+  sleep 1
+done
 
 if is_listening; then
   ok "listening on 127.0.0.1:$BIND_PORT"
@@ -213,7 +216,13 @@ else
   err "service not listening on 127.0.0.1:$BIND_PORT"
   case "$PLATFORM" in
     macos) err "check: tail ~/Library/Logs/cc-proxy/proxy.log" ;;
-    linux) err "check: journalctl --user -u cc-proxy.service" ;;
+    linux)
+      if [[ "${SYSTEM:-0}" == 1 ]]; then
+        err "check: journalctl -u cc-proxy.service"
+      else
+        err "check: journalctl --user -u cc-proxy.service"
+      fi
+      ;;
   esac
   exit 1
 fi
