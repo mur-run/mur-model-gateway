@@ -158,13 +158,16 @@ cd "$REPO_ROOT"
 if [[ "$MUSL" == 1 ]]; then
   MUSL_TARGET=x86_64-unknown-linux-musl
   log "building cc-proxy (release, static $MUSL_TARGET)"
-  if ! cargo build --release --target "$MUSL_TARGET"; then
-    err "musl build failed. On a glibc host you need:"
-    err "  rustup target add $MUSL_TARGET && apt-get install musl-tools"
-    err "or build via Docker:"
-    err "  docker run --rm -v \"$REPO_ROOT\":/src -w /src rust:1.91-bookworm bash -c \\"
-    err "    'rustup target add $MUSL_TARGET && apt-get update && apt-get install -y musl-tools && cargo build --release --target $MUSL_TARGET'"
-    exit 1
+  if ! command -v cargo >/dev/null 2>&1 || ! cargo build --release --target "$MUSL_TARGET"; then
+    if command -v docker >/dev/null 2>&1; then
+      log "cargo unavailable or musl build failed → building via Docker (rust:1.91-bookworm)"
+      docker run --rm -v "$REPO_ROOT":/src -w /src rust:1.91-bookworm bash -c \
+        "rustup target add $MUSL_TARGET && apt-get update -qq && apt-get install -y -qq musl-tools && cargo build --release --target $MUSL_TARGET"
+    else
+      err "musl build failed and no docker available. On a glibc host you need:"
+      err "  rustup target add $MUSL_TARGET && apt-get install musl-tools"
+      exit 1
+    fi
   fi
   BUILD_OUT="$REPO_ROOT/target/$MUSL_TARGET/release/cc-proxy"
 else

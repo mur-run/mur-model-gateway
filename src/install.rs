@@ -164,7 +164,8 @@ pub fn install(opts: InstallOpts) -> Result<()> {
             let env_file = paths.env_file.as_ref().expect("system mode sets env_file");
             let user = whoami::username();
             let unit = render_linux_system_unit(&paths.binary, &user, env_file);
-            write_root_owned(env_file, &render_env_file(&env), 0o600)?;
+            let existing = std::fs::read_to_string(env_file).unwrap_or_default();
+            write_root_owned(env_file, &merge_env_file(&existing, &env), 0o600)?;
             write_root_owned(&paths.service_file, &unit, 0o644)?;
             println!("wrote {}", paths.service_file.display());
             println!("wrote {} (mode 600)", env_file.display());
@@ -407,6 +408,22 @@ pub fn render_env_file(env: &[(String, String)]) -> String {
     env.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
 }
 
+/// Re-render the env file while preserving manually-added lines (e.g. the
+/// secret token appended by the operator). Managed keys are replaced; any
+/// existing line whose KEY isn't in `env` survives verbatim.
+pub fn merge_env_file(existing: &str, env: &[(String, String)]) -> String {
+    let managed: std::collections::HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    let kept: String = existing
+        .lines()
+        .filter(|line| {
+            let key = line.split('=').next().unwrap_or("").trim();
+            !key.is_empty() && !key.starts_with('#') && !managed.contains(key)
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    format!("{}{kept}", render_env_file(env))
+}
+
 pub fn render_windows_cmd(binary: &Path, log_file: &Path, env: &[(String, String)]) -> String {
     let set_lines: String = env
         .iter()
@@ -525,6 +542,24 @@ mod tests {
         assert!(u.contains("User=karajan"));
         assert!(u.contains("EnvironmentFile=/etc/cc-proxy.env"));
         assert!(u.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn merge_env_file_preserves_operator_lines() {
+        let existing = "RUST_LOG=old\nCC_PROXY_OAUTH_TOKEN=sk-ant-oat01-secret\n# comment\n";
+        let env = vec![
+            ("RUST_LOG".to_string(), "info".to_string()),
+            (
+                "CC_PROXY_TOKEN_SOURCE".to_string(),
+                "env:CC_PROXY_OAUTH_TOKEN".to_string(),
+            ),
+        ];
+        let merged = merge_env_file(existing, &env);
+        assert!(merged.contains("RUST_LOG=info\n"));
+        assert!(!merged.contains("RUST_LOG=old"));
+        assert!(merged.contains("CC_PROXY_OAUTH_TOKEN=sk-ant-oat01-secret\n"));
+        assert!(merged.contains("CC_PROXY_TOKEN_SOURCE=env:CC_PROXY_OAUTH_TOKEN\n"));
+        assert!(!merged.contains("# comment"));
     }
 
     #[test]
