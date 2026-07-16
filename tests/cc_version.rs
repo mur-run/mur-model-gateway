@@ -3,6 +3,10 @@
 //! Live test depends on `claude --version` being on PATH; we
 //! `#[ignore]` it by default so CI without Claude Code installed
 //! still passes. Run with `cargo test --test cc_version -- --ignored`.
+//!
+//! Only compiled when `disguise_impl.rs` is present (cfg(has_beta_hook)).
+
+#![cfg(has_beta_hook)]
 
 use cc_proxy::cc_version::{FALLBACK_VERSION, VersionCache, VersionStrategy};
 use cc_proxy::disguise::billing_prefix;

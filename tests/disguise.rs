@@ -4,6 +4,10 @@
 //! upstream sees Bearer auth, the claude-code-* beta header, and a
 //! billing-prefix block prepended to `system`. When the inbound has its
 //! own auth, the upstream sees that auth unchanged.
+//!
+//! Only compiled when `disguise_impl.rs` is present (cfg(has_beta_hook)).
+
+#![cfg(has_beta_hook)]
 
 use cc_proxy::cc_version::{VersionCache, VersionStrategy};
 use cc_proxy::disguise::{OAUTH_BETAS, billing_prefix};
