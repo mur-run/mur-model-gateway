@@ -19,7 +19,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, Response, StatusCode, Uri},
     response::IntoResponse,
     routing::any,
 };
@@ -330,19 +330,13 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     }
 
     if let Some(tok) = override_token.as_deref() {
-        let merged_betas = disguise::merge_betas(disguise::OAUTH_BETAS, &client_betas);
-        upstream_req = upstream_req
-            .header(
-                "Authorization",
-                HeaderValue::from_str(&format!("Bearer {tok}")).context("invalid Bearer token")?,
-            )
-            .header(
-                "anthropic-beta",
-                HeaderValue::from_str(&merged_betas).context("invalid anthropic-beta")?,
-            );
-        if !parts.headers.contains_key("anthropic-version") {
-            upstream_req = upstream_req.header("anthropic-version", "2023-06-01");
-        }
+        let has_anthropic_version = parts.headers.contains_key("anthropic-version");
+        upstream_req = disguise::apply_disguise_headers(
+            upstream_req,
+            tok,
+            &client_betas,
+            has_anthropic_version,
+        )?;
     }
     upstream_req = upstream_req.body(final_body);
 
