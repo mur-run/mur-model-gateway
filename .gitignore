@@ -9,3 +9,4 @@ secrets/
 *.pem
 *.key
 .tokensave
+src/disguise_impl.rs
