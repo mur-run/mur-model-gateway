@@ -32,7 +32,7 @@ mod disguise_impl {
     }
 }
 
-pub(crate) use disguise_impl::*;
+pub use disguise_impl::*;
 
 #[cfg(test)]
 mod tests {
