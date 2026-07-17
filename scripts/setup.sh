@@ -176,6 +176,21 @@ else
   BUILD_OUT="$REPO_ROOT/target/release/cc-proxy"
 fi
 
+# ─── codesign (macOS) ───────────────────────────────────────────────
+# Re-sign with a real identity + stable identifier so the keychain
+# "Always Allow" grant survives rebuilds. The default linker ad-hoc
+# signature changes on every build, which re-triggers the password
+# prompt for the Claude Code-credentials item on each request.
+if [[ "$PLATFORM" == macos ]]; then
+  SIGN_ID="${CC_PROXY_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' 'NR==1 {print $2}')}"
+  if [[ -n "$SIGN_ID" ]]; then
+    log "codesigning with: $SIGN_ID"
+    codesign -f -s "$SIGN_ID" -i com.cc-proxy "$BUILD_OUT"
+  else
+    log "no codesigning identity — skipping (keychain will re-prompt after every rebuild)"
+  fi
+fi
+
 # ─── install binary ────────────────────────────────────────────────
 
 mkdir -p "$INSTALL_DIR"

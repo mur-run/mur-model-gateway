@@ -7,14 +7,22 @@
 //!
 //! The token's stored under generic-password service `Claude Code-credentials`
 //! with the OS account = current username. The blob is JSON; we extract
-//! `claudeAiOauth.accessToken`. Read on every request — Claude Code refreshes
-//! the token in the background, the proxy never caches.
+//! `claudeAiOauth.accessToken`. Reads are cached for [`CACHE_TTL`]: on macOS
+//! every uncached read can pop a keychain permission dialog (and a rebuilt
+//! binary always does), so per-request reads turn into a dialog storm.
+//! Claude Code refreshes the token on the order of hours; 60s staleness is fine.
 
 use serde_json::Value;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const SERVICE: &str = "Claude Code-credentials";
 
-#[derive(Debug, thiserror::Error)]
+const CACHE_TTL: Duration = Duration::from_secs(60);
+type CachedRead = Option<(Instant, Result<Option<String>, KeychainError>)>;
+static CACHE: Mutex<CachedRead> = Mutex::new(None);
+
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum KeychainError {
     #[error("keychain backend error: {0}")]
     Backend(String),
@@ -28,6 +36,10 @@ pub enum KeychainError {
 /// `Ok(None)` — no entry exists (Claude Code never logged in).
 /// `Err(_)` — backend error (locked keychain / permission denied / parse failure).
 pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
+    cached(&CACHE, CACHE_TTL, read_keychain_uncached)
+}
+
+fn read_keychain_uncached() -> Result<Option<String>, KeychainError> {
     let user = whoami::username();
     let entry = keyring::Entry::new(SERVICE, &user)
         .map_err(|e| KeychainError::Backend(format!("entry::new({SERVICE}, {user}): {e}")))?;
@@ -36,6 +48,25 @@ pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(KeychainError::Backend(format!("get_password: {e}"))),
     }
+}
+
+/// TTL cache. The lock is held across `fetch` on purpose: concurrent requests
+/// trigger at most one macOS keychain permission dialog instead of one each,
+/// and once it's answered the rest are served from cache.
+fn cached(
+    cache: &Mutex<CachedRead>,
+    ttl: Duration,
+    fetch: impl FnOnce() -> Result<Option<String>, KeychainError>,
+) -> Result<Option<String>, KeychainError> {
+    let mut slot = cache.lock().unwrap();
+    if let Some((at, res)) = slot.as_ref() {
+        if at.elapsed() < ttl {
+            return res.clone();
+        }
+    }
+    let res = fetch();
+    *slot = Some((Instant::now(), res.clone()));
+    res
 }
 
 /// Default path of Claude Code's on-disk credentials file (Linux/Windows/WSL
@@ -134,5 +165,29 @@ mod tests {
             Err(KeychainError::Malformed(_))
         ));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn cached_serves_within_ttl_and_refetches_after_expiry() {
+        let cache: Mutex<CachedRead> = Mutex::new(None);
+        let ttl = Duration::from_secs(60);
+        let r1 = cached(&cache, ttl, || Ok(Some("first".into())));
+        let r2 = cached(&cache, ttl, || Ok(Some("second".into())));
+        assert_eq!(r1.unwrap().as_deref(), Some("first"));
+        assert_eq!(r2.unwrap().as_deref(), Some("first")); // served from cache
+
+        let r3 = cached(&cache, Duration::ZERO, || Ok(Some("third".into())));
+        assert_eq!(r3.unwrap().as_deref(), Some("third")); // expired → refetched
+    }
+
+    #[test]
+    fn cached_caches_errors_too() {
+        // A denied keychain prompt must not re-prompt on every retry.
+        let cache: Mutex<CachedRead> = Mutex::new(None);
+        let ttl = Duration::from_secs(60);
+        let r1 = cached(&cache, ttl, || Err(KeychainError::Backend("denied".into())));
+        let r2 = cached(&cache, ttl, || Ok(Some("never-fetched".into())));
+        assert!(matches!(r1, Err(KeychainError::Backend(_))));
+        assert!(matches!(r2, Err(KeychainError::Backend(_))));
     }
 }
