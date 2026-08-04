@@ -22,7 +22,10 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
 - **Optional wire compression.** `MUR_MODEL_GATEWAY_COMPRESS=1` applies MUR's
   CCR compression to `tool_result` blocks on all three providers.
 
-![Token compression ratio](compress-ratio.png)
+**Up to 90.4% token savings** — 3,026 compressions turned 5.89M input tokens into
+568K, saving 5.32M (mur-compress v2.61.0, single day):
+
+![Token compression stats: 3,026 compressions, 5,891,050 input tokens, 568,301 output tokens, 5,322,749 tokens saved, 90.4% savings](compress-ratio.png)
 
 ## Install
 
