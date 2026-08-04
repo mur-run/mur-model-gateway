@@ -21,6 +21,8 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
   → OpenAI, `/v1beta/models/*` → Gemini.
 - **Optional wire compression.** `MUR_MODEL_GATEWAY_COMPRESS=1` applies MUR's
   CCR compression to `tool_result` blocks on all three providers.
+- **Cheap to leave running.** One static Rust binary, ~60–70 MB resident —
+  no runtime, no Node process, no container.
 
 **Up to 90.4% token savings** — 3,026 compressions turned 5.89M input tokens into
 568K, saving 5.32M (mur-compress v2.61.0, single day):
