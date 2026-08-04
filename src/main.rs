@@ -1,14 +1,14 @@
 use anyhow::Context;
-use cc_proxy::{
+use clap::{Parser, Subcommand};
+use mur_model_gateway::{
     AppState, DEFAULT_BIND, DEFAULT_UPSTREAM_ANTHROPIC, DEFAULT_UPSTREAM_GEMINI,
     DEFAULT_UPSTREAM_OPENAI, TokenSource, build_router, install,
 };
-use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 
 #[derive(Parser)]
 #[command(
-    name = "cc-proxy",
+    name = "mur-model-gateway",
     about = "Multi-provider LLM API reverse proxy (Anthropic / OpenAI / Gemini) with Claude Code disguise layer",
     version
 )]
@@ -23,24 +23,24 @@ enum Command {
     Serve,
     /// Write the platform-specific service descriptor.
     Install {
-        /// Bake CC_PROXY_COMPRESS=1 into the service (wire-level tool_result compression).
+        /// Bake MUR_MODEL_GATEWAY_COMPRESS=1 into the service (wire-level tool_result compression).
         #[arg(long, conflicts_with = "no_compress")]
         compress: bool,
-        /// Force compression off, even if CC_PROXY_COMPRESS=1 is set in the environment.
+        /// Force compression off, even if MUR_MODEL_GATEWAY_COMPRESS=1 is set in the environment.
         #[arg(long)]
         no_compress: bool,
-        /// Bake CC_PROXY_TOKEN_SOURCE into the service
+        /// Bake MUR_MODEL_GATEWAY_TOKEN_SOURCE into the service
         /// (keychain | off | env:VAR | file | file:/path/to/credentials.json).
         #[arg(long)]
         token_source: Option<String>,
-        /// Bake CC_PROXY_BIND into the service (e.g. 127.0.0.1:9099).
+        /// Bake MUR_MODEL_GATEWAY_BIND into the service (e.g. 127.0.0.1:9099).
         #[arg(long)]
         bind: Option<String>,
-        /// Bake CC_PROXY_UPSTREAM into the service.
+        /// Bake MUR_MODEL_GATEWAY_UPSTREAM into the service.
         #[arg(long)]
         upstream: Option<String>,
         /// Linux only: install a system-level unit (/etc/systemd/system) with
-        /// EnvironmentFile=/etc/cc-proxy.env — starts at boot without a login
+        /// EnvironmentFile=/etc/mur-model-gateway.env — starts at boot without a login
         /// session. Requires root for the /etc writes.
         #[arg(long)]
         system: bool,
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
                 } else if no_compress {
                     Some(false)
                 } else {
-                    None // fall back to CC_PROXY_COMPRESS env sniff
+                    None // fall back to MUR_MODEL_GATEWAY_COMPRESS env sniff
                 },
                 token_source,
                 bind,
@@ -93,26 +93,31 @@ async fn main() -> anyhow::Result<()> {
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,cc_proxy=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,mur_model_gateway=debug")
+            }),
         )
         .init();
 }
 
 async fn serve() -> anyhow::Result<()> {
-    let bind: SocketAddr = std::env::var("CC_PROXY_BIND")
+    let bind: SocketAddr = std::env::var("MUR_MODEL_GATEWAY_BIND")
         .unwrap_or_else(|_| DEFAULT_BIND.to_string())
         .parse()
-        .context("invalid CC_PROXY_BIND")?;
-    let upstream_anthropic =
-        resolve_upstream("CC_PROXY_UPSTREAM_ANTHROPIC", DEFAULT_UPSTREAM_ANTHROPIC);
-    let upstream_openai = resolve_upstream("CC_PROXY_UPSTREAM_OPENAI", DEFAULT_UPSTREAM_OPENAI);
-    let upstream_gemini = resolve_upstream("CC_PROXY_UPSTREAM_GEMINI", DEFAULT_UPSTREAM_GEMINI);
+        .context("invalid MUR_MODEL_GATEWAY_BIND")?;
+    let upstream_anthropic = resolve_upstream(
+        "MUR_MODEL_GATEWAY_UPSTREAM_ANTHROPIC",
+        DEFAULT_UPSTREAM_ANTHROPIC,
+    );
+    let upstream_openai =
+        resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_OPENAI", DEFAULT_UPSTREAM_OPENAI);
+    let upstream_gemini =
+        resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_GEMINI", DEFAULT_UPSTREAM_GEMINI);
 
     let token_source = parse_token_source(
-        &std::env::var("CC_PROXY_TOKEN_SOURCE").unwrap_or_else(|_| "keychain".to_string()),
+        &std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE").unwrap_or_else(|_| "keychain".to_string()),
     )
-    .context("invalid CC_PROXY_TOKEN_SOURCE")?;
+    .context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE")?;
 
     let state = AppState::new(
         &upstream_anthropic,
@@ -130,7 +135,7 @@ async fn serve() -> anyhow::Result<()> {
         upstream_anthropic = %upstream_anthropic,
         upstream_openai = %upstream_openai,
         upstream_gemini = %upstream_gemini,
-        "cc-proxy listening"
+        "mur-model-gateway listening"
     );
 
     axum::serve(listener, app)
@@ -146,7 +151,7 @@ fn parse_token_source(spec: &str) -> anyhow::Result<TokenSource> {
     match spec {
         "off" | "disabled" => Ok(TokenSource::Disabled),
         "keychain" => Ok(TokenSource::Keychain),
-        "file" => cc_proxy::keychain::default_credentials_path()
+        "file" => mur_model_gateway::keychain::default_credentials_path()
             .map(TokenSource::CredentialsFile)
             .ok_or_else(|| anyhow::anyhow!("cannot resolve home dir for default credentials path")),
         _ => {
@@ -163,10 +168,10 @@ fn parse_token_source(spec: &str) -> anyhow::Result<TokenSource> {
     }
 }
 
-/// Resolve an upstream URL: provider-specific var → generic CC_PROXY_UPSTREAM → default.
+/// Resolve an upstream URL: provider-specific var → generic MUR_MODEL_GATEWAY_UPSTREAM → default.
 fn resolve_upstream(provider_var: &str, default: &str) -> String {
     std::env::var(provider_var)
-        .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
+        .or_else(|_| std::env::var("MUR_MODEL_GATEWAY_UPSTREAM"))
         .unwrap_or_else(|_| default.to_string())
 }
 

@@ -1,11 +1,11 @@
-//! cc-proxy — multi-provider LLM API reverse proxy (Anthropic, OpenAI, Gemini).
+//! mur-model-gateway — multi-provider LLM API reverse proxy (Anthropic, OpenAI, Gemini).
 //!
 //! Path-based routing: `/v1/messages*` → Anthropic, `/v1/chat/completions*` → OpenAI,
 //! `/v1beta/models/*` → Gemini. A disguise layer applies to Anthropic traffic only:
 //! when the inbound request carries no auth, the proxy resolves an OAuth token from
 //! the configured [`TokenSource`], adds `Authorization: Bearer …`, the claude-code-*
 //! `anthropic-beta` header, and prepends a billing-header text block to the request's
-//! `system` field. Wire-level CCR compression (opt-in via `CC_PROXY_COMPRESS=1`)
+//! `system` field. Wire-level CCR compression (opt-in via `MUR_MODEL_GATEWAY_COMPRESS=1`)
 //! applies to tool_result blocks for all three providers.
 
 pub mod cc_version;
@@ -146,7 +146,7 @@ pub struct AppState {
     pub token_source: TokenSource,
     pub version_cache: Arc<cc_version::VersionCache>,
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
-    /// Env-gated: CC_PROXY_COMPRESS=1. Tests flip the field directly.
+    /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
 }
 
@@ -183,7 +183,7 @@ impl AppState {
                 .context("reqwest client")?,
             token_source,
             version_cache,
-            compress: std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1"),
+            compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -209,7 +209,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response<Body> {
         Ok(resp) => resp,
         Err(err) => {
             tracing::warn!(error = %err, "proxy error");
-            (StatusCode::BAD_GATEWAY, format!("cc-proxy: {err}")).into_response()
+            (StatusCode::BAD_GATEWAY, format!("mur-model-gateway: {err}")).into_response()
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Auto-detect the locally-installed Claude Code version, so the
 //! billing-header `cc_version=` claim tracks reality instead of a
-//! frozen constant. This is the single most important reason cc-proxy
+//! frozen constant. This is the single most important reason mur-model-gateway
 //! exists as a separate component: a hardcoded `cc_version` rots the
 //! moment Anthropic enforces a minimum version.
 //!

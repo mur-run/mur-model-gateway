@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# cc-proxy zero-question installer: detects platform quirks and calls
+# mur-model-gateway zero-question installer: detects platform quirks and calls
 # setup.sh with the right flags. Safe to re-run.
 #
 #   ./scripts/auto.sh                 # detect everything, install, start, verify
-#   CC_PROXY_TOKEN_SOURCE=env:MY_VAR ./scripts/auto.sh   # override token source
+#   MUR_MODEL_GATEWAY_TOKEN_SOURCE=env:MY_VAR ./scripts/auto.sh   # override token source
 #
 # Detection rules:
 #   - Linux + GLIBC < 2.34            → --musl static build
@@ -26,8 +26,8 @@ if [[ "$(uname -s)" == Linux ]]; then
     FLAGS+=(--musl)
   fi
   # existing system unit → this host runs system-level; upgrade in place
-  if [[ -f /etc/systemd/system/cc-proxy.service ]]; then
-    echo "[auto] existing /etc/systemd/system/cc-proxy.service → system-level unit"
+  if [[ -f /etc/systemd/system/mur-model-gateway.service ]]; then
+    echo "[auto] existing /etc/systemd/system/mur-model-gateway.service → system-level unit"
     FLAGS+=(--system)
   # no user session bus → user units won't start at boot; go system
   elif [[ -z "${XDG_RUNTIME_DIR:-}" ]] || ! systemctl --user is-system-running >/dev/null 2>&1; then
@@ -36,9 +36,9 @@ if [[ "$(uname -s)" == Linux ]]; then
   fi
 fi
 
-if [[ -n "${CC_PROXY_TOKEN_SOURCE:-}" ]]; then
-  echo "[auto] token source from env: $CC_PROXY_TOKEN_SOURCE"
-  INSTALL_FLAGS+=(--token-source "$CC_PROXY_TOKEN_SOURCE")
+if [[ -n "${MUR_MODEL_GATEWAY_TOKEN_SOURCE:-}" ]]; then
+  echo "[auto] token source from env: $MUR_MODEL_GATEWAY_TOKEN_SOURCE"
+  INSTALL_FLAGS+=(--token-source "$MUR_MODEL_GATEWAY_TOKEN_SOURCE")
 elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
   echo "[auto] found ~/.claude/.credentials.json → --token-source file"
   INSTALL_FLAGS+=(--token-source file)

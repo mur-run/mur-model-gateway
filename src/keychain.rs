@@ -59,10 +59,10 @@ fn cached(
     fetch: impl FnOnce() -> Result<Option<String>, KeychainError>,
 ) -> Result<Option<String>, KeychainError> {
     let mut slot = cache.lock().unwrap();
-    if let Some((at, res)) = slot.as_ref() {
-        if at.elapsed() < ttl {
-            return res.clone();
-        }
+    if let Some((at, res)) = slot.as_ref()
+        && at.elapsed() < ttl
+    {
+        return res.clone();
     }
     let res = fetch();
     *slot = Some((Instant::now(), res.clone()));
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn credentials_file_reads_token() {
-        let dir = std::env::temp_dir().join("cc-proxy-cred-test");
+        let dir = std::env::temp_dir().join("mur-model-gateway-cred-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("creds.json");
         std::fs::write(
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn credentials_file_garbage_is_malformed() {
-        let dir = std::env::temp_dir().join("cc-proxy-cred-test");
+        let dir = std::env::temp_dir().join("mur-model-gateway-cred-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("garbage.json");
         std::fs::write(&path, "not json").unwrap();

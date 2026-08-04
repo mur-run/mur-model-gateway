@@ -1,8 +1,8 @@
-# cc-proxy × mur-compress: wire-level tool_result compression
+# mur-model-gateway × mur-compress: wire-level tool_result compression
 
 **Date:** 2026-07-03
-**Status:** Implemented (env-gated `CC_PROXY_COMPRESS=1`, default off)
-**Scope:** cc-proxy only. Zero changes to the mur repo.
+**Status:** Implemented (env-gated `MUR_MODEL_GATEWAY_COMPRESS=1`, default off)
+**Scope:** mur-model-gateway only. Zero changes to the mur repo.
 
 ## Problem
 
@@ -10,13 +10,13 @@
 Anthropic API. MUR's compression today is hook-level only: the Claude Code
 PostToolUse hook and the mur MCP server compress tool outputs at the source.
 That leaves uncovered every client that dials Anthropic without those hooks —
-notably the mur agent runtimes, which all route through cc-proxy
-(127.0.0.1:8088). cc-proxy already sits in the path of ALL local Anthropic
+notably the mur agent runtimes, which all route through mur-model-gateway
+(127.0.0.1:8088). mur-model-gateway already sits in the path of ALL local Anthropic
 traffic; adding compression there gives universal coverage with one change.
 
 ## Decision
 
-Link the `mur-compress` crate into cc-proxy and compress `tool_result` blocks
+Link the `mur-compress` crate into mur-model-gateway and compress `tool_result` blocks
 in `/v1/messages*` request bodies, sharing the `~/.mur/compress` store so the
 existing `mur_retrieve` MCP tool recovers originals with no new plumbing.
 
@@ -25,7 +25,7 @@ Rejected alternatives:
 - **Shell out to `mur compress` per block** — process spawn per tool_result on
   the hot path; latency and failure modes for no gain.
 - **Fold the proxy into mur (`mur wrap`)** — headroom-parity product feature,
-  but requires merging cc-proxy's auth-disguise layer into mur. Possible later
+  but requires merging mur-model-gateway's auth-disguise layer into mur. Possible later
   evolution; out of scope here.
 
 ## Why it works
@@ -86,7 +86,7 @@ Fail-open.
 
 ### Rollout gate
 
-`CC_PROXY_COMPRESS=1` env var, default **off**. All local Anthropic traffic
+`MUR_MODEL_GATEWAY_COMPRESS=1` env var, default **off**. All local Anthropic traffic
 (Claude Code + every mur agent) flows through this proxy — opt in for the
 first live period; flip the default once proven.
 
@@ -98,7 +98,7 @@ the default on, verify which mur agents have the mur MCP server configured.
 
 ## Testing
 
-Unit (in cc-proxy):
+Unit (in mur-model-gateway):
 
 - Fat `tool_result` → smaller body, marker present, hash retrievable from the
   store.
@@ -108,9 +108,9 @@ Unit (in cc-proxy):
 
 Live:
 
-- One Claude Code turn through the proxy with `CC_PROXY_COMPRESS=1`; confirm
+- One Claude Code turn through the proxy with `MUR_MODEL_GATEWAY_COMPRESS=1`; confirm
   `mur compress stats` delta and that `mur_retrieve` recovers the content.
 
 ## Estimated size
 
-~150 lines in cc-proxy.
+~150 lines in mur-model-gateway.

@@ -1,4 +1,4 @@
-# 啓用 proxy 壓縮(CC_PROXY_COMPRESS)
+# 啓用 proxy 壓縮(MUR_MODEL_GATEWAY_COMPRESS)
 
 wire-level tool_result 壓縮的安裝設定。設計背景見
 [specs/2026-07-03-mur-compress-design.md](specs/2026-07-03-mur-compress-design.md)。
@@ -6,9 +6,9 @@ wire-level tool_result 壓縮的安裝設定。設計背景見
 ## install 參數
 
 ```
-cc-proxy install --compress      # 服務定義寫入 CC_PROXY_COMPRESS=1(啓用)
-cc-proxy install --no-compress   # 強制關閉,即使環境有 CC_PROXY_COMPRESS=1
-cc-proxy install                 # 不帶參數 → 沿用安裝當下的環境變數;都沒有就是關(預設)
+mur-model-gateway install --compress      # 服務定義寫入 MUR_MODEL_GATEWAY_COMPRESS=1(啓用)
+mur-model-gateway install --no-compress   # 強制關閉,即使環境有 MUR_MODEL_GATEWAY_COMPRESS=1
+mur-model-gateway install                 # 不帶參數 → 沿用安裝當下的環境變數;都沒有就是關(預設)
 ```
 
 優先順序:**參數 > 環境變數 > 預設關閉**。
@@ -20,14 +20,14 @@ cc-proxy install                 # 不帶參數 → 沿用安裝當下的環境�
 
 ```bash
 ./scripts/setup.sh                       # 重新 build + 安裝 + 重啓服務(不啓壓縮)
-CC_PROXY_COMPRESS=1 ./scripts/setup.sh   # 同上,但啓用壓縮
+MUR_MODEL_GATEWAY_COMPRESS=1 ./scripts/setup.sh   # 同上,但啓用壓縮
 ```
 
 ## 驗證
 
 ```bash
 # macOS:確認 plist 有寫入
-grep -A2 CC_PROXY_COMPRESS ~/Library/LaunchAgents/run.cc-proxy.plist
+grep -A2 MUR_MODEL_GATEWAY_COMPRESS ~/Library/LaunchAgents/run.mur-model-gateway.plist
 
 # 跑一輪 Claude Code 後看共用統計
 mur compress stats

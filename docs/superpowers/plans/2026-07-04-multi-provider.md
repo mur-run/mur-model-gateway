@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extend cc-proxy to route and CCR-compress tool results for Anthropic, OpenAI, and Gemini through a single instance via path-based auto-detection.
+**Goal:** Extend mur-model-gateway to route and CCR-compress tool results for Anthropic, OpenAI, and Gemini through a single instance via path-based auto-detection.
 
 **Architecture:** New `Provider` enum derived from request path selects upstream URL and compression extractor. Three provider-specific extractors traverse each API's JSON shape to find and compress tool results. Disguise remains Anthropic-only.
 
@@ -11,9 +11,9 @@
 ## Global Constraints
 
 - Zero changes to the mur repo (mur-compress is consumed as-is)
-- Compression gate: `CC_PROXY_COMPRESS=1` env var, default off, applies uniformly
+- Compression gate: `MUR_MODEL_GATEWAY_COMPRESS=1` env var, default off, applies uniformly
 - Fail-open: any parse/engine error forwards the original body untouched
-- Backward compatible: existing `CC_PROXY_UPSTREAM` env var is a fallback for all three providers
+- Backward compatible: existing `MUR_MODEL_GATEWAY_UPSTREAM` env var is a fallback for all three providers
 - Disguise layer: Anthropic-only, never touches OpenAI or Gemini traffic
 
 ---
@@ -130,7 +130,7 @@ impl AppState {
                 .context("reqwest client")?,
             token_source,
             version_cache,
-            compress: std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1"),
+            compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -270,7 +270,7 @@ fn upstream_for_resolves_correctly() {
 
 - [ ] **Step 6: Run tests to verify**
 
-Run: `cargo test -p cc-proxy`
+Run: `cargo test -p mur-model-gateway`
 Expected: compile error — `compress::should_compress` and `compress::rewrite_request_body` signature mismatch (we haven't updated compress.rs yet). This is expected; Task 2 fixes it.
 
 - [ ] **Step 7: Commit**
@@ -499,7 +499,7 @@ fn openai_array_form_text_blocks() {
 
 - [ ] **Step 7: Run tests to verify**
 
-Run: `cargo test -p cc-proxy`
+Run: `cargo test -p mur-model-gateway`
 Expected: All tests pass. The new OpenAI extractor compiles and compresses correctly.
 
 - [ ] **Step 8: Commit**
@@ -647,7 +647,7 @@ fn gemini_skips_non_function_response_parts() {
 
 - [ ] **Step 3: Run tests to verify**
 
-Run: `cargo test -p cc-proxy`
+Run: `cargo test -p mur-model-gateway`
 Expected: All tests pass. Existing Anthropic + new OpenAI + new Gemini tests all green.
 
 - [ ] **Step 4: Commit**
@@ -675,14 +675,14 @@ Replace the upstream resolution in `serve()`:
 Current (lines 72-73):
 ```rust
 let upstream =
-    std::env::var("CC_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
+    std::env::var("MUR_MODEL_GATEWAY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
 ```
 
 Replace with:
 ```rust
-let upstream_anthropic = resolve_upstream("CC_PROXY_UPSTREAM_ANTHROPIC", DEFAULT_UPSTREAM_ANTHROPIC);
-let upstream_openai = resolve_upstream("CC_PROXY_UPSTREAM_OPENAI", DEFAULT_UPSTREAM_OPENAI);
-let upstream_gemini = resolve_upstream("CC_PROXY_UPSTREAM_GEMINI", DEFAULT_UPSTREAM_GEMINI);
+let upstream_anthropic = resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_ANTHROPIC", DEFAULT_UPSTREAM_ANTHROPIC);
+let upstream_openai = resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_OPENAI", DEFAULT_UPSTREAM_OPENAI);
+let upstream_gemini = resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_GEMINI", DEFAULT_UPSTREAM_GEMINI);
 ```
 
 Replace the AppState construction and log line. Current:
@@ -690,7 +690,7 @@ Replace the AppState construction and log line. Current:
 let state = AppState::new(&upstream, token_source)?;
 let upstream_for_log = state.upstream.clone();
 // ...
-tracing::info!(addr = %bind, upstream = %upstream_for_log, "cc-proxy listening");
+tracing::info!(addr = %bind, upstream = %upstream_for_log, "mur-model-gateway listening");
 ```
 
 Replace with:
@@ -710,31 +710,31 @@ tracing::info!(
     upstream_anthropic = %upstream_for_log_a,
     upstream_openai = %upstream_for_log_o,
     upstream_gemini = %upstream_for_log_g,
-    "cc-proxy listening"
+    "mur-model-gateway listening"
 );
 ```
 
 Add the helper function at the bottom of `main.rs` (before `shutdown_signal()`):
 
 ```rust
-/// Resolve an upstream URL: provider-specific var → generic CC_PROXY_UPSTREAM → default.
+/// Resolve an upstream URL: provider-specific var → generic MUR_MODEL_GATEWAY_UPSTREAM → default.
 fn resolve_upstream(provider_var: &str, default: &str) -> String {
     std::env::var(provider_var)
-        .or_else(|_| std::env::var("CC_PROXY_UPSTREAM"))
+        .or_else(|_| std::env::var("MUR_MODEL_GATEWAY_UPSTREAM"))
         .unwrap_or_else(|_| default.to_string())
 }
 ```
 
-Update the imports at the top — add `DEFAULT_UPSTREAM_ANTHROPIC`, `DEFAULT_UPSTREAM_OPENAI`, `DEFAULT_UPSTREAM_GEMINI` to the `use cc_proxy::` line, and remove `DEFAULT_UPSTREAM`.
+Update the imports at the top — add `DEFAULT_UPSTREAM_ANTHROPIC`, `DEFAULT_UPSTREAM_OPENAI`, `DEFAULT_UPSTREAM_GEMINI` to the `use mur_model_gateway::` line, and remove `DEFAULT_UPSTREAM`.
 
 - [ ] **Step 2: Build to verify compilation**
 
-Run: `cargo build -p cc-proxy`
+Run: `cargo build -p mur-model-gateway`
 Expected: Compiles cleanly with no warnings.
 
 - [ ] **Step 3: Run full test suite**
 
-Run: `cargo test -p cc-proxy`
+Run: `cargo test -p mur-model-gateway`
 Expected: All tests pass (provider detection + Anthropic compression + OpenAI compression + Gemini compression + disguise + hop-by-hop).
 
 - [ ] **Step 4: Commit**
@@ -751,10 +751,10 @@ git commit -m "feat: plumb provider-specific upstream env vars into main"
 **Files:**
 - No code changes — verification only
 
-- [ ] **Step 1: Start cc-proxy with compression enabled**
+- [ ] **Step 1: Start mur-model-gateway with compression enabled**
 
 ```bash
-CC_PROXY_COMPRESS=1 cargo run -- serve &
+MUR_MODEL_GATEWAY_COMPRESS=1 cargo run -- serve &
 ```
 
 - [ ] **Step 2: Send a synthetic OpenAI request with a fat tool result**
@@ -824,8 +824,8 @@ kill %1
    - OpenAI extractor with string + array content shapes → Task 2 ✓
    - Gemini extractor with object result + string response shapes → Task 3 ✓
    - Disguise Anthropic-only gate → Task 1 (forward() condition) ✓
-   - Env vars with CC_PROXY_UPSTREAM fallback → Task 4 ✓
-   - Rollout gate (CC_PROXY_COMPRESS=1) unchanged → not modified, existing logic preserved ✓
+   - Env vars with MUR_MODEL_GATEWAY_UPSTREAM fallback → Task 4 ✓
+   - Rollout gate (MUR_MODEL_GATEWAY_COMPRESS=1) unchanged → not modified, existing logic preserved ✓
    - Fail-open behavior unchanged → not modified ✓
    - Skip rules unchanged → not modified ✓
    - Tests per spec → Tasks 1-3 ✓

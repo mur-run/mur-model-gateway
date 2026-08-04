@@ -236,7 +236,7 @@ Expected: all tests pass. Only `should_disguise_paths` runs from the disguise mo
 Run:
 ```bash
 cargo build --release 2>&1
-strings target/release/cc-proxy | grep -i "anthropic-beta\|OAUTH_BETAS\|claude-code-2025\|billing-header" || echo "CLEAN: no sensitive strings found"
+strings target/release/mur-model-gateway | grep -i "anthropic-beta\|OAUTH_BETAS\|claude-code-2025\|billing-header" || echo "CLEAN: no sensitive strings found"
 ```
 Expected: `CLEAN: no sensitive strings found`
 
@@ -441,7 +441,7 @@ Expected: all tests pass — including the 8 tests in disguise_impl.rs plus shou
 
 Run:
 ```bash
-strings target/release/cc-proxy | grep "anthropic-beta" || echo "NOT FOUND"
+strings target/release/mur-model-gateway | grep "anthropic-beta" || echo "NOT FOUND"
 ```
 Expected: `anthropic-beta` IS found (it's compiled in from disguise_impl.rs).
 
@@ -474,7 +474,7 @@ cargo build --release 2>&1
 - [ ] **Step 2: Scan for any leaked sensitive strings**
 
 ```bash
-strings target/release/cc-proxy | grep -iE "anthropic-beta|OAUTH_BETAS|claude-code-2025|billing-header|x-anthropic" || echo "CLEAN"
+strings target/release/mur-model-gateway | grep -iE "anthropic-beta|OAUTH_BETAS|claude-code-2025|billing-header|x-anthropic" || echo "CLEAN"
 ```
 Expected: `CLEAN`
 

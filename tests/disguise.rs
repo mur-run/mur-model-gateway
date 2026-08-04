@@ -9,10 +9,10 @@
 
 #![cfg(has_beta_hook)]
 
-use cc_proxy::cc_version::{VersionCache, VersionStrategy};
-use cc_proxy::disguise::{OAUTH_BETAS, billing_prefix};
-use cc_proxy::{AppState, TokenSource, build_router};
 use httpmock::prelude::*;
+use mur_model_gateway::cc_version::{VersionCache, VersionStrategy};
+use mur_model_gateway::disguise::{OAUTH_BETAS, billing_prefix};
+use mur_model_gateway::{AppState, TokenSource, build_router};
 use std::sync::Arc;
 use std::time::Duration;
 

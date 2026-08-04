@@ -1,11 +1,11 @@
-# Compress roadmap — cc-proxy / mur-compress
+# Compress roadmap — mur-model-gateway / mur-compress
 
 ## Ground truths (verified 2026-07-05)
 
 1. **Grammar 沒有缺。** headroom 0.30.0 走 `tree_sitter_language_pack`（`code_compressor.py` 的 `_get_parser`），python/js/ts/php/go/java/swift/dart 實測全部載入 OK。`headroom-ai[code]` 是 no-op，`code_compressor.py:1052` 的 Kompress fallback 在本機不會觸發。
 2. **headroom 是第三方 pip 套件**（non-editable）。`read_lifecycle.py`、`cache_aligner.py`、`parser.py` 只能走 config 或 upstream PR，不是我們的實作面。
-3. **我們擁有的是 Rust 這條路**：cc-proxy `src/compress.rs` → `mur-compress`（detect.rs 五類 regex 路由；compressors = diff/json/log/search/fallback；CcrStore hash-addressed 可取回）。沒有 code-aware 壓縮器。
-4. **cc-proxy 無狀態但看得到全部。** 每個 request body 帶完整 transcript，所以 supersession / 跨訊息 dedup 不需要 session state——在 `rewrite_request_body` 內對整份 messages 做即可。
+3. **我們擁有的是 Rust 這條路**：mur-model-gateway `src/compress.rs` → `mur-compress`（detect.rs 五類 regex 路由；compressors = diff/json/log/search/fallback；CcrStore hash-addressed 可取回）。沒有 code-aware 壓縮器。
+4. **mur-model-gateway 無狀態但看得到全部。** 每個 request body 帶完整 transcript，所以 supersession / 跨訊息 dedup 不需要 session state——在 `rewrite_request_body` 內對整份 messages 做即可。
 5. **Prefix-cache 約束的精確形式**：mur-compress 目前 cache-safe 是因為壓縮是 *content-deterministic*（同輸入→同輸出，與時間無關）。任何新 transform 只要維持「輸出只是 transcript 內容的純函數」就自動 prefix-stable；引入 recency window（距結尾 N 條）會讓舊訊息 bytes 每 turn 變動 → 每 turn cache miss，禁止。允許的例外：**one-shot flip** —— 某訊息因「後面出現了取代事件」而坍縮，flip 只發生一次，之後永久凍結；代價是一次 cache break，換整段 session 的持續節省。
 
 ## Ranked plan
@@ -18,7 +18,7 @@
 
 ### P2 — Supersession collapse（最大單一槓桿）✅ 完成
 
-位置：`cc-proxy/src/compress.rs`，在既有 per-block 壓縮**之前**跑一個 transcript-level pass，三個 provider 都有：`collapse_stale_tool_results_anthropic` / `_openai` / `_gemini`，共用 `compute_stale_reasons`（決策邏輯只寫一份）。
+位置：`mur-model-gateway/src/compress.rs`，在既有 per-block 壓縮**之前**跑一個 transcript-level pass，三個 provider 都有：`collapse_stale_tool_results_anthropic` / `_openai` / `_gemini`，共用 `compute_stale_reasons`（決策邏輯只寫一份）。
 
 - Anthropic：`tool_use.id` 對 `tool_result.tool_use_id` 精確配對；`input.file_path` 取路徑。
 - OpenAI：`tool_calls[].id` 對 `tool_call_id`；`function.arguments`（JSON 字串）解析取 `file_path`。
@@ -33,7 +33,7 @@
 ### P3 — Exact-duplicate tool-result dedup ✅ 完成（搭 P2 便車）
 同一 pass 裡：對所有未被 supersession 標記的候選，直接用字串相等分組（O(n²)，單一 request 的 tool_result 數量小，可接受，且不像 hash 那樣有碰撞風險）；完全相同的重複（重跑 build/test 同輸出），保留**最後**一份，較早的換 `[identical to a later tool result in this conversation — mur_retrieve hash=…]`。沒做 near-dup diff（rolling similarity）——先看 P1 ledger 證明 near-dup 量值得再說。
 
-測試：`cc-proxy/src/compress.rs` 新增 12 個測試，涵蓋三個 provider 的 supersession / 精確 dedup / idempotency-prefix-stability / mixed-content 安全性；`mur-compress` 新增 `archive()` 的 store-then-retrieve 測試。全綠，clippy 乾淨。
+測試：`mur-model-gateway/src/compress.rs` 新增 12 個測試，涵蓋三個 provider 的 supersession / 精確 dedup / idempotency-prefix-stability / mixed-content 安全性；`mur-compress` 新增 `archive()` 的 store-then-retrieve 測試。全綠，clippy 乾淨。
 
 ### P4 — Code skeletonization ✅ 完成（只作用於已死內容）
 - `mur-compress` 新增 `src/skeleton.rs`：`skeletonize(source, file_path) -> Option<String>`，用副檔名(不是內容 heuristic——省了整套 detect 邏輯，因為呼叫端本來就知道 `file_path`)選 tree-sitter grammar，遞迴走 AST：命中 function-like node（Rust `function_item`；Python `function_definition`；JS/TS `function_declaration`/`method_definition`/`function_expression`/`arrow_function`）就把它的 `body` 欄位範圍換成 `{ /* elided */ }`，不再往內遞迴；只在 container-like node(module/class/impl/…)才繼續往下找巢狀函式。Imports、struct/class 宣告、簽名、docstring 全部保留原樣。
@@ -43,12 +43,12 @@
   - `tree-sitter-go`/`tree-sitter-php`/`tree-sitter-swift` 同理，最新版都是 ABI 15，往回退到 `=0.23.4` / `=0.23.11` / `=0.6.0` 才吃 ABI 14。
   - `tree-sitter-dart` 更極端：連最舊的 `0.1.0`/`0.2.0` 都是 ABI 15，只有 `=0.0.4`(pre-1.0 alpha)是 ABI 14，而且這個版本的 grammar 本身node kind 命名也不同(用 `program`/`lambda_expression` 而非新版的 `source_file`/`function_declaration`)，且 API 是舊式 `pub fn language() -> Language`(不是 `LANGUAGE: LanguageFn` const)——`LangSpec` 裡 dart 那筆因此跟其他語言長得不一樣。
   - 排錯方法：對每個新語言，先暫時在 `skeletonize()` 裡塞 `eprintln!` 印 `set_language` 的 `Err`/`ranges.len()`，跑一次 `cargo test`，看到 `LanguageError { version: N }` 就代表 ABI 不合，往舊版本退；空 `ranges` 但 `Ok` 則代表 node kind 名稱猜錯，得用一個小測試把 `tree.root_node()` 遞迴印出來核對實際 kind。
-- 掛載點：`cc-proxy`「一律無條件」不加 feature flag，只在 `stale_stub` 的 `SupersededPath` 分支呼叫——即只有已被 P2 判定過期的 Read 結果才可能被骨架化；`Duplicate`(重跑輸出)和任何「最新一份」都不碰。Skeleton 是**內嵌**在 stub 訊息裡的密集摘要，不需要額外 retrieval hop；完整原文仍照 P2 的方式經 `archive()` 存 CcrStore，兩者互不取代。
+- 掛載點：`mur-model-gateway`「一律無條件」不加 feature flag，只在 `stale_stub` 的 `SupersededPath` 分支呼叫——即只有已被 P2 判定過期的 Read 結果才可能被骨架化；`Duplicate`(重跑輸出)和任何「最新一份」都不碰。Skeleton 是**內嵌**在 stub 訊息裡的密集摘要，不需要額外 retrieval hop；完整原文仍照 P2 的方式經 `archive()` 存 CcrStore，兩者互不取代。
 
-測試：`mur-compress::skeleton` 14 個測試(九語言各自的函式/方法/class 骨架化、無函式回 None、未知副檔名回 None、idempotency)；`cc-proxy::compress` 新增 1 個整合測試驗證 superseded Read 的 stub 真的內嵌了骨架。全部通過，clippy 乾淨，整個 mur workspace(`cargo check`)也確認未受影響。
+測試：`mur-compress::skeleton` 14 個測試(九語言各自的函式/方法/class 骨架化、無函式回 None、未知副檔名回 None、idempotency)；`mur-model-gateway::compress` 新增 1 個整合測試驗證 superseded Read 的 stub 真的內嵌了骨架。全部通過，clippy 乾淨，整個 mur workspace(`cargo check`)也確認未受影響。
 
 ### P5 — 分層協調（防重壓）
-- cc-proxy 已有 `has_retrieve_marker` skip。反向：headroom 的 `parser.py` 認得 CCR marker——確認它對含 marker 區塊真的 no-op；若否，開 upstream issue/PR，這是唯一值得碰 headroom 的點。
+- mur-model-gateway 已有 `has_retrieve_marker` skip。反向：headroom 的 `parser.py` 認得 CCR marker——確認它對含 marker 區塊真的 no-op；若否，開 upstream issue/PR，這是唯一值得碰 headroom 的點。
 
 ### 不做（現階段）
 - headroom 內部改造（supersession/read_lifecycle 強化）：非我們的 code；P2 在 proxy 層拿到同一份收益且對兩條鏈（有/無 headroom）都生效。

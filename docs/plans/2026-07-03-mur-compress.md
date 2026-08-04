@@ -1,10 +1,10 @@
-# cc-proxy × mur-compress Implementation Plan
+# mur-model-gateway × mur-compress Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Compress oversized `tool_result` blocks in `/v1/messages` request bodies through the mur-compress engine before forwarding upstream, sharing `~/.mur/compress` so `mur_retrieve` recovers originals.
 
-**Architecture:** New `src/compress.rs` module in cc-proxy. In `forward()`, after body buffering and before the disguise step, an env-gated rewrite parses the JSON body, compresses fat `tool_result` text via `mur_compress::auto_compress`, and re-serializes. Everything is fail-open: any error forwards the original bytes.
+**Architecture:** New `src/compress.rs` module in mur-model-gateway. In `forward()`, after body buffering and before the disguise step, an env-gated rewrite parses the JSON body, compresses fat `tool_result` text via `mur_compress::auto_compress`, and re-serializes. Everything is fail-open: any error forwards the original bytes.
 
 **Tech Stack:** Rust edition 2024, axum 0.8, `mur-compress` (path dep on the sibling mur checkout), httpmock + tempfile for tests.
 
@@ -16,7 +16,7 @@
 - **`tool_result` blocks only.** Never touch `system`, user text, or assistant turns.
 - **Preserve sibling fields:** `tool_use_id`, `is_error`, `cache_control` must survive the rewrite (mutate text values in place; never rebuild blocks).
 - **No hardcoded thresholds:** `min_tokens` and all gates come from mur's `CompressConfig::load(mur_home)` (`~/.mur/compress.yaml`, defaults built in). Honor `cfg.enabled` and `cfg.auto.enabled`.
-- **Opt-in rollout:** compression runs only when env `CC_PROXY_COMPRESS=1`. Default off.
+- **Opt-in rollout:** compression runs only when env `MUR_MODEL_GATEWAY_COMPRESS=1`. Default off.
 - **Zero changes to the mur repo.**
 - Repo hygiene: `cargo fmt` clean, `cargo clippy -- -D warnings` clean, single source file ≤ 800 lines.
 - The mur checkout must exist at `../mur` relative to this repo (`/Volumes/Firecuda4tb/Projects/mur`).
@@ -361,18 +361,18 @@ git commit -m "feat(compress): tool_result rewrite core over mur-compress"
 
 **Interfaces:**
 - Consumes: `rewrite_tool_results` from Task 2.
-- Produces: `compress::rewrite_request_body(body: &[u8]) -> Option<Vec<u8>>`; `pub compress: bool` on `AppState` (read from env `CC_PROXY_COMPRESS` in `with_version`, overridable by tests via the pub field).
+- Produces: `compress::rewrite_request_body(body: &[u8]) -> Option<Vec<u8>>`; `pub compress: bool` on `AppState` (read from env `MUR_MODEL_GATEWAY_COMPRESS` in `with_version`, overridable by tests via the pub field).
 
 - [ ] **Step 1: Write the failing integration test**
 
 Create `tests/compress_e2e.rs`:
 
 ```rust
-//! Wire-level compression acceptance: with CC_PROXY_COMPRESS on, a fat
+//! Wire-level compression acceptance: with MUR_MODEL_GATEWAY_COMPRESS on, a fat
 //! tool_result in /v1/messages reaches the upstream compressed; with the
 //! flag off the body is forwarded byte-identical.
 
-use cc_proxy::{AppState, TokenSource, build_router};
+use mur_model_gateway::{AppState, TokenSource, build_router};
 use httpmock::prelude::*;
 use std::time::Duration;
 
@@ -522,7 +522,7 @@ pub struct AppState {
     pub token_source: TokenSource,
     pub version_cache: Arc<cc_version::VersionCache>,
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
-    /// Env-gated: CC_PROXY_COMPRESS=1. Tests flip the field directly.
+    /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
 }
 ```
@@ -530,7 +530,7 @@ pub struct AppState {
 In `with_version` (the ctor that builds the struct literal), add:
 
 ```rust
-            compress: std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1"),
+            compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
 ```
 
 In `forward()`, immediately after the `body_bytes` read:
@@ -569,7 +569,7 @@ Expected: all tests PASS, including the untouched `passthrough`/`disguise`/`cc_v
 ```bash
 cargo fmt && cargo clippy -- -D warnings
 git add src/compress.rs src/lib.rs tests/compress_e2e.rs
-git commit -m "feat(compress): CC_PROXY_COMPRESS-gated wire compression in forward()"
+git commit -m "feat(compress): MUR_MODEL_GATEWAY_COMPRESS-gated wire compression in forward()"
 ```
 
 ---
@@ -595,9 +595,9 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
 HTTPServer(('127.0.0.1', 9909), H).serve_forever()
 " &
-CC_PROXY_COMPRESS=1 CC_PROXY_BIND=127.0.0.1:9908 \
-  CC_PROXY_UPSTREAM=http://127.0.0.1:9909 CC_PROXY_TOKEN_SOURCE=off \
-  ./target/release/cc-proxy serve &
+MUR_MODEL_GATEWAY_COMPRESS=1 MUR_MODEL_GATEWAY_BIND=127.0.0.1:9908 \
+  MUR_MODEL_GATEWAY_UPSTREAM=http://127.0.0.1:9909 MUR_MODEL_GATEWAY_TOKEN_SOURCE=off \
+  ./target/release/mur-model-gateway serve &
 ```
 
 - [ ] **Step 2: Send a fat tool_result through it and verify compression + retrieval**
@@ -633,7 +633,7 @@ Expected: original content comes back; stats delta shows one new compression. Ki
 In `docs/specs/2026-07-03-mur-compress-design.md` change the Status line to:
 
 ```markdown
-**Status:** Implemented (env-gated `CC_PROXY_COMPRESS=1`, default off)
+**Status:** Implemented (env-gated `MUR_MODEL_GATEWAY_COMPRESS=1`, default off)
 ```
 
 ```bash
@@ -645,4 +645,4 @@ git commit -m "docs: mark mur-compress spec implemented"
 
 ## Rollout note (post-plan, manual)
 
-The installed launchd service does not set `CC_PROXY_COMPRESS`. To enable live: add the env var to the service descriptor (`cc-proxy install` path) or the launchd plist, restart the service, and watch `mur compress stats` for a few sessions before considering a default flip. Verify which mur agents have the mur MCP server before flipping the default (retrieval caveat in the spec).
+The installed launchd service does not set `MUR_MODEL_GATEWAY_COMPRESS`. To enable live: add the env var to the service descriptor (`mur-model-gateway install` path) or the launchd plist, restart the service, and watch `mur compress stats` for a few sessions before considering a default flip. Verify which mur agents have the mur MCP server before flipping the default (retrieval caveat in the spec).

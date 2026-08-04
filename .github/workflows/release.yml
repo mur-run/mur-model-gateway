@@ -1,0 +1,138 @@
+name: Release
+
+# Tag push (v*) publishes a GitHub Release with binaries.
+# workflow_dispatch builds the same artifacts without publishing — use it to
+# rehearse the pipeline (an unrun pipeline is an untested pipeline).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: mur-model-gateway
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  build-macos:
+    needs: test
+    runs-on: macos-14
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+      NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/$BIN \
+            target/x86_64-apple-darwin/release/$BIN \
+            -output $BIN
+
+      # With a Developer ID identity the keychain "Always Allow" ACL binds to
+      # the stable signing identity, so users authorize once and never see the
+      # prompt again — including across updates. Without secrets we fall back
+      # to ad-hoc so dispatch rehearsals still produce runnable artifacts.
+      - name: Codesign
+        run: |
+          if [ -n "$MACOS_CERT_P12" ]; then
+            security create-keychain -p "" build.keychain
+            security default-keychain -s build.keychain
+            security unlock-keychain -p "" build.keychain
+            printf '%s' "$MACOS_CERT_P12" | base64 -d > cert.p12
+            security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+            rm cert.p12
+            security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+            codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" $BIN
+          else
+            echo "::warning::MACOS_CERT_P12 not set — ad-hoc signing (users will get repeated keychain prompts)"
+            codesign --force -s - $BIN
+          fi
+          codesign -dv $BIN
+
+      # Bare Mach-O binaries cannot be stapled; Gatekeeper fetches the ticket
+      # online on first run, which is fine for a CLI distributed as a tarball.
+      - name: Notarize
+        if: env.NOTARY_KEY_P8 != ''
+        run: |
+          printf '%s' "$NOTARY_KEY_P8" | base64 -d > notary.p8
+          zip notarize.zip $BIN
+          xcrun notarytool submit notarize.zip \
+            --key notary.p8 --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+          rm notary.p8 notarize.zip
+
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          case "$GITHUB_REF" in refs/tags/*) ;; *) VERSION=$(git rev-parse --short HEAD) ;; esac
+          NAME=$BIN-$VERSION-macos-universal
+          mkdir -p dist
+          tar -czf dist/$NAME.tar.gz $BIN
+          (cd dist && shasum -a 256 $NAME.tar.gz > $NAME.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  build-linux:
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          case "$GITHUB_REF" in refs/tags/*) ;; *) VERSION=$(git rev-parse --short HEAD) ;; esac
+          NAME=$BIN-$VERSION-linux-x86_64
+          mkdir -p dist
+          tar -czf dist/$NAME.tar.gz -C target/release $BIN
+          (cd dist && sha256sum $NAME.tar.gz > $NAME.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

@@ -1,11 +1,11 @@
-//! Wire-level compression acceptance: with CC_PROXY_COMPRESS on, a fat
+//! Wire-level compression acceptance: with MUR_MODEL_GATEWAY_COMPRESS on, a fat
 //! tool_result reaches the upstream compressed for all three providers;
 //! with the flag off the body is forwarded byte-identical.
 //!
 //! All scenarios run in a single test to avoid parallel MUR_HOME env races.
 
-use cc_proxy::{AppState, TokenSource, build_router};
 use httpmock::prelude::*;
+use mur_model_gateway::{AppState, TokenSource, build_router};
 use std::time::Duration;
 
 async fn spawn_proxy(upstream: String, compress: bool) -> String {

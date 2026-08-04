@@ -8,10 +8,10 @@
 
 #![cfg(has_beta_hook)]
 
-use cc_proxy::cc_version::{FALLBACK_VERSION, VersionCache, VersionStrategy};
-use cc_proxy::disguise::billing_prefix;
-use cc_proxy::{AppState, TokenSource, build_router};
 use httpmock::prelude::*;
+use mur_model_gateway::cc_version::{FALLBACK_VERSION, VersionCache, VersionStrategy};
+use mur_model_gateway::disguise::billing_prefix;
+use mur_model_gateway::{AppState, TokenSource, build_router};
 use std::sync::Arc;
 use std::time::Duration;
 

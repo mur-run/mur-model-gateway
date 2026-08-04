@@ -9,30 +9,30 @@
 //!
 //! Config flags (`--token-source`, `--bind`, `--upstream`) are rendered into
 //! the descriptor as environment variables — the runtime already reads
-//! CC_PROXY_TOKEN_SOURCE / CC_PROXY_BIND / CC_PROXY_UPSTREAM, so nothing else
+//! MUR_MODEL_GATEWAY_TOKEN_SOURCE / MUR_MODEL_GATEWAY_BIND / MUR_MODEL_GATEWAY_UPSTREAM, so nothing else
 //! is needed. In `--system` mode the env goes to a root-owned, mode-600
-//! `/etc/cc-proxy.env` (referenced via `EnvironmentFile=`) so secrets like an
+//! `/etc/mur-model-gateway.env` (referenced via `EnvironmentFile=`) so secrets like an
 //! `env:VAR` token can be appended there without living in the unit file.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
-pub const SERVICE_LABEL: &str = "run.cc-proxy";
-pub const LINUX_SYSTEM_UNIT: &str = "/etc/systemd/system/cc-proxy.service";
-pub const LINUX_SYSTEM_ENV_FILE: &str = "/etc/cc-proxy.env";
+pub const SERVICE_LABEL: &str = "run.mur-model-gateway";
+pub const LINUX_SYSTEM_UNIT: &str = "/etc/systemd/system/mur-model-gateway.service";
+pub const LINUX_SYSTEM_ENV_FILE: &str = "/etc/mur-model-gateway.env";
 
 /// Install-time configuration collected from CLI flags.
 #[derive(Default)]
 pub struct InstallOpts {
-    /// `--compress` / `--no-compress`; `None` = sniff CC_PROXY_COMPRESS env.
+    /// `--compress` / `--no-compress`; `None` = sniff MUR_MODEL_GATEWAY_COMPRESS env.
     pub compress: Option<bool>,
-    /// CC_PROXY_TOKEN_SOURCE to bake in (already validated by the caller).
+    /// MUR_MODEL_GATEWAY_TOKEN_SOURCE to bake in (already validated by the caller).
     pub token_source: Option<String>,
-    /// CC_PROXY_BIND to bake in.
+    /// MUR_MODEL_GATEWAY_BIND to bake in.
     pub bind: Option<String>,
-    /// CC_PROXY_UPSTREAM to bake in.
+    /// MUR_MODEL_GATEWAY_UPSTREAM to bake in.
     pub upstream: Option<String>,
-    /// Linux only: system-level unit + /etc/cc-proxy.env instead of user unit.
+    /// Linux only: system-level unit + /etc/mur-model-gateway.env instead of user unit.
     pub system: bool,
 }
 
@@ -58,31 +58,31 @@ impl InstallPaths {
             (
                 home.join("Library/LaunchAgents")
                     .join(format!("{SERVICE_LABEL}.plist")),
-                home.join("Library/Logs/cc-proxy"),
+                home.join("Library/Logs/mur-model-gateway"),
                 None,
             )
         } else if cfg!(target_os = "linux") {
             if system {
                 (
                     PathBuf::from(LINUX_SYSTEM_UNIT),
-                    PathBuf::from("/var/log/cc-proxy"),
+                    PathBuf::from("/var/log/mur-model-gateway"),
                     Some(PathBuf::from(LINUX_SYSTEM_ENV_FILE)),
                 )
             } else {
                 let cfg = dirs.config_dir();
                 let state = dirs.state_dir().unwrap_or(cfg);
                 (
-                    cfg.join("systemd/user/cc-proxy.service"),
-                    state.join("cc-proxy"),
+                    cfg.join("systemd/user/mur-model-gateway.service"),
+                    state.join("mur-model-gateway"),
                     None,
                 )
             }
         } else {
-            // Windows / other — fall back to %LOCALAPPDATA%\cc-proxy\.
+            // Windows / other — fall back to %LOCALAPPDATA%\mur-model-gateway\.
             let local = dirs.config_local_dir();
             (
-                local.join("cc-proxy/cc-proxy.cmd"),
-                local.join("cc-proxy/logs"),
+                local.join("mur-model-gateway/mur-model-gateway.cmd"),
+                local.join("mur-model-gateway/logs"),
                 None,
             )
         };
@@ -98,14 +98,17 @@ impl InstallPaths {
 /// The env lines a descriptor carries: RUST_LOG plus every opted-in var.
 /// Single source of truth for all three render formats.
 pub fn env_pairs(opts: &InstallOpts, compress: bool) -> Result<Vec<(String, String)>> {
-    let mut pairs = vec![("RUST_LOG".to_string(), "info,cc_proxy=debug".to_string())];
+    let mut pairs = vec![(
+        "RUST_LOG".to_string(),
+        "info,mur_model_gateway=debug".to_string(),
+    )];
     if compress {
-        pairs.push(("CC_PROXY_COMPRESS".to_string(), "1".to_string()));
+        pairs.push(("MUR_MODEL_GATEWAY_COMPRESS".to_string(), "1".to_string()));
     }
     for (key, val) in [
-        ("CC_PROXY_TOKEN_SOURCE", &opts.token_source),
-        ("CC_PROXY_BIND", &opts.bind),
-        ("CC_PROXY_UPSTREAM", &opts.upstream),
+        ("MUR_MODEL_GATEWAY_TOKEN_SOURCE", &opts.token_source),
+        ("MUR_MODEL_GATEWAY_BIND", &opts.bind),
+        ("MUR_MODEL_GATEWAY_UPSTREAM", &opts.upstream),
     ] {
         if let Some(v) = val {
             // Injection guard: these values get spliced verbatim into plist
@@ -137,10 +140,10 @@ pub fn install(opts: InstallOpts) -> Result<()> {
     let log_file = paths.log_dir.join("proxy.log");
     // Flag wins; otherwise capture the install-time env opt-in (default off).
     let compress = opts.compress.unwrap_or_else(|| {
-        let env_on = std::env::var("CC_PROXY_COMPRESS").is_ok_and(|v| v == "1");
+        let env_on = std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1");
         if env_on {
             eprintln!(
-                "note: CC_PROXY_COMPRESS=1 detected in environment, baking into service descriptor.\n\
+                "note: MUR_MODEL_GATEWAY_COMPRESS=1 detected in environment, baking into service descriptor.\n\
                  \x20      Pass --no-compress to override."
             );
         }
@@ -181,19 +184,19 @@ pub fn install(opts: InstallOpts) -> Result<()> {
                 );
             }
             println!("next: sudo systemctl daemon-reload");
-            println!("      sudo systemctl enable --now cc-proxy.service");
-            println!("      journalctl -u cc-proxy.service -f");
+            println!("      sudo systemctl enable --now mur-model-gateway.service");
+            println!("      journalctl -u mur-model-gateway.service -f");
         } else {
             let unit = render_linux_unit(&paths.binary, &env);
             std::fs::write(&paths.service_file, unit)
                 .with_context(|| format!("write {}", paths.service_file.display()))?;
             println!("wrote {}", paths.service_file.display());
             println!("next: systemctl --user daemon-reload");
-            println!("      systemctl --user enable --now cc-proxy.service");
-            println!("      journalctl --user -u cc-proxy.service -f");
+            println!("      systemctl --user enable --now mur-model-gateway.service");
+            println!("      journalctl --user -u mur-model-gateway.service -f");
             println!(
                 "note: user units only run while you're logged in; for headless/boot\n\
-                 \x20     start use `cc-proxy install --system` or `loginctl enable-linger $USER`"
+                 \x20     start use `mur-model-gateway install --system` or `loginctl enable-linger $USER`"
             );
         }
     } else {
@@ -203,10 +206,10 @@ pub fn install(opts: InstallOpts) -> Result<()> {
         println!("wrote {}", paths.service_file.display());
         println!("next (run in an elevated prompt to register the logon task):");
         println!(
-            "      schtasks /Create /F /SC ONLOGON /TN cc-proxy /TR \"\\\"{}\\\"\"",
+            "      schtasks /Create /F /SC ONLOGON /TN mur-model-gateway /TR \"\\\"{}\\\"\"",
             paths.service_file.display()
         );
-        println!("      schtasks /Run /TN cc-proxy");
+        println!("      schtasks /Run /TN mur-model-gateway");
         println!("      logs: {}", log_file.display());
     }
     Ok(())
@@ -234,7 +237,7 @@ fn write_root_owned(path: &Path, content: &str, mode: u32) -> Result<()> {
                 path.display(),
                 std::env::current_exe()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "cc-proxy".into())
+                    .unwrap_or_else(|_| "mur-model-gateway".into())
             );
         }
         Err(e) => Err(e).with_context(|| format!("write {}", path.display())),
@@ -280,10 +283,10 @@ pub fn uninstall() -> Result<()> {
     if cfg!(target_os = "macos") {
         println!("next: launchctl bootout gui/$(id -u)/{SERVICE_LABEL}");
     } else if cfg!(target_os = "linux") {
-        println!("next: systemctl --user disable --now cc-proxy.service");
-        println!("      (system mode: sudo systemctl disable --now cc-proxy.service)");
+        println!("next: systemctl --user disable --now mur-model-gateway.service");
+        println!("      (system mode: sudo systemctl disable --now mur-model-gateway.service)");
     } else {
-        println!("next: schtasks /Delete /TN cc-proxy /F");
+        println!("next: schtasks /Delete /TN mur-model-gateway /F");
     }
     Ok(())
 }
@@ -360,7 +363,7 @@ pub fn render_linux_unit(binary: &Path, env: &[(String, String)]) -> String {
     let bin = binary.display();
     format!(
         r#"[Unit]
-Description=cc-proxy local Anthropic API proxy
+Description=mur-model-gateway local Anthropic API proxy
 After=network-online.target
 Wants=network-online.target
 
@@ -384,7 +387,7 @@ pub fn render_linux_system_unit(binary: &Path, user: &str, env_file: &Path) -> S
     let envf = env_file.display();
     format!(
         r#"[Unit]
-Description=cc-proxy local Anthropic API proxy
+Description=mur-model-gateway local Anthropic API proxy
 After=network-online.target
 Wants=network-online.target
 
@@ -440,13 +443,16 @@ mod tests {
     use std::path::PathBuf;
 
     fn base_env() -> Vec<(String, String)> {
-        vec![("RUST_LOG".to_string(), "info,cc_proxy=debug".to_string())]
+        vec![(
+            "RUST_LOG".to_string(),
+            "info,mur_model_gateway=debug".to_string(),
+        )]
     }
 
     #[test]
     fn env_pairs_orders_and_includes_opted_in_vars() {
         let opts = InstallOpts {
-            token_source: Some("env:CC_PROXY_OAUTH_TOKEN".into()),
+            token_source: Some("env:MUR_MODEL_GATEWAY_OAUTH_TOKEN".into()),
             bind: Some("127.0.0.1:9099".into()),
             upstream: Some("https://api.example.com".into()),
             ..Default::default()
@@ -457,10 +463,10 @@ mod tests {
             keys,
             [
                 "RUST_LOG",
-                "CC_PROXY_COMPRESS",
-                "CC_PROXY_TOKEN_SOURCE",
-                "CC_PROXY_BIND",
-                "CC_PROXY_UPSTREAM"
+                "MUR_MODEL_GATEWAY_COMPRESS",
+                "MUR_MODEL_GATEWAY_TOKEN_SOURCE",
+                "MUR_MODEL_GATEWAY_BIND",
+                "MUR_MODEL_GATEWAY_UPSTREAM"
             ]
         );
     }
@@ -479,20 +485,20 @@ mod tests {
     #[test]
     fn macos_plist_embeds_binary_log_and_env() {
         let mut env = base_env();
-        env.push(("CC_PROXY_TOKEN_SOURCE".into(), "file".into()));
+        env.push(("MUR_MODEL_GATEWAY_TOKEN_SOURCE".into(), "file".into()));
         let p = render_macos_plist(
-            &PathBuf::from("/usr/local/bin/cc-proxy"),
+            &PathBuf::from("/usr/local/bin/mur-model-gateway"),
             &PathBuf::from("/tmp/proxy.log"),
             &env,
         );
-        assert!(p.contains("<string>/usr/local/bin/cc-proxy</string>"));
+        assert!(p.contains("<string>/usr/local/bin/mur-model-gateway</string>"));
         assert!(p.contains("<string>/tmp/proxy.log</string>"));
         assert!(p.contains(&format!("<string>{SERVICE_LABEL}</string>")));
         assert!(p.contains("<key>KeepAlive</key>"));
         assert!(p.contains("<key>RunAtLoad</key>"));
-        assert!(p.contains("<key>CC_PROXY_TOKEN_SOURCE</key>"));
+        assert!(p.contains("<key>MUR_MODEL_GATEWAY_TOKEN_SOURCE</key>"));
         assert!(p.contains("<string>file</string>"));
-        assert!(!p.contains("CC_PROXY_COMPRESS"));
+        assert!(!p.contains("MUR_MODEL_GATEWAY_COMPRESS"));
     }
 
     #[test]
@@ -501,64 +507,67 @@ mod tests {
         let env = env_pairs(&opts, true).unwrap();
 
         let p = render_macos_plist(
-            &PathBuf::from("/usr/local/bin/cc-proxy"),
+            &PathBuf::from("/usr/local/bin/mur-model-gateway"),
             &PathBuf::from("/tmp/proxy.log"),
             &env,
         );
-        assert!(p.contains("<key>CC_PROXY_COMPRESS</key>"));
+        assert!(p.contains("<key>MUR_MODEL_GATEWAY_COMPRESS</key>"));
         assert!(p.contains("<string>1</string>"));
 
-        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), &env);
-        assert!(u.contains("Environment=CC_PROXY_COMPRESS=1"));
+        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/mur-model-gateway"), &env);
+        assert!(u.contains("Environment=MUR_MODEL_GATEWAY_COMPRESS=1"));
 
         let c = render_windows_cmd(
-            &PathBuf::from(r"C:\Users\u\cc-proxy.exe"),
+            &PathBuf::from(r"C:\Users\u\mur-model-gateway.exe"),
             &PathBuf::from(r"C:\Users\u\logs\proxy.log"),
             &env,
         );
-        assert!(c.contains("set CC_PROXY_COMPRESS=1"));
+        assert!(c.contains("set MUR_MODEL_GATEWAY_COMPRESS=1"));
     }
 
     #[test]
     fn linux_unit_embeds_binary_and_env() {
         let mut env = base_env();
-        env.push(("CC_PROXY_BIND".into(), "127.0.0.1:9099".into()));
-        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/cc-proxy"), &env);
-        assert!(u.contains("ExecStart=/home/u/.local/bin/cc-proxy"));
+        env.push(("MUR_MODEL_GATEWAY_BIND".into(), "127.0.0.1:9099".into()));
+        let u = render_linux_unit(&PathBuf::from("/home/u/.local/bin/mur-model-gateway"), &env);
+        assert!(u.contains("ExecStart=/home/u/.local/bin/mur-model-gateway"));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains("WantedBy=default.target"));
-        assert!(u.contains("Environment=CC_PROXY_BIND=127.0.0.1:9099"));
-        assert!(!u.contains("CC_PROXY_COMPRESS"));
+        assert!(u.contains("Environment=MUR_MODEL_GATEWAY_BIND=127.0.0.1:9099"));
+        assert!(!u.contains("MUR_MODEL_GATEWAY_COMPRESS"));
     }
 
     #[test]
     fn linux_system_unit_runs_as_user_with_env_file() {
         let u = render_linux_system_unit(
-            &PathBuf::from("/usr/local/bin/cc-proxy"),
+            &PathBuf::from("/usr/local/bin/mur-model-gateway"),
             "karajan",
             &PathBuf::from(LINUX_SYSTEM_ENV_FILE),
         );
-        assert!(u.contains("ExecStart=/usr/local/bin/cc-proxy"));
+        assert!(u.contains("ExecStart=/usr/local/bin/mur-model-gateway"));
         assert!(u.contains("User=karajan"));
-        assert!(u.contains("EnvironmentFile=/etc/cc-proxy.env"));
+        assert!(u.contains("EnvironmentFile=/etc/mur-model-gateway.env"));
         assert!(u.contains("WantedBy=multi-user.target"));
     }
 
     #[test]
     fn merge_env_file_preserves_operator_lines() {
-        let existing = "RUST_LOG=old\nCC_PROXY_OAUTH_TOKEN=sk-ant-oat01-secret\n# comment\n";
+        let existing =
+            "RUST_LOG=old\nMUR_MODEL_GATEWAY_OAUTH_TOKEN=sk-ant-oat01-secret\n# comment\n";
         let env = vec![
             ("RUST_LOG".to_string(), "info".to_string()),
             (
-                "CC_PROXY_TOKEN_SOURCE".to_string(),
-                "env:CC_PROXY_OAUTH_TOKEN".to_string(),
+                "MUR_MODEL_GATEWAY_TOKEN_SOURCE".to_string(),
+                "env:MUR_MODEL_GATEWAY_OAUTH_TOKEN".to_string(),
             ),
         ];
         let merged = merge_env_file(existing, &env);
         assert!(merged.contains("RUST_LOG=info\n"));
         assert!(!merged.contains("RUST_LOG=old"));
-        assert!(merged.contains("CC_PROXY_OAUTH_TOKEN=sk-ant-oat01-secret\n"));
-        assert!(merged.contains("CC_PROXY_TOKEN_SOURCE=env:CC_PROXY_OAUTH_TOKEN\n"));
+        assert!(merged.contains("MUR_MODEL_GATEWAY_OAUTH_TOKEN=sk-ant-oat01-secret\n"));
+        assert!(
+            merged.contains("MUR_MODEL_GATEWAY_TOKEN_SOURCE=env:MUR_MODEL_GATEWAY_OAUTH_TOKEN\n")
+        );
         assert!(!merged.contains("# comment"));
     }
 
@@ -566,23 +575,26 @@ mod tests {
     fn env_file_renders_key_value_lines() {
         let env = vec![
             ("RUST_LOG".to_string(), "info".to_string()),
-            ("CC_PROXY_TOKEN_SOURCE".to_string(), "env:T".to_string()),
+            (
+                "MUR_MODEL_GATEWAY_TOKEN_SOURCE".to_string(),
+                "env:T".to_string(),
+            ),
         ];
         assert_eq!(
             render_env_file(&env),
-            "RUST_LOG=info\nCC_PROXY_TOKEN_SOURCE=env:T\n"
+            "RUST_LOG=info\nMUR_MODEL_GATEWAY_TOKEN_SOURCE=env:T\n"
         );
     }
 
     #[test]
     fn windows_cmd_quotes_binary_and_redirects_log() {
         let c = render_windows_cmd(
-            &PathBuf::from(r"C:\Users\u\cc-proxy.exe"),
+            &PathBuf::from(r"C:\Users\u\mur-model-gateway.exe"),
             &PathBuf::from(r"C:\Users\u\logs\proxy.log"),
             &base_env(),
         );
-        assert!(c.contains(r#""C:\Users\u\cc-proxy.exe""#));
+        assert!(c.contains(r#""C:\Users\u\mur-model-gateway.exe""#));
         assert!(c.contains(r#">> "C:\Users\u\logs\proxy.log" 2>&1"#));
-        assert!(!c.contains("CC_PROXY_COMPRESS"));
+        assert!(!c.contains("MUR_MODEL_GATEWAY_COMPRESS"));
     }
 }

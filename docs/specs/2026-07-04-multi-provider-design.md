@@ -1,12 +1,12 @@
-# cc-proxy: multi-provider support (OpenAI + Gemini)
+# mur-model-gateway: multi-provider support (OpenAI + Gemini)
 
 **Date:** 2026-07-04
 **Status:** Draft
-**Scope:** cc-proxy only. Zero changes to the mur repo.
+**Scope:** mur-model-gateway only. Zero changes to the mur repo.
 
 ## Problem
 
-cc-proxy currently targets only Anthropic's API. It provides three services on
+mur-model-gateway currently targets only Anthropic's API. It provides three services on
 that traffic:
 
 1. **Passthrough routing** — forward requests to `api.anthropic.com`.
@@ -19,13 +19,13 @@ that traffic:
 None of this works for OpenAI or Gemini traffic. The compression service in
 particular is valuable for any LLM provider: tool results (command output, file
 contents, search results) dominate token spend regardless of which model
-processes them. cc-proxy already sits at 127.0.0.1:8088 — if it understood
+processes them. mur-model-gateway already sits at 127.0.0.1:8088 — if it understood
 OpenAI and Gemini request shapes, it could compress their tool results with no
 new infrastructure.
 
 ## Decision
 
-Extend cc-proxy to route and compress traffic for Anthropic, OpenAI, and Gemini
+Extend mur-model-gateway to route and compress traffic for Anthropic, OpenAI, and Gemini
 through a single instance. Path-based auto-detection selects the upstream;
 compression is dispatched to provider-aware extractors that understand each
 API's tool-result JSON structure. Disguise remains Anthropic-only.
@@ -70,13 +70,13 @@ New `Provider` enum, derived from the request path:
 Environment variables, each optional with the default above:
 
 ```
-CC_PROXY_UPSTREAM_ANTHROPIC
-CC_PROXY_UPSTREAM_OPENAI
-CC_PROXY_UPSTREAM_GEMINI
+MUR_MODEL_GATEWAY_UPSTREAM_ANTHROPIC
+MUR_MODEL_GATEWAY_UPSTREAM_OPENAI
+MUR_MODEL_GATEWAY_UPSTREAM_GEMINI
 ```
 
-The existing `CC_PROXY_UPSTREAM` is kept as a fallback: if a provider-specific
-var is unset AND `CC_PROXY_UPSTREAM` is set, it overrides the default for all
+The existing `MUR_MODEL_GATEWAY_UPSTREAM` is kept as a fallback: if a provider-specific
+var is unset AND `MUR_MODEL_GATEWAY_UPSTREAM` is set, it overrides the default for all
 three providers. This preserves backward compatibility for single-provider
 deployments.
 
@@ -160,7 +160,7 @@ block or corrupt a request.
 
 ### Rollout gate (unchanged)
 
-`CC_PROXY_COMPRESS=1` env var, default off. The gate applies to all three
+`MUR_MODEL_GATEWAY_COMPRESS=1` env var, default off. The gate applies to all three
 providers uniformly — when on, all tool-result-shaped blocks are candidates.
 
 ## Testing

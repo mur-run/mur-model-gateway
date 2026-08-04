@@ -1,6 +1,6 @@
 [package]
-name = "cc-proxy"
-version = "0.0.1"
+name = "mur-model-gateway"
+version = "0.1.0"
 edition = "2024"
 publish = false
 
@@ -11,7 +11,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "5"
 futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
-# git tag (not local path) so cc-proxy builds on deploy hosts without a mur checkout;
+# git tag (not local path) so mur-model-gateway builds on deploy hosts without a mur checkout;
 # keep the tag in lockstep with the mur version you develop against.
 mur-compress = { git = "https://github.com/mur-run/mur.git", tag = "v2.40.1", package = "mur-compress" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

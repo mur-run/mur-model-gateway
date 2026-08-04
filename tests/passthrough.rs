@@ -1,9 +1,9 @@
-//! Iter 0 acceptance: cc-proxy must transparently forward
+//! Iter 0 acceptance: mur-model-gateway must transparently forward
 //! requests + headers + body to an upstream and stream the
 //! response (status, headers, body) back unchanged.
 
-use cc_proxy::{AppState, TokenSource, build_router};
 use httpmock::prelude::*;
+use mur_model_gateway::{AppState, TokenSource, build_router};
 use std::time::Duration;
 
 #[tokio::test]
@@ -117,7 +117,7 @@ async fn passthrough_handles_get() {
     assert!(resp.text().await.unwrap().contains("in_progress"));
 }
 
-/// Spawn cc-proxy on an ephemeral port pointing at `upstream`.
+/// Spawn mur-model-gateway on an ephemeral port pointing at `upstream`.
 async fn spawn_proxy(upstream: String) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -131,7 +131,7 @@ async fn spawn_proxy(upstream: String) -> String {
     addr.to_string()
 }
 
-/// Spawn cc-proxy with distinct upstreams per provider.
+/// Spawn mur-model-gateway with distinct upstreams per provider.
 async fn spawn_proxy_distinct(
     upstream_anthropic: String,
     upstream_openai: String,

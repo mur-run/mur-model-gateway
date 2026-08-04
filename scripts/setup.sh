@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cc-proxy setup: build release → install to ~/.local/bin → register
+# mur-model-gateway setup: build release → install to ~/.local/bin → register
 # as a user service (launchd on macOS, systemd --user on Linux).
 #
 # Re-runnable. Tears down any existing service before re-installing,
@@ -11,17 +11,17 @@
 #   ./scripts/setup.sh --uninstall  # tear down service, leave binary
 #   ./scripts/setup.sh --musl       # static musl build (old-GLIBC hosts, e.g. Ubuntu 20.04)
 #   ./scripts/setup.sh --system     # Linux: system-level unit (boots headless; needs sudo)
-#   ./scripts/setup.sh -- --token-source env:CC_PROXY_OAUTH_TOKEN --bind 127.0.0.1:9099
-#                                   # everything after -- goes to `cc-proxy install`
+#   ./scripts/setup.sh -- --token-source env:MUR_MODEL_GATEWAY_OAUTH_TOKEN --bind 127.0.0.1:9099
+#                                   # everything after -- goes to `mur-model-gateway install`
 #   INSTALL_DIR=~/bin ./scripts/setup.sh   # override install location
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-INSTALL_PATH="$INSTALL_DIR/cc-proxy"
-SERVICE_LABEL="run.cc-proxy"
-BIND_PORT="${CC_PROXY_BIND_PORT:-8088}"
+INSTALL_PATH="$INSTALL_DIR/mur-model-gateway"
+SERVICE_LABEL="run.mur-model-gateway"
+BIND_PORT="${MUR_MODEL_GATEWAY_BIND_PORT:-8088}"
 
 case "$(uname -s)" in
   Darwin) PLATFORM=macos ;;
@@ -31,7 +31,7 @@ esac
 
 # ─── helpers ────────────────────────────────────────────────────────
 
-log() { printf '\033[36m[cc-proxy setup]\033[0m %s\n' "$*"; }
+log() { printf '\033[36m[mur-model-gateway setup]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[32m✓\033[0m %s\n' "$*"; }
 err() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
 
@@ -44,9 +44,9 @@ teardown_service() {
       ;;
     linux)
       if [[ "${SYSTEM:-0}" == 1 ]]; then
-        sudo systemctl disable --now cc-proxy.service 2>/dev/null || true
+        sudo systemctl disable --now mur-model-gateway.service 2>/dev/null || true
       else
-        systemctl --user disable --now cc-proxy.service 2>/dev/null || true
+        systemctl --user disable --now mur-model-gateway.service 2>/dev/null || true
       fi
       ;;
   esac
@@ -61,10 +61,10 @@ start_service() {
     linux)
       if [[ "${SYSTEM:-0}" == 1 ]]; then
         sudo systemctl daemon-reload
-        sudo systemctl enable --now cc-proxy.service
+        sudo systemctl enable --now mur-model-gateway.service
       else
         systemctl --user daemon-reload
-        systemctl --user enable --now cc-proxy.service
+        systemctl --user enable --now mur-model-gateway.service
       fi
       ;;
   esac
@@ -72,9 +72,9 @@ start_service() {
 
 is_listening() {
   if command -v lsof >/dev/null 2>&1; then
-    lsof -nP "-iTCP:$BIND_PORT" -sTCP:LISTEN 2>/dev/null | grep -q cc-proxy
+    lsof -nP "-iTCP:$BIND_PORT" -sTCP:LISTEN 2>/dev/null | grep -q mur-model-gateway
   elif command -v ss >/dev/null 2>&1; then
-    ss -tlnp 2>/dev/null | grep -q ":$BIND_PORT.*cc-proxy"
+    ss -tlnp 2>/dev/null | grep -q ":$BIND_PORT.*mur-model-gateway"
   else
     (echo >"/dev/tcp/127.0.0.1/$BIND_PORT") 2>/dev/null
   fi
@@ -83,7 +83,7 @@ is_listening() {
 print_post_install_help() {
   cat <<EOF
 
-cc-proxy is up on 127.0.0.1:$BIND_PORT.
+mur-model-gateway is up on 127.0.0.1:$BIND_PORT.
 
 Add to your shell init (\$HOME/.zshenv / \$HOME/.bashrc):
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$BIND_PORT"
@@ -92,20 +92,20 @@ EOF
   case "$PLATFORM" in
     macos)
       cat <<EOF
-Logs : tail -f ~/Library/Logs/cc-proxy/proxy.log
+Logs : tail -f ~/Library/Logs/mur-model-gateway/proxy.log
 Stop : launchctl bootout gui/\$(id -u)/$SERVICE_LABEL
 EOF
       ;;
     linux)
       if [[ "${SYSTEM:-0}" == 1 ]]; then
         cat <<EOF
-Logs : journalctl -u cc-proxy.service -f
-Stop : sudo systemctl disable --now cc-proxy.service
+Logs : journalctl -u mur-model-gateway.service -f
+Stop : sudo systemctl disable --now mur-model-gateway.service
 EOF
       else
         cat <<EOF
-Logs : journalctl --user -u cc-proxy.service -f
-Stop : systemctl --user disable --now cc-proxy.service
+Logs : journalctl --user -u mur-model-gateway.service -f
+Stop : systemctl --user disable --now mur-model-gateway.service
 EOF
       fi
       ;;
@@ -157,7 +157,7 @@ fi
 cd "$REPO_ROOT"
 if [[ "$MUSL" == 1 ]]; then
   MUSL_TARGET=x86_64-unknown-linux-musl
-  log "building cc-proxy (release, static $MUSL_TARGET)"
+  log "building mur-model-gateway (release, static $MUSL_TARGET)"
   if ! command -v cargo >/dev/null 2>&1 || ! cargo build --release --target "$MUSL_TARGET"; then
     if command -v docker >/dev/null 2>&1; then
       log "cargo unavailable or musl build failed → building via Docker (rust:1.91-bookworm)"
@@ -169,11 +169,11 @@ if [[ "$MUSL" == 1 ]]; then
       exit 1
     fi
   fi
-  BUILD_OUT="$REPO_ROOT/target/$MUSL_TARGET/release/cc-proxy"
+  BUILD_OUT="$REPO_ROOT/target/$MUSL_TARGET/release/mur-model-gateway"
 else
-  log "building cc-proxy (release)"
+  log "building mur-model-gateway (release)"
   cargo build --release
-  BUILD_OUT="$REPO_ROOT/target/release/cc-proxy"
+  BUILD_OUT="$REPO_ROOT/target/release/mur-model-gateway"
 fi
 
 # ─── codesign (macOS) ───────────────────────────────────────────────
@@ -182,10 +182,10 @@ fi
 # signature changes on every build, which re-triggers the password
 # prompt for the Claude Code-credentials item on each request.
 if [[ "$PLATFORM" == macos ]]; then
-  SIGN_ID="${CC_PROXY_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' 'NR==1 {print $2}')}"
+  SIGN_ID="${MUR_MODEL_GATEWAY_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' 'NR==1 {print $2}')}"
   if [[ -n "$SIGN_ID" ]]; then
     log "codesigning with: $SIGN_ID"
-    codesign -f -s "$SIGN_ID" -i com.cc-proxy "$BUILD_OUT"
+    codesign -f -s "$SIGN_ID" -i com.mur-model-gateway "$BUILD_OUT"
   else
     log "no codesigning identity — skipping (keychain will re-prompt after every rebuild)"
   fi
@@ -230,12 +230,12 @@ if is_listening; then
 else
   err "service not listening on 127.0.0.1:$BIND_PORT"
   case "$PLATFORM" in
-    macos) err "check: tail ~/Library/Logs/cc-proxy/proxy.log" ;;
+    macos) err "check: tail ~/Library/Logs/mur-model-gateway/proxy.log" ;;
     linux)
       if [[ "${SYSTEM:-0}" == 1 ]]; then
-        err "check: journalctl -u cc-proxy.service"
+        err "check: journalctl -u mur-model-gateway.service"
       else
-        err "check: journalctl --user -u cc-proxy.service"
+        err "check: journalctl --user -u mur-model-gateway.service"
       fi
       ;;
   esac

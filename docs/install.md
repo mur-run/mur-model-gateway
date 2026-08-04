@@ -1,8 +1,8 @@
-# cc-proxy 安裝指南
+# mur-model-gateway 安裝指南
 
-`cc-proxy install` 會寫出平台對應的 service 描述檔，並把設定烘進環境變數。
-Runtime 只讀環境變數（`CC_PROXY_TOKEN_SOURCE` / `CC_PROXY_BIND` / `CC_PROXY_UPSTREAM*` /
-`CC_PROXY_COMPRESS`），沒有 config 檔。
+`mur-model-gateway install` 會寫出平台對應的 service 描述檔，並把設定烘進環境變數。
+Runtime 只讀環境變數（`MUR_MODEL_GATEWAY_TOKEN_SOURCE` / `MUR_MODEL_GATEWAY_BIND` / `MUR_MODEL_GATEWAY_UPSTREAM*` /
+`MUR_MODEL_GATEWAY_COMPRESS`），沒有 config 檔。
 
 ## 快速開始
 
@@ -13,7 +13,7 @@ Runtime 只讀環境變數（`CC_PROXY_TOKEN_SOURCE` / `CC_PROXY_BIND` / `CC_PRO
 ./scripts/setup.sh --uninstall    # 移除 service（binary 保留）
 ```
 
-`setup.sh` 在 `--` 之後的參數會原封不動傳給 `cc-proxy install`：
+`setup.sh` 在 `--` 之後的參數會原封不動傳給 `mur-model-gateway install`：
 
 ```bash
 ./scripts/setup.sh -- --token-source file --bind 127.0.0.1:9099
@@ -23,10 +23,10 @@ Runtime 只讀環境變數（`CC_PROXY_TOKEN_SOURCE` / `CC_PROXY_BIND` / `CC_PRO
 
 | 旗標 | 效果 |
 |------|------|
-| `--token-source <spec>` | 烘入 `CC_PROXY_TOKEN_SOURCE`（見下） |
-| `--bind <addr>` | 烘入 `CC_PROXY_BIND`（預設 `127.0.0.1:8088`） |
-| `--upstream <url>` | 烘入 `CC_PROXY_UPSTREAM` |
-| `--compress` / `--no-compress` | `CC_PROXY_COMPRESS=1` 開關（無旗標時嗅探環境變數） |
+| `--token-source <spec>` | 烘入 `MUR_MODEL_GATEWAY_TOKEN_SOURCE`（見下） |
+| `--bind <addr>` | 烘入 `MUR_MODEL_GATEWAY_BIND`（預設 `127.0.0.1:8088`） |
+| `--upstream <url>` | 烘入 `MUR_MODEL_GATEWAY_UPSTREAM` |
+| `--compress` / `--no-compress` | `MUR_MODEL_GATEWAY_COMPRESS=1` 開關（無旗標時嗅探環境變數） |
 | `--system` | Linux 限定：system-level unit（見下） |
 
 值裡不允許空白與 `<>"&`（會被直接拼進 plist/unit/cmd，install 時就擋下）。
@@ -48,19 +48,19 @@ Token 一律每請求重讀，Claude Code 背景刷新後自動生效。
 ### macOS（launchd）
 
 ```bash
-cc-proxy install [flags]
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/run.cc-proxy.plist
-launchctl enable gui/$(id -u)/run.cc-proxy
+mur-model-gateway install [flags]
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/run.mur-model-gateway.plist
+launchctl enable gui/$(id -u)/run.mur-model-gateway
 ```
 
-Log：`~/Library/Logs/cc-proxy/proxy.log`。
+Log：`~/Library/Logs/mur-model-gateway/proxy.log`。
 
 ### Linux — user unit（預設）
 
 ```bash
-cc-proxy install [flags]
+mur-model-gateway install [flags]
 systemctl --user daemon-reload
-systemctl --user enable --now cc-proxy.service
+systemctl --user enable --now mur-model-gateway.service
 ```
 
 ⚠️ user unit 只在你登入時跑；headless / 開機自啟要嘛
@@ -69,32 +69,32 @@ systemctl --user enable --now cc-proxy.service
 ### Linux — system unit（`--system`，headless 伺服器）
 
 ```bash
-sudo cc-proxy install --system --token-source env:CC_PROXY_OAUTH_TOKEN
+sudo mur-model-gateway install --system --token-source env:MUR_MODEL_GATEWAY_OAUTH_TOKEN
 # 然後自己把 token 補進 env 檔（不要經過 shell history / 工具輸出）：
-#   sudoedit /etc/cc-proxy.env   → 加一行 CC_PROXY_OAUTH_TOKEN=sk-ant-oat01-…
+#   sudoedit /etc/mur-model-gateway.env   → 加一行 MUR_MODEL_GATEWAY_OAUTH_TOKEN=sk-ant-oat01-…
 sudo systemctl daemon-reload
-sudo systemctl enable --now cc-proxy.service
-journalctl -u cc-proxy.service -f
+sudo systemctl enable --now mur-model-gateway.service
+journalctl -u mur-model-gateway.service -f
 ```
 
 產物：
-- `/etc/systemd/system/cc-proxy.service` — `User=<執行 install 的使用者>`、
-  `EnvironmentFile=/etc/cc-proxy.env`、`WantedBy=multi-user.target`（開機即啟動，不需登入）
-- `/etc/cc-proxy.env` — root-owned、mode 600，所有環境變數（含 secret）都放這裡
+- `/etc/systemd/system/mur-model-gateway.service` — `User=<執行 install 的使用者>`、
+  `EnvironmentFile=/etc/mur-model-gateway.env`、`WantedBy=multi-user.target`（開機即啟動，不需登入）
+- `/etc/mur-model-gateway.env` — root-owned、mode 600，所有環境變數（含 secret）都放這裡
 
 `setup.sh --system -- <flags>` 會自動 sudo 完成上述流程。
 
 ### Windows（Task Scheduler）
 
 ```powershell
-cc-proxy install [flags]
+mur-model-gateway install [flags]
 # install 會印出可直接貼上的指令（elevated prompt）：
-schtasks /Create /F /SC ONLOGON /TN cc-proxy /TR "\"C:\Users\you\AppData\Local\cc-proxy\cc-proxy.cmd\""
-schtasks /Run /TN cc-proxy
+schtasks /Create /F /SC ONLOGON /TN mur-model-gateway /TR "\"C:\Users\you\AppData\Local\mur-model-gateway\mur-model-gateway.cmd\""
+schtasks /Run /TN mur-model-gateway
 ```
 
 `.cmd` 內含所有 `set` 環境變數行，輸出導到
-`%LOCALAPPDATA%\cc-proxy\logs\proxy.log`。`/F` 讓重複安裝直接覆蓋。
+`%LOCALAPPDATA%\mur-model-gateway\logs\proxy.log`。`/F` 讓重複安裝直接覆蓋。
 
 ## 舊 GLIBC 主機（如 Ubuntu 20.04 / GLIBC 2.31）
 
@@ -113,18 +113,18 @@ docker run --rm -v "$PWD":/src -w /src rust:1.91-bookworm bash -c \
    apt-get install -y musl-tools && cargo build --release --target x86_64-unknown-linux-musl'
 ```
 
-注意：cc-proxy 是 edition 2024，需要 Rust ≥1.85（建議 rust:1.91 以上的 image）。
+注意：mur-model-gateway 是 edition 2024，需要 Rust ≥1.85（建議 rust:1.91 以上的 image）。
 
 ## 解除安裝 / 狀態
 
 ```bash
-cc-proxy status      # 列出 binary、user/system service 檔與 env 檔是否存在
-cc-proxy uninstall   # 移除 user + system 兩邊的 service/env 檔（/etc 需 sudo，會印提示）
+mur-model-gateway status      # 列出 binary、user/system service 檔與 env 檔是否存在
+mur-model-gateway uninstall   # 移除 user + system 兩邊的 service/env 檔（/etc 需 sudo，會印提示）
 ```
 
 ## 疑難排解
 
-- **systemd restart-storm、`Address in use (os error 98)`** — 有殘留的 cc-proxy
+- **systemd restart-storm、`Address in use (os error 98)`** — 有殘留的 mur-model-gateway
   process 佔著 port：`ss -ltnp | grep 8088` 找到後 kill 再 start。
 - **上游回 404 `not_found_error: model: …`** — 這是 Anthropic 本尊的回應，
   代表**認證已成功**，只是 model id 過期；不是 proxy 路由問題。
