@@ -25,8 +25,8 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
 ## Install
 
 Grab a binary from [Releases](https://github.com/mur-run/mur-model-gateway/releases)
-(macOS universal, Developer-ID signed and notarized; Linux x86_64), or build from
-source (Rust ≥ 1.85):
+(macOS universal, Developer-ID signed and notarized; Linux x86_64; Windows x86_64),
+or build from source (Rust ≥ 1.85):
 
 ```bash
 cargo build --release

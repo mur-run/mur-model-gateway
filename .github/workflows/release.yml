@@ -118,9 +118,33 @@ jobs:
           name: linux
           path: dist/*
 
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      # Unsigned — Windows code signing needs an EV/OV cert we don't have yet;
+      # SmartScreen may warn on first download, normal for OSS binaries.
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { git rev-parse --short HEAD }
+          $name = "$env:BIN-$version-windows-x86_64"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/release/$env:BIN.exe" -DestinationPath "dist/$name.zip"
+          "$((Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower())  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
