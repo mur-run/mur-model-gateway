@@ -2,8 +2,7 @@
 
 Local LLM API gateway for the [MUR](https://github.com/mur-run/mur) agent platform.
 It lets your MUR agents (and any other local tool) call **Anthropic, OpenAI, and
-Gemini** through one local endpoint — reusing the credentials you already have,
-including your Claude Code subscription login, instead of a separate per-token API key.
+Gemini** through one local endpoint — also provide compress feature.
 
 ```
 agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
