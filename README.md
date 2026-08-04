@@ -22,6 +22,8 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
 - **Optional wire compression.** `MUR_MODEL_GATEWAY_COMPRESS=1` applies MUR's
   CCR compression to `tool_result` blocks on all three providers.
 
+![Token compression ratio](compress-ratio.png)
+
 ## Install
 
 Grab a binary from [Releases](https://github.com/mur-run/mur-model-gateway/releases)
