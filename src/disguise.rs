@@ -13,6 +13,10 @@ pub fn should_disguise(path: &str) -> bool {
 
 // ── cfg-gated: real impl or stub ──
 
+// ponytail: rustfmt resolves `mod` declarations syntactically, ignoring cfg, so
+// a clean checkout without the gitignored impl fails `cargo fmt --check`.
+// skip = don't descend. Format that file directly if you ever need to.
+#[rustfmt::skip]
 #[cfg(has_beta_hook)]
 mod disguise_impl;
 
