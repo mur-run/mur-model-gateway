@@ -20,6 +20,39 @@ pub enum TranslateError {
 pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
     let chat = chat.as_object().ok_or(TranslateError::NotAnObject)?;
 
+    // Semantic parameters: the Responses API cannot honour these, and
+    // silently ignoring them would hand back a result the caller believes
+    // is seeded / scored / schema-constrained when it is not.
+    for param in ["seed", "logprobs", "top_logprobs", "response_format"] {
+        if chat.contains_key(param) && !chat[param].is_null() {
+            return Err(TranslateError::Rejected {
+                param: match param {
+                    "seed" => "seed",
+                    "logprobs" => "logprobs",
+                    "top_logprobs" => "top_logprobs",
+                    _ => "response_format",
+                },
+            });
+        }
+    }
+    if chat.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1) {
+        return Err(TranslateError::Rejected { param: "n" });
+    }
+
+    // Cosmetic parameters are dropped, not rejected: clients send library
+    // defaults for these and would break on a 400.
+    for param in [
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "user",
+        "stop",
+    ] {
+        if chat.contains_key(param) {
+            tracing::warn!(param, "parameter has no Responses equivalent, dropped");
+        }
+    }
+
     let mut out = Map::new();
     if let Some(model) = chat.get("model") {
         // Passed through verbatim: the gateway keeps no model allowlist.
@@ -292,5 +325,70 @@ mod tests {
         assert_eq!(input[0]["type"], json!("message"));
         assert_eq!(input[0]["content"][0]["text"], json!("checking"));
         assert_eq!(input[1]["type"], json!("function_call"));
+    }
+
+    fn chat_with(extra: (&str, Value)) -> Value {
+        let mut v = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        v[extra.0] = extra.1;
+        v
+    }
+
+    #[test]
+    fn rejects_semantic_parameters() {
+        // Each of these changes what the caller may assume about the result,
+        // so failing loudly beats returning something subtly different.
+        for param in ["seed", "logprobs", "top_logprobs", "response_format"] {
+            let chat = chat_with((param, json!(1)));
+            assert_eq!(
+                chat_to_responses(&chat),
+                Err(TranslateError::Rejected {
+                    param: match param {
+                        "seed" => "seed",
+                        "logprobs" => "logprobs",
+                        "top_logprobs" => "top_logprobs",
+                        _ => "response_format",
+                    }
+                }),
+                "{param} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_n_above_one_but_allows_one() {
+        assert_eq!(
+            chat_to_responses(&chat_with(("n", json!(2)))),
+            Err(TranslateError::Rejected { param: "n" })
+        );
+        assert!(chat_to_responses(&chat_with(("n", json!(1)))).is_ok());
+    }
+
+    #[test]
+    fn drops_cosmetic_parameters_without_failing() {
+        // These tune output rather than define it; rejecting them would
+        // break clients that send library defaults.
+        let mut chat = chat_with(("user", json!("u1")));
+        chat["presence_penalty"] = json!(0.0);
+        chat["frequency_penalty"] = json!(0.0);
+        chat["logit_bias"] = json!({});
+        chat["stop"] = json!(["\n"]);
+
+        let out = chat_to_responses(&chat).unwrap();
+        for dropped in [
+            "user",
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "stop",
+        ] {
+            assert!(
+                out.get(dropped).is_none(),
+                "{dropped} must not reach upstream"
+            );
+        }
+        assert_eq!(out["input"][0]["content"][0]["text"], json!("hi"));
     }
 }
