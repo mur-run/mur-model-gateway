@@ -552,8 +552,15 @@ First add an absence matcher after `is_untranslated_chat_body` (line 60):
 /// True only if the request carries none of the ChatGPT client headers the
 /// OAuth `apply_codex_headers` hook would set. API-key mode sends the key
 /// and nothing else.
+///
+/// httpmock 0.7 exposes headers as `Option<Vec<(String, String)>>` — a list,
+/// not a map — so this scans it. Absent headers (`None`) trivially satisfy
+/// the absence check.
 fn has_no_chatgpt_account_id(req: &HttpMockRequest) -> bool {
-    req.headers.get("chatgpt-account-id").is_none()
+    req.headers.as_ref().is_none_or(|hs| {
+        !hs.iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("chatgpt-account-id"))
+    })
 }
 ```
 
