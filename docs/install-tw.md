@@ -48,7 +48,7 @@ Token 一律每請求重讀，Claude Code 背景刷新後自動生效。
 
 | spec | 行為 |
 |------|------|
-| `codex`（預設） | 讀 `~/.codex/auth.json`，`codex login` 寫的那個檔 |
+| `codex`（預設） | 讀 `~/.codex/auth.json`，`codex login` 寫的那個檔 — `auth_mode = "chatgpt"`（OAuth）與 `auth_mode = "apikey"`（一般 API key）都會自動偵測 |
 | `env:VAR` | 每次請求從環境變數 `VAR` 讀 token |
 | `off` / `disabled` | `/v1/responses` 純 passthrough，不做 disguise |
 
@@ -56,9 +56,11 @@ Token 一律每請求重讀，Claude Code 背景刷新後自動生效。
 `codex` 本來就是 runtime 預設值，不用加旗標；上游刷新 token 後，新的 access token
 會自動寫回 `~/.codex/auth.json`。
 
-**目前沒有 MUR agent 能碰到 `/v1/responses`。** MUR 的 OpenAI client 只會講 Chat
-Completions，不會講 Responses API，所以現在這條路由只有本來就講 Responses API
-的 client（例如 `curl`、Codex CLI 本身）能用。
+**MUR agent 可以透過轉譯層使用 Codex 路由。** MUR 的 OpenAI client 只會講 Chat
+Completions，所以把 model registry 的項目指向
+`POST http://127.0.0.1:8088/codex/v1/chat/completions` — gateway 會在上游轉譯成
+Responses API。原本就講 Responses API 的 client（例如 `curl`、Codex CLI 本身）
+還是可以直接用 `/v1/responses`。
 
 ### 驗證過可以用的請求
 

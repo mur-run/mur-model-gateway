@@ -51,7 +51,7 @@ automatically.
 
 | spec | Behaviour |
 |------|-----------|
-| `codex` (default) | Reads `~/.codex/auth.json`, the file `codex login` writes |
+| `codex` (default) | Reads `~/.codex/auth.json`, the file `codex login` writes — `auth_mode = "chatgpt"` (OAuth) and `auth_mode = "apikey"` (plain API key) are both handled automatically |
 | `env:VAR` | Reads the token from environment variable `VAR` on every request |
 | `off` / `disabled` | Pure passthrough on `/v1/responses`, no disguise |
 
@@ -59,8 +59,10 @@ This governs only the `/v1/responses` route — `--token-source` above still gov
 Anthropic/OpenAI/Gemini. `codex` is already the runtime default with no flag needed; a rotated
 access token is written back to `~/.codex/auth.json` automatically when the upstream refreshes it.
 
-**No MUR agent can reach `/v1/responses` yet.** MUR's OpenAI client only speaks Chat Completions,
-not the Responses API, so this route is reachable today only by a client that already speaks the
+**MUR agents can use the Codex route through the translation layer.** MUR's OpenAI client only
+speaks Chat Completions, so point a model registry entry at
+`POST http://127.0.0.1:8088/codex/v1/chat/completions` — the gateway translates to the Responses
+API upstream. The raw `/v1/responses` endpoint remains for clients that already speak the
 Responses API directly (`curl`, the Codex CLI itself).
 
 ### A request that works
