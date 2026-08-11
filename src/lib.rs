@@ -36,6 +36,11 @@ pub const DEFAULT_UPSTREAM_ANTHROPIC: &str = "https://api.anthropic.com";
 pub const DEFAULT_UPSTREAM_OPENAI: &str = "https://api.openai.com";
 pub const DEFAULT_UPSTREAM_GEMINI: &str = "https://generativelanguage.googleapis.com";
 pub const DEFAULT_UPSTREAM_CODEX: &str = "https://chatgpt.com/backend-api/codex";
+/// API-key mode targets the public Responses API. Deliberately the same
+/// value as `DEFAULT_UPSTREAM_OPENAI` but named for its role — Codex in
+/// API-key mode is a different credential mode, not the OpenAI route. Not
+/// env-configurable (spec: stage 3).
+pub const DEFAULT_UPSTREAM_CODEX_APIKEY: &str = "https://api.openai.com";
 /// Backward-compatible alias — points to Anthropic.
 pub const DEFAULT_UPSTREAM: &str = DEFAULT_UPSTREAM_ANTHROPIC;
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
@@ -160,7 +165,9 @@ impl TokenSource {
                 }
             }
             TokenSource::CredentialsFile(path) => keychain::read_credentials_file(path),
-            TokenSource::Codex(path) => Ok(codex::read_auth(path).map(|a| a.access_token)),
+            TokenSource::Codex(path) => {
+                Ok(codex::read_credential(path).map(|c| c.bearer().to_string()))
+            }
             TokenSource::EnvVar(name) => Ok(std::env::var(name).ok()),
             TokenSource::Static(s) => Ok(Some(s.as_ref().clone())),
             TokenSource::Disabled => Ok(None),
@@ -174,6 +181,11 @@ pub struct AppState {
     pub upstream_openai: String,
     pub upstream_gemini: String,
     pub upstream_codex: String,
+    /// Upstream for Codex in API-key mode. Defaults to
+    /// `DEFAULT_UPSTREAM_CODEX_APIKEY`; a test-only seam (`with_upstream_codex_apikey`)
+    /// lets integration tests point it at httpmock. Deliberately NOT wired to
+    /// any env var — the production host is hard-coded by design.
+    pub upstream_codex_apikey: String,
     pub client: reqwest::Client,
     pub token_source: TokenSource,
     /// Credential source for `Provider::Codex`. `token_source` stays the
@@ -222,6 +234,7 @@ impl AppState {
             upstream_openai: upstream_openai.into().trim_end_matches('/').to_string(),
             upstream_gemini: upstream_gemini.into().trim_end_matches('/').to_string(),
             upstream_codex: DEFAULT_UPSTREAM_CODEX.to_string(),
+            upstream_codex_apikey: DEFAULT_UPSTREAM_CODEX_APIKEY.to_string(),
             client: reqwest::Client::builder()
                 .timeout(UPSTREAM_TIMEOUT)
                 .build()
@@ -253,6 +266,13 @@ impl AppState {
     /// Override the Codex upstream. Used by tests to point at httpmock.
     pub fn with_upstream_codex(mut self, url: impl Into<String>) -> Self {
         self.upstream_codex = url.into();
+        self
+    }
+
+    /// Override the API-key-mode upstream. Test-only seam: the production
+    /// default is the hard-coded `DEFAULT_UPSTREAM_CODEX_APIKEY`.
+    pub fn with_upstream_codex_apikey(mut self, url: impl Into<String>) -> Self {
+        self.upstream_codex_apikey = url.into();
         self
     }
 
@@ -308,11 +328,58 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .unwrap_or("/");
     let path_only = parts.uri.path();
     let provider = detect_provider(path_only);
-    let target_path = match provider {
-        Provider::Codex => codex_target_path(path_and_query),
-        _ => path_and_query.to_string(),
+
+    let translating = codex::should_translate(path_only);
+
+    // Codex: callers with no real credential of their own get the stored
+    // Codex credential plus the client headers; callers that already carry
+    // one pass through untouched. Same INTENT as the Anthropic path's mode
+    // 3 (don't second-guess a client that authenticates itself) but not the
+    // same rule: unlike Anthropic's plain `contains_key` check,
+    // `has_client_credential` treats a present-but-empty auth header as "no
+    // credential" — see that function's doc for why.
+    //
+    // Resolved before the upstream URL is built: the credential's mode
+    // decides the upstream host, path prefix, and headers.
+    let codex_cred: Option<codex::CodexCredential> =
+        if provider == Provider::Codex && !has_client_credential(&parts.headers) {
+            match state.token_source_for(Provider::Codex) {
+                TokenSource::Codex(path) => codex::read_credential(path),
+                other => match other.resolve() {
+                    Ok(Some(tok)) => Some(codex::CodexCredential::OAuth {
+                        access_token: tok,
+                        account_id: None,
+                    }),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "codex token source failed, passing through");
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
+    let codex_apikey = matches!(codex_cred, Some(codex::CodexCredential::ApiKey { .. }));
+    let (target_path, upstream) = match provider {
+        // API-key mode keeps /v1 on the public Responses endpoint.
+        Provider::Codex if codex_apikey && translating => (
+            "/v1/responses".to_string(),
+            state.upstream_codex_apikey.as_str(),
+        ),
+        Provider::Codex if codex_apikey => (
+            path_and_query.to_string(),
+            state.upstream_codex_apikey.as_str(),
+        ),
+        // OAuth (and passthrough) keep the stage-1/2 behaviour: strip /v1,
+        // chatgpt.com upstream.
+        Provider::Codex => (
+            codex_target_path(path_and_query),
+            state.upstream_for(provider),
+        ),
+        _ => (path_and_query.to_string(), state.upstream_for(provider)),
     };
-    let target_url = format!("{}{}", state.upstream_for(provider), target_path);
+    let target_url = format!("{upstream}{target_path}");
     let _: Uri = target_url.parse().context("target uri parse")?;
 
     let body_bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
@@ -341,7 +408,6 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // leave as a Responses request. Assigning into `body_bytes` (not
     // `final_body`) is load-bearing: the 401 retry below re-sends
     // `body_bytes`, and an untranslated retry would be rejected upstream.
-    let translating = codex::should_translate(path_only);
     let (client_model, client_wants_stream) = if translating {
         let chat = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_default();
         (
@@ -373,32 +439,6 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     } else {
         body_bytes
     };
-
-    // Codex: callers with no real credential of their own get the stored
-    // Codex credential plus the client headers; callers that already carry
-    // one pass through untouched. Same INTENT as the Anthropic path's mode
-    // 3 (don't second-guess a client that authenticates itself) but not the
-    // same rule: unlike Anthropic's plain `contains_key` check,
-    // `has_client_credential` treats a present-but-empty auth header as "no
-    // credential" — see that function's doc for why.
-    let codex_cred: Option<(String, Option<String>)> =
-        if provider == Provider::Codex && !has_client_credential(&parts.headers) {
-            match state.token_source_for(Provider::Codex) {
-                TokenSource::Codex(path) => {
-                    codex::read_auth(path).map(|a| (a.access_token, a.account_id))
-                }
-                other => match other.resolve() {
-                    Ok(Some(tok)) => Some((tok, None)),
-                    Ok(None) => None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "codex token source failed, passing through");
-                        None
-                    }
-                },
-            }
-        } else {
-            None
-        };
 
     // Disguise gate. Three modes on Messages-shape paths (when the
     // configured TokenSource is NOT Disabled):
@@ -492,8 +532,18 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             has_anthropic_version,
         )?;
     }
-    if let Some((token, account_id)) = codex_cred.as_ref() {
-        upstream_req = codex::apply_codex_headers(upstream_req, token, account_id.as_deref());
+    match codex_cred.as_ref() {
+        Some(codex::CodexCredential::OAuth {
+            access_token,
+            account_id,
+        }) => {
+            upstream_req =
+                codex::apply_codex_headers(upstream_req, access_token, account_id.as_deref());
+        }
+        Some(codex::CodexCredential::ApiKey { key }) => {
+            upstream_req = upstream_req.bearer_auth(key);
+        }
+        None => {}
     }
     upstream_req = upstream_req.body(final_body);
 
@@ -509,7 +559,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // refreshing on a genuine permission error would be worse than not
     // retrying at all, so only 401 is ever treated as "possibly an expired
     // token" here.
-    if codex_retry_eligible(provider, upstream_resp.status(), codex_cred.is_some())
+    if codex_retry_eligible(provider, upstream_resp.status(), codex_cred.as_ref())
         && let TokenSource::Codex(path) = state.token_source_for(Provider::Codex)
         && let Some(fresh) = codex::refreshed_access_token(path).await
     {
@@ -518,7 +568,10 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         // A transient read failure on this second read would otherwise
         // silently drop the account header from the retried request, and a
         // real backend rejects requests that are missing it.
-        let account_id = codex_cred.as_ref().and_then(|(_, aid)| aid.clone());
+        let account_id = codex_cred
+            .as_ref()
+            .and_then(codex::CodexCredential::account_id)
+            .map(str::to_string);
         let mut retry = state.client.request(parts.method.clone(), &target_url);
         // Fix round 1, finding 4: forward the same client headers as the
         // first attempt (content-type, accept — including
@@ -693,19 +746,31 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
 /// network and file-system machinery — or the gitignored Codex OAuth
 /// implementation — the rest of the retry path needs.
 ///
-/// `codex_cred_present` must be true: it reflects whether *this gateway*
-/// attached the credential that got rejected (`codex_cred.is_some()` at the
-/// call site). Without that check, a client posting its own bad key to the
-/// Codex route would get a 401 here, and the gateway would redeem — and
-/// rotate — the user's real, stored refresh token to retry a request that
-/// never used the user's credential in the first place. A third party's bad
-/// key must never be able to spend or rotate the user's credential.
+/// `codex_cred` must be `Some` of an OAuth credential: it reflects whether
+/// *this gateway* attached the credential that got rejected, and only OAuth
+/// carries a refresh token to redeem. Without the presence check, a client
+/// posting its own bad key to the Codex route would get a 401 here, and the
+/// gateway would redeem — and rotate — the user's real, stored refresh
+/// token to retry a request that never used the user's credential in the
+/// first place. A third party's bad key must never be able to spend or
+/// rotate the user's credential. API-key credentials are never eligible
+/// either way: there is no refresh token to redeem, so resending the same
+/// key cannot succeed.
 fn codex_retry_eligible(
     provider: Provider,
     status: reqwest::StatusCode,
-    codex_cred_present: bool,
+    codex_cred: Option<&codex::CodexCredential>,
 ) -> bool {
-    provider == Provider::Codex && status == reqwest::StatusCode::UNAUTHORIZED && codex_cred_present
+    match codex_cred {
+        Some(codex::CodexCredential::OAuth { .. }) => {
+            provider == Provider::Codex && status == reqwest::StatusCode::UNAUTHORIZED
+        }
+        // API-key 401 means the key itself is rejected: there is no refresh
+        // token to redeem, and resending the same key cannot succeed, so the
+        // upstream 401 is returned unchanged. `None` (no gateway-supplied
+        // credential) is likewise never eligible, as before.
+        Some(codex::CodexCredential::ApiKey { .. }) | None => false,
+    }
 }
 
 /// If the inbound request supplies an Anthropic OAuth subscription token
@@ -830,7 +895,22 @@ mod tests {
         .unwrap();
         let ts = TokenSource::Codex(p.clone());
         assert_eq!(ts.resolve().unwrap().as_deref(), Some("fake-access-token"));
+        // API-key mode resolves to the key, not an OAuth access token.
+        std::fs::write(
+            &p,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake","tokens":null}"#,
+        )
+        .unwrap();
+        assert_eq!(ts.resolve().unwrap().as_deref(), Some("sk-fake"));
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn apikey_upstream_defaults_to_const_and_is_overridable() {
+        let s = AppState::new("a", "o", "g", TokenSource::Disabled).unwrap();
+        assert_eq!(s.upstream_codex_apikey, DEFAULT_UPSTREAM_CODEX_APIKEY);
+        let s2 = s.with_upstream_codex_apikey("http://127.0.0.1:9");
+        assert_eq!(s2.upstream_codex_apikey, "http://127.0.0.1:9");
     }
 
     /// Fix round 3, finding C1 (red against pre-fix code): a client's own
@@ -845,26 +925,37 @@ mod tests {
     /// `client_credential_401_does_not_trigger_refresh`.
     #[test]
     fn codex_retry_requires_gateway_supplied_credential() {
+        let oauth = codex::CodexCredential::OAuth {
+            access_token: "t".into(),
+            account_id: None,
+        };
+        let apikey = codex::CodexCredential::ApiKey { key: "sk".into() };
         assert!(!codex_retry_eligible(
             Provider::Codex,
             reqwest::StatusCode::UNAUTHORIZED,
-            false
+            None
         ));
         assert!(codex_retry_eligible(
             Provider::Codex,
             reqwest::StatusCode::UNAUTHORIZED,
-            true
+            Some(&oauth)
         ));
-        // Sanity: the other two conjuncts still matter on their own.
+        // API-key 401 is a rejected key — no refresh token to redeem, never retried.
+        assert!(!codex_retry_eligible(
+            Provider::Codex,
+            reqwest::StatusCode::UNAUTHORIZED,
+            Some(&apikey)
+        ));
+        // Sanity: the other conjuncts still matter on their own.
         assert!(!codex_retry_eligible(
             Provider::Anthropic,
             reqwest::StatusCode::UNAUTHORIZED,
-            true
+            Some(&oauth)
         ));
         assert!(!codex_retry_eligible(
             Provider::Codex,
             reqwest::StatusCode::OK,
-            true
+            Some(&oauth)
         ));
     }
 
