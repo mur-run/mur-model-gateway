@@ -96,6 +96,65 @@ impl std::fmt::Debug for CodexAuth {
     }
 }
 
+/// Credentials dispatched on `auth_mode` from `~/.codex/auth.json`.
+///
+/// `auth_mode = "chatgpt"` is an OAuth token pair plus an account id, sent
+/// to ChatGPT's Codex backend. `auth_mode = "apikey"` is a plain OpenAI API
+/// key, sent to `api.openai.com`. The two differ in upstream, path prefix,
+/// header shape, and 401 behaviour — which is exactly why they are a tagged
+/// union and not a tuple: a `CodexCredential` forces `forward()` to handle
+/// each mode's coupled choices explicitly.
+pub enum CodexCredential {
+    /// ChatGPT subscription OAuth.
+    OAuth {
+        access_token: String,
+        account_id: Option<String>,
+    },
+    /// Pay-per-use OpenAI API key.
+    ApiKey { key: String },
+}
+
+/// Redacting Debug: a derived impl would dump the token/key into any `{:?}`
+/// capture, exactly what `CodexAuth`'s manual impl exists to prevent.
+impl std::fmt::Debug for CodexCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodexCredential::OAuth {
+                access_token: _,
+                account_id,
+            } => f
+                .debug_struct("CodexCredential::OAuth")
+                .field("access_token", &"<redacted>")
+                .field("account_id", &account_id)
+                .finish(),
+            CodexCredential::ApiKey { .. } => f
+                .debug_struct("CodexCredential::ApiKey")
+                .field("key", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl CodexCredential {
+    /// The secret to send upstream: the OAuth access token or the API key.
+    /// Used by `TokenSource::resolve()`.
+    pub fn bearer(&self) -> &str {
+        match self {
+            CodexCredential::OAuth { access_token, .. } => access_token,
+            CodexCredential::ApiKey { key } => key,
+        }
+    }
+
+    /// `Some(account_id)` for OAuth, `None` for API-key mode (which sends no
+    /// ChatGPT client headers).
+    pub fn account_id(&self) -> Option<&str> {
+        match self {
+            CodexCredential::OAuth { account_id, .. } => account_id.as_deref(),
+            CodexCredential::ApiKey { .. } => None,
+        }
+    }
+}
+
 /// `~/.codex/auth.json`.
 pub fn default_auth_path() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|d| d.home_dir().join(".codex/auth.json"))
@@ -126,6 +185,23 @@ pub fn parse_auth(raw: &str) -> Option<CodexAuth> {
 /// falls through to passthrough.
 pub fn read_auth(path: &Path) -> Option<CodexAuth> {
     parse_auth(&std::fs::read_to_string(path).ok()?)
+}
+
+pub fn read_credential(path: &Path) -> Option<CodexCredential> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    match v.get("auth_mode").and_then(|m| m.as_str()) {
+        Some("chatgpt") => parse_auth(&raw).map(|a| CodexCredential::OAuth {
+            access_token: a.access_token,
+            account_id: a.account_id,
+        }),
+        Some("apikey") => v
+            .get("OPENAI_API_KEY")
+            .and_then(|k| k.as_str())
+            .filter(|k| !k.is_empty())
+            .map(|k| CodexCredential::ApiKey { key: k.to_string() }),
+        _ => None,
+    }
 }
 
 /// Most recent refresh, memoised so a burst of 401s triggers one grant.
@@ -376,11 +452,86 @@ mod tests {
     }
 
     #[test]
-    fn rejects_api_key_mode() {
-        // Stage 1 handles OAuth only; API-key mode resolves to None so the
-        // caller falls through to passthrough rather than sending a bad token.
-        let raw = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake","tokens":null}"#;
-        assert!(parse_auth(raw).is_none());
+    fn parses_api_key_mode() {
+        let dir = std::env::temp_dir().join("mmg-codex-apikey-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("auth.json");
+        std::fs::write(
+            &p,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake","tokens":null}"#,
+        )
+        .unwrap();
+        match read_credential(&p).expect("apikey mode parses") {
+            CodexCredential::ApiKey { key } => assert_eq!(key, "sk-fake"),
+            other => panic!("expected ApiKey, got {other:?}"),
+        }
+        // The OAuth-only parser still rejects API-key mode — that is the
+        // dispatch boundary read_credential sits on.
+        assert!(parse_auth(r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake"}"#).is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn read_credential_dispatches_on_auth_mode() {
+        let dir = std::env::temp_dir().join("mmg-codex-read-credential");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("auth.json");
+
+        // auth_mode = "chatgpt" → OAuth.
+        std::fs::write(
+            &p,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"a","refresh_token":"r","account_id":"acct"}}"#,
+        )
+        .unwrap();
+        match read_credential(&p).expect("chatgpt parses") {
+            CodexCredential::OAuth {
+                access_token,
+                account_id,
+            } => {
+                assert_eq!(access_token, "a");
+                assert_eq!(account_id.as_deref(), Some("acct"));
+            }
+            other => panic!("expected OAuth, got {other:?}"),
+        }
+
+        // auth_mode = "apikey" but the key is missing or empty → None (caller
+        // falls through to passthrough, warning logged upstream).
+        std::fs::write(&p, r#"{"auth_mode":"apikey","OPENAI_API_KEY":null}"#).unwrap();
+        assert!(read_credential(&p).is_none());
+        std::fs::write(&p, r#"{"auth_mode":"apikey","OPENAI_API_KEY":""}"#).unwrap();
+        assert!(read_credential(&p).is_none());
+
+        // Unrecognised mode → None.
+        std::fs::write(&p, r#"{"auth_mode":"spaceship","OPENAI_API_KEY":"sk-x"}"#).unwrap();
+        assert!(read_credential(&p).is_none());
+
+        // Malformed JSON → None.
+        std::fs::write(&p, "{not json").unwrap();
+        assert!(read_credential(&p).is_none());
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn codex_credential_debug_redacts_secrets() {
+        let oauth = CodexCredential::OAuth {
+            access_token: "oa-tok".into(),
+            account_id: Some("acct".into()),
+        };
+        let apikey = CodexCredential::ApiKey {
+            key: "sk-fake".into(),
+        };
+
+        let od = format!("{oauth:?}");
+        assert!(
+            !od.contains("oa-tok"),
+            "OAuth access token must be redacted"
+        );
+        assert!(od.contains("acct"), "account_id is not a secret");
+
+        let ad = format!("{apikey:?}");
+        assert!(!ad.contains("sk-fake"), "API key must be redacted");
+        assert!(ad.contains("<redacted>"));
     }
 
     #[test]
