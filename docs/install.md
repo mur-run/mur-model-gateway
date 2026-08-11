@@ -63,6 +63,25 @@ access token is written back to `~/.codex/auth.json` automatically when the upst
 not the Responses API, so this route is reachable today only by a client that already speaks the
 Responses API directly (`curl`, the Codex CLI itself).
 
+### A request that works
+
+Verified against the live backend on 2026-08-11. Note `input` is a **list**, not a string, and the
+model must be one your ChatGPT account may use — `codex` lists them under `/model`. As of
+codex-cli 0.147.0 those are the `gpt-5.6-*`, `gpt-5.5` and `gpt-5.4*` family; `gpt-5`,
+`gpt-5-codex`, `codex-mini-latest` and `o4-mini` are all rejected.
+
+```bash
+curl -sS -X POST http://127.0.0.1:8088/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5.6-sol",
+       "input":[{"type":"message","role":"user",
+                 "content":[{"type":"input_text","text":"say ok"}]}],
+       "store":false,"stream":true}'
+```
+
+Expect an SSE stream beginning `event: response.created`. Omitting the `content-type` header sends
+form-encoded data and earns `Unsupported content type` from the backend.
+
 ## Per platform
 
 ### macOS (launchd)
@@ -149,6 +168,10 @@ mur-model-gateway uninstall   # removes the service/env files on both the user a
 - **Upstream returns 404 `not_found_error: model: …`** — that reply comes from Anthropic itself,
   which means **authentication succeeded** and only the model id is stale. It is not a proxy
   routing problem.
+- **Codex route returns `model is not supported…` or `Input must be a list`** — same story: these
+  come from ChatGPT's backend, so **authentication succeeded** and only the request body is wrong.
+  An unauthenticated request gets 401/403 instead, and one carrying a bad account id never reaches
+  an entitlement decision. See the Codex section above for a request shape that works.
 - **Pointing an app at it** — set `ANTHROPIC_BASE_URL=http://127.0.0.1:8088` in the app, and that
   is all. Requests carrying an OAuth-shaped key, or no auth at all, go through the disguise;
   requests with a normal `sk-ant-api03-*` key are passed through untouched.

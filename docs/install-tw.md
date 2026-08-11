@@ -60,6 +60,25 @@ Token 一律每請求重讀，Claude Code 背景刷新後自動生效。
 Completions，不會講 Responses API，所以現在這條路由只有本來就講 Responses API
 的 client（例如 `curl`、Codex CLI 本身）能用。
 
+### 驗證過可以用的請求
+
+2026-08-11 對線上後端實測過。注意 `input` 是**陣列**，不是字串，而且 model
+必須是你的 ChatGPT 帳號可以用的 — `codex` 會把清單列在 `/model` 下。以
+codex-cli 0.147.0 為例是 `gpt-5.6-*`、`gpt-5.5` 和 `gpt-5.4*` 家族；
+`gpt-5`、`gpt-5-codex`、`codex-mini-latest` 和 `o4-mini` 都會被拒。
+
+```bash
+curl -sS -X POST http://127.0.0.1:8088/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5.6-sol",
+       "input":[{"type":"message","role":"user",
+                 "content":[{"type":"input_text","text":"say ok"}]}],
+       "store":false,"stream":true}'
+```
+
+會拿到以 `event: response.created` 開頭的 SSE 串流。少了 `content-type` header
+會送出 form-encoded 資料，後端回 `Unsupported content type`。
+
 ## 各平台
 
 ### macOS（launchd）
@@ -145,6 +164,10 @@ mur-model-gateway uninstall   # 移除 user + system 兩邊的 service/env 檔�
   process 佔著 port：`ss -ltnp | grep 8088` 找到後 kill 再 start。
 - **上游回 404 `not_found_error: model: …`** — 這是 Anthropic 本尊的回應，
   代表**認證已成功**，只是 model id 過期；不是 proxy 路由問題。
+- **Codex 路由回 `model is not supported…` 或 `Input must be a list`** — 同樣的道理：
+  這是 ChatGPT 後端的回應，代表**認證已成功**，只是 request body 不對。
+  沒通過認證會拿到 401／403，帳號 id 不對則根本走不到判斷方案權限那一步。
+  可用的 request 形狀見上面的 Codex 章節。
 - **接入應用** — 應用端設 `ANTHROPIC_BASE_URL=http://127.0.0.1:8088` 即可；
   帶 OAuth 形狀 key 或不帶 auth 的請求會走 disguise，帶正常 `sk-ant-api03-*`
   的請求原樣 passthrough。
