@@ -3,6 +3,7 @@
 //! Fail-open — any parse or engine failure forwards the original bytes.
 
 use crate::Provider;
+use crate::codex;
 use mur_compress::{CompressConfig, CompressEngine, auto_compress, retrieval_note};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -439,8 +440,11 @@ pub fn should_compress(path: &str, provider: Provider) -> bool {
             path.starts_with("/v1beta/models/")
                 && (path.contains(":generateContent") || path.contains(":streamGenerateContent"))
         }
-        // Codex traffic is out of scope for wire-level tool_result compression.
-        Provider::Codex => false,
+        // The translated path's inbound body is a Chat Completions body, so
+        // the existing OpenAI rewriter understands it as-is — provided
+        // compression runs *before* translation. The raw /v1/responses
+        // passthrough stays uncompressed, as stage 1 decided.
+        Provider::Codex => codex::should_translate(path),
     }
 }
 
@@ -643,9 +647,7 @@ pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Option<Vec<u8>> 
         Provider::Anthropic => rewrite_tool_results_anthropic(&engine, min_tokens, body),
         Provider::OpenAI => rewrite_tool_results_openai(&engine, min_tokens, body),
         Provider::Gemini => rewrite_tool_results_gemini(&engine, min_tokens, body),
-        // Codex traffic is out of scope for wire-level tool_result compression;
-        // forward the original body untouched (fail-open, see doc comment above).
-        Provider::Codex => None,
+        Provider::Codex => rewrite_tool_results_openai(&engine, min_tokens, body),
     }
 }
 

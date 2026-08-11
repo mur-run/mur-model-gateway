@@ -337,6 +337,43 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         body_bytes
     };
 
+    // Stage 2: the Codex chat path arrives as Chat Completions and must
+    // leave as a Responses request. Assigning into `body_bytes` (not
+    // `final_body`) is load-bearing: the 401 retry below re-sends
+    // `body_bytes`, and an untranslated retry would be rejected upstream.
+    let translating = codex::should_translate(path_only);
+    let (client_model, client_wants_stream) = if translating {
+        let chat = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_default();
+        (
+            chat.get("model")
+                .and_then(|m| m.as_str().map(str::to_string)),
+            chat.get("stream").and_then(serde_json::Value::as_bool) == Some(true),
+        )
+    } else {
+        (None, false)
+    };
+    let body_bytes = if translating {
+        let chat: serde_json::Value = serde_json::from_slice(&body_bytes)
+            .map_err(|_| anyhow::anyhow!("codex chat body is not JSON"))?;
+        match translate::chat_to_responses(&chat) {
+            Ok(v) => axum::body::Bytes::from(serde_json::to_vec(&v)?),
+            Err(translate::TranslateError::Rejected { param }) => {
+                return Ok(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("`{param}` is not supported on the Codex route"),
+                ));
+            }
+            Err(translate::TranslateError::NotAnObject) => {
+                return Ok(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "request body must be a JSON object",
+                ));
+            }
+        }
+    } else {
+        body_bytes
+    };
+
     // Codex: callers with no real credential of their own get the stored
     // Codex credential plus the client headers; callers that already carry
     // one pass through untouched. Same INTENT as the Anthropic path's mode
@@ -521,6 +558,36 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         response_headers.insert(name.clone(), value.clone());
     }
 
+    if translating && !client_wants_stream {
+        let raw = upstream_resp.bytes().await.context("read upstream body")?;
+        if !status.is_success() {
+            // Pass the upstream's status through, but in a shape an OpenAI
+            // client can parse.
+            let msg = String::from_utf8_lossy(&raw).to_string();
+            return Ok(openai_error_response(status, &msg));
+        }
+        let mut buf = String::from_utf8_lossy(&raw).into_owned();
+        let mut agg = translate::ResponseAggregator::new();
+        for (event, data) in translate::split_sse_frames(&mut buf) {
+            agg.push(&event, &data);
+        }
+        let model = client_model.as_deref().unwrap_or("");
+        let chat = translate::responses_to_chat(&agg.finish(), model);
+        let out = serde_json::to_vec(&chat)?;
+        // The upstream said text/event-stream; the client is getting JSON.
+        response_headers.remove("content-length");
+        response_headers.remove("content-type");
+        let mut builder = Response::builder()
+            .status(status)
+            .header("content-type", "application/json");
+        for (name, value) in response_headers.iter() {
+            builder = builder.header(name, value);
+        }
+        return builder
+            .body(Body::from(out))
+            .context("build translated response");
+    }
+
     tracing::debug!(
         method = %parts.method,
         path = %path_and_query,
@@ -609,6 +676,19 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+/// An OpenAI-shaped error body. The Codex route's clients are OpenAI
+/// clients, so they parse this shape and nothing else.
+fn openai_error_response(status: StatusCode, message: &str) -> Response<Body> {
+    let body = serde_json::json!({
+        "error": {"message": message, "type": "invalid_request_error"}
+    });
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static error response builds")
 }
 
 #[cfg(test)]
