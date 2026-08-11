@@ -31,6 +31,7 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8088";
 pub const DEFAULT_UPSTREAM_ANTHROPIC: &str = "https://api.anthropic.com";
 pub const DEFAULT_UPSTREAM_OPENAI: &str = "https://api.openai.com";
 pub const DEFAULT_UPSTREAM_GEMINI: &str = "https://generativelanguage.googleapis.com";
+pub const DEFAULT_UPSTREAM_CODEX: &str = "https://chatgpt.com/backend-api/codex";
 /// Backward-compatible alias — points to Anthropic.
 pub const DEFAULT_UPSTREAM: &str = DEFAULT_UPSTREAM_ANTHROPIC;
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
@@ -43,6 +44,7 @@ pub enum Provider {
     Anthropic,
     OpenAI,
     Gemini,
+    Codex,
 }
 
 /// Map a request path to its provider. Falls back to Anthropic for unrecognised paths.
@@ -80,8 +82,21 @@ pub fn detect_provider(path: &str) -> Provider {
     {
         return Provider::Gemini;
     }
+    if codex::should_route(path) {
+        return Provider::Codex;
+    }
     tracing::debug!(path = %path, "unrecognised path, falling back to Anthropic");
     Provider::Anthropic
+}
+
+/// ChatGPT's Codex backend is rooted at `<base>/responses`, but callers use the
+/// OpenAI-style `/v1/responses`. Strip the `/v1` so the two line up. Every other
+/// provider concatenates the incoming path unchanged.
+pub fn codex_target_path(path_and_query: &str) -> String {
+    match path_and_query.strip_prefix("/v1") {
+        Some(rest) => rest.to_string(),
+        None => path_and_query.to_string(),
+    }
 }
 
 /// Pluggable OAuth token source.
@@ -143,6 +158,7 @@ pub struct AppState {
     pub upstream_anthropic: String,
     pub upstream_openai: String,
     pub upstream_gemini: String,
+    pub upstream_codex: String,
     pub client: reqwest::Client,
     pub token_source: TokenSource,
     pub version_cache: Arc<cc_version::VersionCache>,
@@ -178,6 +194,7 @@ impl AppState {
             upstream_anthropic: upstream_anthropic.into().trim_end_matches('/').to_string(),
             upstream_openai: upstream_openai.into().trim_end_matches('/').to_string(),
             upstream_gemini: upstream_gemini.into().trim_end_matches('/').to_string(),
+            upstream_codex: DEFAULT_UPSTREAM_CODEX.to_string(),
             client: reqwest::Client::builder()
                 .timeout(UPSTREAM_TIMEOUT)
                 .build()
@@ -188,12 +205,19 @@ impl AppState {
         })
     }
 
+    /// Override the Codex upstream. Used by tests to point at httpmock.
+    pub fn with_upstream_codex(mut self, url: impl Into<String>) -> Self {
+        self.upstream_codex = url.into();
+        self
+    }
+
     /// Return the upstream URL for the given provider.
     pub fn upstream_for(&self, provider: Provider) -> &str {
         match provider {
             Provider::Anthropic => &self.upstream_anthropic,
             Provider::OpenAI => &self.upstream_openai,
             Provider::Gemini => &self.upstream_gemini,
+            Provider::Codex => &self.upstream_codex,
         }
     }
 }
@@ -224,7 +248,11 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .unwrap_or("/");
     let path_only = parts.uri.path();
     let provider = detect_provider(path_only);
-    let target_url = format!("{}{}", state.upstream_for(provider), path_and_query);
+    let target_path = match provider {
+        Provider::Codex => codex_target_path(path_and_query),
+        _ => path_and_query.to_string(),
+    };
+    let target_url = format!("{}{}", state.upstream_for(provider), target_path);
     let _: Uri = target_url.parse().context("target uri parse")?;
 
     let body_bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
@@ -538,5 +566,40 @@ mod tests {
             s.upstream_for(Provider::Gemini),
             "https://generativelanguage.googleapis.com"
         );
+    }
+
+    #[test]
+    fn detects_codex_provider() {
+        assert_eq!(detect_provider("/v1/responses"), Provider::Codex);
+        assert_eq!(
+            detect_provider("/v1/responses?stream=true"),
+            Provider::Codex
+        );
+        assert_eq!(detect_provider("/v1/messages"), Provider::Anthropic);
+        // Unrecognised paths still fall back to Anthropic.
+        assert_eq!(detect_provider("/v1/responsesX"), Provider::Anthropic);
+    }
+
+    #[test]
+    fn codex_target_path_strips_v1() {
+        assert_eq!(codex_target_path("/v1/responses"), "/responses");
+        assert_eq!(
+            codex_target_path("/v1/responses?stream=true"),
+            "/responses?stream=true"
+        );
+        // Defensive: a path that somehow lacks the prefix is passed through.
+        assert_eq!(codex_target_path("/responses"), "/responses");
+    }
+
+    #[test]
+    fn upstream_for_resolves_codex() {
+        let s = AppState::new(
+            "https://a.test",
+            "https://o.test",
+            "https://g.test",
+            TokenSource::Disabled,
+        )
+        .unwrap();
+        assert_eq!(s.upstream_for(Provider::Codex), DEFAULT_UPSTREAM_CODEX);
     }
 }
