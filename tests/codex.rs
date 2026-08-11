@@ -375,6 +375,94 @@ async fn expired_token_triggers_one_refresh_and_retry() {
     std::fs::remove_file(&auth).ok();
 }
 
+/// Fix round 3, finding C1 (red against pre-fix code — see
+/// `codex_retry_eligible` in src/lib.rs for the unit-testable core of this
+/// same guard). Before this fix, the 401-retry guard checked only that the
+/// route was Codex, the status was 401, and a Codex token source was
+/// configured — never whether the credential that actually got rejected was
+/// one *this gateway* had attached. A client posting its own bad key to
+/// `/v1/responses` would get a 401 from upstream, and the old guard would
+/// still fire: it would redeem, and rotate, the user's real stored refresh
+/// token to retry a request that never used that credential in the first
+/// place. This test authenticates with a client-owned credential distinct
+/// from the stored fixture, and requires the token endpoint see zero hits
+/// and `auth.json` stay byte-for-byte unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_credential_401_does_not_trigger_refresh() {
+    // Fix round 1, finding 7: serialises this test against every other
+    // test in the file for the env-var reasons on `ENV_SERIAL` above.
+    let _serial = serial_guard().await;
+    let upstream = MockServer::start_async().await;
+
+    // The client's own bad key, rejected upstream — distinct from every
+    // stored-credential fixture value used elsewhere in this file, so a
+    // failure here can't be confused with the gateway's own token leaking.
+    let rejected = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer client-owns-this-bad-token");
+            then.status(401).body(r#"{"error":"invalid_api_key"}"#);
+        })
+        .await;
+
+    // Configured, but must see zero hits: this test's whole point is that a
+    // client-owned credential's 401 must never reach the refresh path at all.
+    let token_ep = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200)
+                .body(r#"{"access_token":"should-never-be-issued"}"#);
+        })
+        .await;
+
+    let dir = std::env::temp_dir().join("mmg-codex-c1-guard");
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth = dir.join("auth.json");
+    let fixture = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"stored-tok","refresh_token":"stored-refresh-token","account_id":"acct-fake"}}"#;
+    std::fs::write(&auth, fixture).unwrap();
+
+    // SAFETY: `_serial` (acquired above) holds `ENV_SERIAL` for this test's
+    // full body, and every test in this file acquires that same lock before
+    // touching env — no other thread in this process can be reading or
+    // writing env while this runs.
+    unsafe {
+        std::env::set_var(
+            "MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT",
+            format!("{}/oauth/token", upstream.base_url()),
+        );
+    }
+    // Cleared on drop (including on an assert panic below), so a failure
+    // here can't leak the override into whatever the harness runs next.
+    let _env_guard = EnvVarGuard("MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT");
+    mur_model_gateway::codex::reset_refresh_cache().await;
+
+    let proxy = spawn_codex(upstream.base_url(), TokenSource::Codex(auth.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer client-owns-this-bad-token")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5-codex","input":"say ok"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    // The client's own 401 is proxied straight back — no retry attempted.
+    assert_eq!(resp.status(), 401);
+    assert_eq!(rejected.hits_async().await, 1);
+    assert_eq!(
+        token_ep.hits_async().await,
+        0,
+        "a client-owned credential's 401 must never redeem the gateway's stored refresh token"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&auth).unwrap(),
+        fixture,
+        "auth.json must be untouched when the rejected credential wasn't the gateway's own"
+    );
+    std::fs::remove_file(&auth).ok();
+}
+
 /// Fix round 1, finding 4: the retry rebuilt the request from scratch with
 /// only `apply_codex_headers` applied (bearer/originator/account-id —
 /// confirmed by inspection that it never sets `content-type` or `accept`),
@@ -403,7 +491,13 @@ async fn retry_forwards_original_request_headers() {
                 .header("authorization", "Bearer fresh-tok")
                 // The load-bearing condition: only present if the retry
                 // forwarded the client's original headers.
-                .header("accept", "text/event-stream");
+                .header("accept", "text/event-stream")
+                // Fix round 3, finding I5: the retry must still carry the
+                // account-id header derived from the fixture — a real
+                // backend rejects requests missing it. Checked by value,
+                // like `fixture_account_id_present`, so this test doesn't
+                // need to hardcode which header name carries it.
+                .matches(retry_fixture_account_id_present);
             then.status(200).body(r#"{"ok":true}"#);
         })
         .await;
@@ -609,4 +703,14 @@ fn fixture_account_id_present(req: &HttpMockRequest) -> bool {
     req.headers
         .as_ref()
         .is_some_and(|hs| hs.iter().any(|(_, v)| v == "fixture-account-id"))
+}
+
+/// Same "check by value, not by header name" rationale as
+/// `fixture_account_id_present`, for the `"acct-fake"` account id shared by
+/// every 401-retry test's `auth.json` fixture in this file (fix round 3,
+/// finding I5).
+fn retry_fixture_account_id_present(req: &HttpMockRequest) -> bool {
+    req.headers
+        .as_ref()
+        .is_some_and(|hs| hs.iter().any(|(_, v)| v == "acct-fake"))
 }

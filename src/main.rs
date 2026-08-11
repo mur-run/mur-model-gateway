@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 #[derive(Parser)]
 #[command(
     name = "mur-model-gateway",
-    about = "Multi-provider LLM API reverse proxy (Anthropic / OpenAI / Gemini) with Claude Code disguise layer",
+    about = "Multi-provider LLM API reverse proxy (Anthropic / OpenAI / Gemini / Codex) with Claude Code disguise layer",
     version
 )]
 struct Cli {
@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("invalid --token-source {spec}"))?;
             }
             if let Some(spec) = &token_source_codex {
-                parse_token_source(spec)
+                parse_token_source_codex(spec)
                     .with_context(|| format!("invalid --token-source-codex {spec}"))?;
             }
             install::install(install::InstallOpts {
@@ -145,8 +145,8 @@ async fn serve() -> anyhow::Result<()> {
     .with_default_codex_source()
     .with_upstream_codex(&upstream_codex);
     if let Ok(spec) = std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX") {
-        state.token_source_codex =
-            parse_token_source(&spec).context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX")?;
+        state.token_source_codex = parse_token_source_codex(&spec)
+            .context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX")?;
     }
     let app = build_router(state);
 
@@ -170,7 +170,12 @@ async fn serve() -> anyhow::Result<()> {
 }
 
 /// Parse a token-source spec:
-/// `keychain` (default) | `off`/`disabled` | `env:VAR` | `file` | `file:/path`.
+/// `keychain` (default) | `off`/`disabled` | `env:VAR` | `file` | `file:/path` | `codex`.
+/// This is the general-purpose parser, shared by the generic `--token-source` /
+/// `MUR_MODEL_GATEWAY_TOKEN_SOURCE` knob and (indirectly, via
+/// [`parse_token_source_codex`]) the Codex-specific one. `keychain` and
+/// `file`/`file:` read Claude Code's Anthropic OAuth credential — meaningful
+/// for the generic knob, meaningless (and dangerous) for Codex.
 fn parse_token_source(spec: &str) -> anyhow::Result<TokenSource> {
     match spec {
         "off" | "disabled" => Ok(TokenSource::Disabled),
@@ -192,6 +197,24 @@ fn parse_token_source(spec: &str) -> anyhow::Result<TokenSource> {
                 )
             }
         }
+    }
+}
+
+/// Parse a token-source spec for the Codex route specifically (fix round 3,
+/// finding I1). Delegates to [`parse_token_source`] but rejects `keychain`
+/// and `file`/`file:` — those resolve to Claude Code's Anthropic OAuth
+/// credential, which is meaningless as a Codex credential and, if ever
+/// resolved and sent, would leak the user's Anthropic subscription token to
+/// chatgpt.com. Valid specs: `codex` (default) | `off`/`disabled` |
+/// `env:VAR` — matching what `--token-source-codex` and
+/// `MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX` document.
+fn parse_token_source_codex(spec: &str) -> anyhow::Result<TokenSource> {
+    match parse_token_source(spec)? {
+        TokenSource::Keychain | TokenSource::CredentialsFile(_) => anyhow::bail!(
+            "invalid Codex token source {spec} (expected: codex | off | env:VAR — \
+             keychain/file read Claude Code's Anthropic credential, not a Codex one)"
+        ),
+        ts => Ok(ts),
     }
 }
 
@@ -251,5 +274,37 @@ mod tests {
     fn token_source_rejects_unknown() {
         assert!(parse_token_source("vault").is_err());
         assert!(parse_token_source("").is_err());
+    }
+
+    /// Fix round 3, finding I1: `keychain` and `file`/`file:` resolve to
+    /// Claude Code's Anthropic OAuth credential, which is meaningless (and
+    /// dangerous — it would be sent to chatgpt.com) as a Codex credential.
+    /// The Codex-specific parser must reject them even though the generic
+    /// one accepts them.
+    #[test]
+    fn token_source_codex_rejects_anthropic_only_specs() {
+        assert!(parse_token_source_codex("keychain").is_err());
+        assert!(parse_token_source_codex("file").is_err());
+        assert!(parse_token_source_codex("file:/opt/creds.json").is_err());
+    }
+
+    #[test]
+    fn token_source_codex_accepts_documented_specs() {
+        assert!(matches!(
+            parse_token_source_codex("codex").unwrap(),
+            TokenSource::Codex(_)
+        ));
+        assert!(matches!(
+            parse_token_source_codex("off").unwrap(),
+            TokenSource::Disabled
+        ));
+        assert!(matches!(
+            parse_token_source_codex("disabled").unwrap(),
+            TokenSource::Disabled
+        ));
+        match parse_token_source_codex("env:MY_TOKEN").unwrap() {
+            TokenSource::EnvVar(v) => assert_eq!(v, "MY_TOKEN"),
+            _ => panic!("expected EnvVar"),
+        }
     }
 }

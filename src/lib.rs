@@ -1,12 +1,15 @@
-//! mur-model-gateway — multi-provider LLM API reverse proxy (Anthropic, OpenAI, Gemini).
+//! mur-model-gateway — multi-provider LLM API reverse proxy (Anthropic, OpenAI, Gemini, Codex).
 //!
 //! Path-based routing: `/v1/messages*` → Anthropic, `/v1/chat/completions*` → OpenAI,
-//! `/v1beta/models/*` → Gemini. A disguise layer applies to Anthropic traffic only:
-//! when the inbound request carries no auth, the proxy resolves an OAuth token from
-//! the configured [`TokenSource`], adds `Authorization: Bearer …`, the claude-code-*
-//! `anthropic-beta` header, and prepends a billing-header text block to the request's
-//! `system` field. Wire-level CCR compression (opt-in via `MUR_MODEL_GATEWAY_COMPRESS=1`)
-//! applies to tool_result blocks for all three providers.
+//! `/v1beta/models/*` → Gemini, `/v1/responses*` → Codex (ChatGPT backend). A disguise
+//! layer applies to Anthropic traffic only: when the inbound request carries no auth,
+//! the proxy resolves an OAuth token from the configured [`TokenSource`], adds
+//! `Authorization: Bearer …`, the claude-code-* `anthropic-beta` header, and prepends a
+//! billing-header text block to the request's `system` field. The Codex route attaches
+//! credentials under its own, simpler rule instead — see [`codex`] — and is
+//! deliberately excluded from wire compression. Wire-level CCR compression (opt-in via
+//! `MUR_MODEL_GATEWAY_COMPRESS=1`) applies to tool_result blocks for the other three
+//! providers.
 
 pub mod cc_version;
 pub mod codex;
@@ -326,9 +329,13 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         body_bytes
     };
 
-    // Codex: auth-less callers get the stored Codex credential plus the client
-    // headers. Requests that already carry auth pass through untouched, same
-    // rule as the Anthropic path.
+    // Codex: callers with no real credential of their own get the stored
+    // Codex credential plus the client headers; callers that already carry
+    // one pass through untouched. Same INTENT as the Anthropic path's mode
+    // 3 (don't second-guess a client that authenticates itself) but not the
+    // same rule: unlike Anthropic's plain `contains_key` check,
+    // `has_client_credential` treats a present-but-empty auth header as "no
+    // credential" — see that function's doc for why.
     let codex_cred: Option<(String, Option<String>)> =
         if provider == Provider::Codex && !has_client_credential(&parts.headers) {
             match state.token_source_for(Provider::Codex) {
@@ -451,12 +458,22 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .with_context(|| format!("upstream {target_url}"))?;
 
     // One retry only. A second 401 goes back to the caller unchanged.
-    if provider == Provider::Codex
-        && upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
+    //
+    // Known limitation (explicitly out of scope): ChatGPT may return 403,
+    // not just 401, for some expired-token cases. That's unverified, and
+    // refreshing on a genuine permission error would be worse than not
+    // retrying at all, so only 401 is ever treated as "possibly an expired
+    // token" here.
+    if codex_retry_eligible(provider, upstream_resp.status(), codex_cred.is_some())
         && let TokenSource::Codex(path) = state.token_source_for(Provider::Codex)
         && let Some(fresh) = codex::refreshed_access_token(path).await
     {
-        let account_id = codex::read_auth(path).and_then(|a| a.account_id);
+        // Fix round 3, finding I2: reuse the account id captured on the
+        // first pass (`codex_cred`) instead of re-reading auth.json here.
+        // A transient read failure on this second read would otherwise
+        // silently drop the account header from the retried request, and a
+        // real backend rejects requests that are missing it.
+        let account_id = codex_cred.as_ref().and_then(|(_, aid)| aid.clone());
         let mut retry = state.client.request(parts.method.clone(), &target_url);
         // Fix round 1, finding 4: forward the same client headers as the
         // first attempt (content-type, accept — including
@@ -513,6 +530,27 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         *h = response_headers;
     }
     builder.body(body).context("build response")
+}
+
+/// Whether the Codex 401 fallback is allowed to attempt a refresh at all.
+/// Split out of `forward`'s retry `if` (fix round 3, finding C1) so the
+/// credential-ownership rule is unit-testable on its own, without the
+/// network and file-system machinery — or the gitignored Codex OAuth
+/// implementation — the rest of the retry path needs.
+///
+/// `codex_cred_present` must be true: it reflects whether *this gateway*
+/// attached the credential that got rejected (`codex_cred.is_some()` at the
+/// call site). Without that check, a client posting its own bad key to the
+/// Codex route would get a 401 here, and the gateway would redeem — and
+/// rotate — the user's real, stored refresh token to retry a request that
+/// never used the user's credential in the first place. A third party's bad
+/// key must never be able to spend or rotate the user's credential.
+fn codex_retry_eligible(
+    provider: Provider,
+    status: reqwest::StatusCode,
+    codex_cred_present: bool,
+) -> bool {
+    provider == Provider::Codex && status == reqwest::StatusCode::UNAUTHORIZED && codex_cred_present
 }
 
 /// If the inbound request supplies an Anthropic OAuth subscription token
@@ -625,6 +663,41 @@ mod tests {
         let ts = TokenSource::Codex(p.clone());
         assert_eq!(ts.resolve().unwrap().as_deref(), Some("fake-access-token"));
         std::fs::remove_file(&p).ok();
+    }
+
+    /// Fix round 3, finding C1 (red against pre-fix code): a client's own
+    /// credential getting a 401 on the Codex route must never be eligible
+    /// for the refresh-and-retry path. Only a 401 on a credential *this
+    /// gateway* attached may trigger it — otherwise a third party's bad key
+    /// spends and rotates the user's stored refresh token. This is the pure
+    /// guard logic only; the full end-to-end regression (asserting the
+    /// token endpoint sees zero hits and auth.json is untouched) lives in
+    /// tests/codex.rs, which needs the real Codex OAuth implementation to
+    /// be meaningful and so does not run on CI — see that file's
+    /// `client_credential_401_does_not_trigger_refresh`.
+    #[test]
+    fn codex_retry_requires_gateway_supplied_credential() {
+        assert!(!codex_retry_eligible(
+            Provider::Codex,
+            reqwest::StatusCode::UNAUTHORIZED,
+            false
+        ));
+        assert!(codex_retry_eligible(
+            Provider::Codex,
+            reqwest::StatusCode::UNAUTHORIZED,
+            true
+        ));
+        // Sanity: the other two conjuncts still matter on their own.
+        assert!(!codex_retry_eligible(
+            Provider::Anthropic,
+            reqwest::StatusCode::UNAUTHORIZED,
+            true
+        ));
+        assert!(!codex_retry_eligible(
+            Provider::Codex,
+            reqwest::StatusCode::OK,
+            true
+        ));
     }
 
     #[test]

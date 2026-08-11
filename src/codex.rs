@@ -177,10 +177,6 @@ pub async fn reset_refresh_cache() {
     }
 }
 
-/// Replace only the rotated fields, atomically. Codex CLI reads keys this
-/// gateway does not model, so the rest of the document is preserved verbatim.
-/// `last_refresh` is deliberately left alone — it is Codex CLI's bookkeeping,
-/// and updating it would need a date dependency this crate does not have.
 /// Removes its path on drop unless [`Self::keep`] was called. Guarantees a
 /// failed write, sync, or rename never leaves a stray, world-readable-or-not
 /// temp file holding a live access/refresh token pair sitting on disk (fix
@@ -244,6 +240,23 @@ fn create_temp_exclusive(tmp: &Path) -> std::io::Result<std::fs::File> {
         .open(tmp)
 }
 
+/// Replace only the rotated fields (`access_token`, and `refresh_token` when
+/// rotated) in `auth.json`, atomically (see [`TempFileGuard`] and
+/// `create_temp_exclusive` for how). Parses the document as a
+/// `serde_json::Value` without the `preserve_order` feature, so any
+/// *unmodelled* key this gateway doesn't know about — top-level or nested
+/// under `tokens` — survives by value. This is NOT a verbatim, byte-for-byte
+/// round-trip (fix round 3, finding D4): `serde_json::to_vec_pretty`
+/// re-sorts object keys alphabetically and applies its own formatting, so
+/// key order and whitespace can both change even though every value Codex
+/// CLI depends on is preserved.
+///
+/// `last_refresh` is deliberately one of the fields left alone — it is
+/// Codex CLI's own bookkeeping, and updating it would need a date
+/// dependency this crate does not have. The cost (fix round 3, finding D5):
+/// Codex CLI sees a stale `last_refresh` the next time it runs and performs
+/// one extra refresh of its own before trusting the token this gateway just
+/// rotated.
 fn persist_rotation(path: &Path, new: &RefreshedTokens) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(path)?;
     let mut doc: serde_json::Value = serde_json::from_str(&raw)?;
