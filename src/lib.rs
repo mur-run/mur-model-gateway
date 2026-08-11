@@ -117,6 +117,9 @@ pub enum TokenSource {
     /// file (Linux/Windows installs write `~/.claude/.credentials.json`
     /// instead of the OS keychain). Re-read on every request.
     CredentialsFile(std::path::PathBuf),
+    /// Read `tokens.access_token` from a Codex credentials JSON file
+    /// (`~/.codex/auth.json`). Re-read on every request.
+    Codex(std::path::PathBuf),
     /// Always return this token. Used by integration tests.
     Static(Arc<String>),
     /// Never disguise; act as a pure passthrough proxy.
@@ -146,6 +149,7 @@ impl TokenSource {
                 }
             }
             TokenSource::CredentialsFile(path) => keychain::read_credentials_file(path),
+            TokenSource::Codex(path) => Ok(codex::read_auth(path).map(|a| a.access_token)),
             TokenSource::EnvVar(name) => Ok(std::env::var(name).ok()),
             TokenSource::Static(s) => Ok(Some(s.as_ref().clone())),
             TokenSource::Disabled => Ok(None),
@@ -161,6 +165,9 @@ pub struct AppState {
     pub upstream_codex: String,
     pub client: reqwest::Client,
     pub token_source: TokenSource,
+    /// Credential source for `Provider::Codex`. Defaults to `~/.codex/auth.json`;
+    /// `token_source` stays the fallback for every other provider.
+    pub token_source_codex: TokenSource,
     pub version_cache: Arc<cc_version::VersionCache>,
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
     /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
@@ -200,6 +207,10 @@ impl AppState {
                 .build()
                 .context("reqwest client")?,
             token_source,
+            token_source_codex: match codex::default_auth_path() {
+                Some(p) => TokenSource::Codex(p),
+                None => TokenSource::Disabled,
+            },
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
         })
@@ -211,6 +222,12 @@ impl AppState {
         self
     }
 
+    /// Override the Codex token source. Used by tests.
+    pub fn with_token_source_codex(mut self, ts: TokenSource) -> Self {
+        self.token_source_codex = ts;
+        self
+    }
+
     /// Return the upstream URL for the given provider.
     pub fn upstream_for(&self, provider: Provider) -> &str {
         match provider {
@@ -218,6 +235,15 @@ impl AppState {
             Provider::OpenAI => &self.upstream_openai,
             Provider::Gemini => &self.upstream_gemini,
             Provider::Codex => &self.upstream_codex,
+        }
+    }
+
+    /// Credential source for a provider. Only Codex has its own; everything
+    /// else uses the global source, so existing installs are unaffected.
+    pub fn token_source_for(&self, provider: Provider) -> &TokenSource {
+        match provider {
+            Provider::Codex => &self.token_source_codex,
+            _ => &self.token_source,
         }
     }
 }
@@ -486,6 +512,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_token_source_resolves_access_token() {
+        let dir = std::env::temp_dir().join("mmg-codex-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("auth.json");
+        std::fs::write(
+            &p,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-access-token","refresh_token":"fake-refresh-token","account_id":"acct-fake"}}"#,
+        )
+        .unwrap();
+        let ts = TokenSource::Codex(p.clone());
+        assert_eq!(ts.resolve().unwrap().as_deref(), Some("fake-access-token"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn detect_provider_anthropic() {
         assert_eq!(detect_provider("/v1/messages"), Provider::Anthropic);
         assert_eq!(
@@ -601,5 +642,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.upstream_for(Provider::Codex), DEFAULT_UPSTREAM_CODEX);
+    }
+
+    #[test]
+    fn token_source_for_picks_per_provider() {
+        let s = AppState::new(
+            "https://a.test",
+            "https://o.test",
+            "https://g.test",
+            TokenSource::Disabled,
+        )
+        .unwrap()
+        .with_token_source_codex(TokenSource::Static(Arc::new("codex-tok".to_string())));
+        // Anthropic keeps the global source; Codex gets its own.
+        assert!(matches!(
+            s.token_source_for(Provider::Anthropic),
+            TokenSource::Disabled
+        ));
+        assert_eq!(
+            s.token_source_for(Provider::Codex)
+                .resolve()
+                .unwrap()
+                .as_deref(),
+            Some("codex-tok")
+        );
     }
 }

@@ -119,12 +119,16 @@ async fn serve() -> anyhow::Result<()> {
     )
     .context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE")?;
 
-    let state = AppState::new(
+    let mut state = AppState::new(
         &upstream_anthropic,
         &upstream_openai,
         &upstream_gemini,
         token_source,
     )?;
+    if let Ok(spec) = std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX") {
+        state.token_source_codex =
+            parse_token_source(&spec).context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX")?;
+    }
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -154,6 +158,9 @@ fn parse_token_source(spec: &str) -> anyhow::Result<TokenSource> {
         "file" => mur_model_gateway::keychain::default_credentials_path()
             .map(TokenSource::CredentialsFile)
             .ok_or_else(|| anyhow::anyhow!("cannot resolve home dir for default credentials path")),
+        "codex" => mur_model_gateway::codex::default_auth_path()
+            .map(TokenSource::Codex)
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve home dir for default codex auth path")),
         _ => {
             if let Some(var) = spec.strip_prefix("env:") {
                 Ok(TokenSource::EnvVar(var.to_string()))
@@ -161,7 +168,7 @@ fn parse_token_source(spec: &str) -> anyhow::Result<TokenSource> {
                 Ok(TokenSource::CredentialsFile(path.into()))
             } else {
                 anyhow::bail!(
-                    "invalid token source {spec} (expected: keychain | off | env:VAR | file | file:/path)"
+                    "invalid token source {spec} (expected: keychain | off | env:VAR | file | file:/path | codex)"
                 )
             }
         }
@@ -213,6 +220,10 @@ mod tests {
                 assert!(p.ends_with(".claude/.credentials.json"))
             }
             _ => panic!("expected CredentialsFile"),
+        }
+        match parse_token_source("codex").unwrap() {
+            TokenSource::Codex(p) => assert!(p.ends_with(".codex/auth.json")),
+            _ => panic!("expected Codex"),
         }
     }
 
