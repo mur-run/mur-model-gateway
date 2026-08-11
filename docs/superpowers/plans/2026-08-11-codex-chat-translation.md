@@ -24,6 +24,10 @@
 - **Tests never touch the network.** They read fixtures captured in Task 1.
 - **Tests are inline `#[cfg(test)] mod tests`** in the module they cover, matching `src/lib.rs` and `src/compress.rs`. Cross-module integration tests go in `tests/`, matching `tests/passthrough.rs`.
 - **`cargo fmt --check` and `cargo clippy` must pass** before every commit.
+- **The Codex upstream is streaming-only.** A Responses request without `stream: true` is rejected
+  with `400 {"detail":"Stream must be set to true"}`. `chat_to_responses` always sets `stream: true`,
+  and a non-streaming Chat Completions request is served by aggregating the SSE reply. The client's
+  `stream` flag — not the upstream's content type — decides what the client receives.
 - Spec: `docs/superpowers/specs/2026-08-11-codex-chat-translation-design.md`.
 
 ### Deviation from the spec, recorded
@@ -36,6 +40,20 @@ existing `codex::should_route(path)`. Same decision, less blast radius.
 ---
 
 ### Task 1: Capture ground-truth fixtures and correct the mapping tables
+
+> **✅ COMPLETE — done by the controller on 2026-08-11, before any other task.** Fixtures are
+> committed at `tests/fixtures/codex/`; the spec's tables are corrected. The steps below are kept as
+> the record of how they were captured. **Read the four findings — Tasks 3, 6, 8 and 9 below were
+> rewritten because of them.**
+>
+> 1. **The upstream is streaming-only.** Omitting `stream: true` returns
+>    `400 {"detail":"Stream must be set to true"}`. There is no non-streaming reply to translate.
+> 2. **`response.completed` has `usage` and `status` but an empty `output`.** Items arrive
+>    individually on `response.output_item.done`, each a complete Responses output item.
+> 3. **Model names are account-tier dependent.** `gpt-5-codex` and `gpt-5` are rejected; `gpt-5.4`
+>    and `gpt-5.5` work. Fixtures use `gpt-5.4`.
+> 4. **Every guessed event and field name was correct**, and the captured tool call splits its
+>    arguments across six `response.function_call_arguments.delta` events.
 
 The spec's mapping tables and SSE event names are written from the public Responses API shape and
 have **not** been verified against live Codex. The streaming event names are the likeliest to be
@@ -342,15 +360,32 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 256,
             "temperature": 0.5,
-            "top_p": 0.9,
-            "stream": true
+            "top_p": 0.9
         });
         let out = chat_to_responses(&chat).unwrap();
         assert_eq!(out["max_output_tokens"], json!(256));
         assert_eq!(out["temperature"], json!(0.5));
         assert_eq!(out["top_p"], json!(0.9));
-        assert_eq!(out["stream"], json!(true));
         assert!(out.get("max_tokens").is_none(), "renamed, not duplicated");
+    }
+
+    #[test]
+    fn stream_is_always_forced_true() {
+        // The upstream rejects anything else with
+        // 400 {"detail":"Stream must be set to true"}. A non-streaming client
+        // request is satisfied by aggregating the stream, not by asking the
+        // upstream for a non-streaming reply.
+        for asked in [json!(false), json!(true), Value::Null] {
+            let mut chat = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            if !asked.is_null() {
+                chat["stream"] = asked.clone();
+            }
+            assert_eq!(
+                chat_to_responses(&chat).unwrap()["stream"],
+                json!(true),
+                "stream must be forced true (client asked {asked})"
+            );
+        }
     }
 
     #[test]
@@ -413,6 +448,10 @@ pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
     // Stateless by construction. Chat Completions carries its whole history
     // on every call, so server-side threading would double-count context.
     out.insert("store".into(), json!(false));
+    // The upstream has no non-streaming mode; it rejects anything else with
+    // 400 {"detail":"Stream must be set to true"}. A client that asked for a
+    // non-streaming reply gets the stream aggregated for it downstream.
+    out.insert("stream".into(), json!(true));
 
     let mut instructions: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
@@ -443,7 +482,7 @@ pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
     if let Some(v) = chat.get("max_tokens").or_else(|| chat.get("max_completion_tokens")) {
         out.insert("max_output_tokens".into(), v.clone());
     }
-    for name in ["temperature", "top_p", "stream", "tool_choice"] {
+    for name in ["temperature", "top_p", "tool_choice"] {
         if let Some(v) = chat.get(name) {
             out.insert(name.into(), v.clone());
         }
@@ -463,7 +502,7 @@ Note: `unwrap_or(&vec![])` will not compile — a temporary cannot be borrowed. 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib translate::`
-Expected: PASS, five tests.
+Expected: PASS, six tests.
 
 - [ ] **Step 5: Commit**
 
@@ -764,15 +803,26 @@ git commit -m "feat(translate): reject semantic params, drop cosmetic ones"
 
 ---
 
-### Task 6: `responses_to_chat` — non-streaming
+### Task 6: `responses_to_chat`, SSE frame splitting, and aggregation
+
+The upstream is streaming-only (Global Constraints), so `responses_to_chat`'s input never arrives as
+a JSON body — it is always rebuilt from the SSE stream. This task therefore builds three things:
+the frame splitter both later tasks share, the aggregator that rebuilds a Responses object, and
+`responses_to_chat` itself.
 
 **Files:**
 - Modify: `src/translate.rs`
-- Test: inline, reading `tests/fixtures/codex/nonstreaming.json` and `toolcall.json`
+- Test: inline, reading `tests/fixtures/codex/*` (already committed — do not re-capture)
 
 **Interfaces:**
-- Consumes: fixtures from Task 1.
-- Produces: `pub fn responses_to_chat(resp: &Value, model: &str) -> Value`.
+- Consumes: the committed fixtures.
+- Produces:
+  - `pub fn split_sse_frames(buf: &mut String) -> Vec<(String, Value)>` — drains complete frames from
+    `buf`, leaving any trailing partial frame in place. Returns `(event, data)` pairs, skipping
+    frames whose data will not parse as JSON.
+  - `pub struct ResponseAggregator` with `new() -> Self`, `push(&mut self, event: &str, data: &Value)`,
+    and `finish(self) -> Value` returning a Responses object.
+  - `pub fn responses_to_chat(resp: &Value, model: &str) -> Value`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -780,34 +830,84 @@ git commit -m "feat(translate): reject semantic params, drop cosmetic ones"
     fn fixture(name: &str) -> Value {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex/");
         let raw = std::fs::read_to_string(format!("{path}{name}"))
-            .unwrap_or_else(|e| panic!("fixture {name}: {e} — run Task 1 first"));
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"));
         serde_json::from_str(&raw).unwrap()
+    }
+
+    fn fixture_raw(name: &str) -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex/");
+        std::fs::read_to_string(format!("{path}{name}"))
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    #[test]
+    fn splits_sse_frames_and_keeps_partials() {
+        let mut buf = String::from("event: a\ndata: {\"x\":1}\n\nevent: b\ndata: {\"y\"");
+        let frames = split_sse_frames(&mut buf);
+        assert_eq!(frames.len(), 1, "only the complete frame is drained");
+        assert_eq!(frames[0].0, "a");
+        assert_eq!(frames[0].1["x"], json!(1));
+        assert_eq!(buf, "event: b\ndata: {\"y\"", "the partial frame stays buffered");
+
+        // Completing the partial yields it on the next call.
+        buf.push_str(":2}\n\n");
+        let frames = split_sse_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, "b");
+        assert_eq!(frames[0].1["y"], json!(2));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn aggregates_the_captured_text_stream() {
+        // response.completed carries usage and status but an EMPTY output
+        // array; the items arrive on response.output_item.done. Rebuilding
+        // from response.completed alone would silently produce empty replies.
+        let mut buf = fixture_raw("streaming.sse");
+        let mut agg = ResponseAggregator::new();
+        for (event, data) in split_sse_frames(&mut buf) {
+            agg.push(&event, &data);
+        }
+        let rebuilt = agg.finish();
+        assert_eq!(rebuilt, fixture("nonstreaming.json"));
+    }
+
+    #[test]
+    fn aggregates_the_captured_tool_call_stream() {
+        let mut buf = fixture_raw("toolcall-streaming.sse");
+        let mut agg = ResponseAggregator::new();
+        for (event, data) in split_sse_frames(&mut buf) {
+            agg.push(&event, &data);
+        }
+        assert_eq!(agg.finish(), fixture("toolcall.json"));
     }
 
     #[test]
     fn converts_real_nonstreaming_fixture() {
-        let out = responses_to_chat(&fixture("nonstreaming.json"), "gpt-5-codex");
+        let out = responses_to_chat(&fixture("nonstreaming.json"), "gpt-5.4");
         assert_eq!(out["object"], json!("chat.completion"));
-        assert_eq!(out["model"], json!("gpt-5-codex"));
+        assert_eq!(out["model"], json!("gpt-5.4"));
         let choice = &out["choices"][0];
         assert_eq!(choice["index"], json!(0));
         assert_eq!(choice["message"]["role"], json!("assistant"));
-        assert!(choice["message"]["content"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(choice["message"]["content"], json!("1\n2\n3\n4\n5"));
         assert_eq!(choice["finish_reason"], json!("stop"));
-        assert!(out["usage"]["prompt_tokens"].as_u64().is_some());
-        assert!(out["usage"]["completion_tokens"].as_u64().is_some());
+        assert_eq!(out["usage"]["prompt_tokens"], json!(9));
+        assert_eq!(out["usage"]["completion_tokens"], json!(13));
+        assert_eq!(out["usage"]["total_tokens"], json!(22));
     }
 
     #[test]
     fn converts_real_toolcall_fixture() {
-        let out = responses_to_chat(&fixture("toolcall.json"), "gpt-5-codex");
+        let out = responses_to_chat(&fixture("toolcall.json"), "gpt-5.4");
         let choice = &out["choices"][0];
         assert_eq!(choice["finish_reason"], json!("tool_calls"));
         let call = &choice["message"]["tool_calls"][0];
         assert_eq!(call["type"], json!("function"));
-        assert!(call["id"].as_str().is_some_and(|s| !s.is_empty()));
-        assert!(call["function"]["name"].as_str().is_some_and(|s| !s.is_empty()));
-        assert!(call["function"]["arguments"].as_str().is_some());
+        // The OpenAI tool-call id is call_id, NOT the item's own id.
+        assert_eq!(call["id"], json!("call_uphHcxpvlpMMt0m2ZeigzBfH"));
+        assert_eq!(call["function"]["name"], json!("get_weather"));
+        assert_eq!(call["function"]["arguments"], json!("{\"city\":\"Taipei\"}"));
     }
 
     #[test]
@@ -843,9 +943,95 @@ git commit -m "feat(translate): reject semantic params, drop cosmetic ones"
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --lib translate::`
-Expected: FAIL — `cannot find function responses_to_chat`.
+Expected: FAIL — `cannot find function split_sse_frames` / `responses_to_chat`.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the frame splitter and the aggregator**
+
+```rust
+/// Drain complete SSE frames from `buf`, leaving any trailing partial frame in
+/// place for the next chunk. Returns `(event name, data)` pairs; the `[DONE]`
+/// sentinel and any frame whose data is not JSON are skipped.
+pub fn split_sse_frames(buf: &mut String) -> Vec<(String, Value)> {
+    // The upstream separates frames with "\n\n", but CR is legal in SSE and
+    // costs one line to tolerate.
+    buf.retain(|c| c != '\r');
+
+    let mut frames = Vec::new();
+    while let Some(end) = buf.find("\n\n") {
+        let frame: String = buf.drain(..end + 2).collect();
+        let mut event = String::new();
+        let mut data = String::new();
+        for line in frame.lines() {
+            if let Some(v) = line.strip_prefix("event:") {
+                event = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("data:") {
+                data.push_str(v.trim());
+            }
+        }
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+            if event.is_empty() {
+                event = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            frames.push((event, value));
+        }
+    }
+    frames
+}
+
+/// Rebuilds a Responses object from the upstream's SSE stream. The upstream is
+/// streaming-only, so this is the only way to serve a non-streaming request.
+#[derive(Default)]
+pub struct ResponseAggregator {
+    response: Value,
+    output: Vec<Value>,
+}
+
+impl ResponseAggregator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, _event: &str, data: &Value) {
+        // response.created / .in_progress / .completed each carry the whole
+        // response object; last one wins, so usage and status end up being the
+        // ones from response.completed.
+        if let Some(resp) = data.get("response") {
+            self.response = resp.clone();
+        }
+        // response.completed's own output array is EMPTY on this backend — the
+        // items only ever arrive on response.output_item.done, already in the
+        // exact shape responses_to_chat expects.
+        if data.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+            && let Some(item) = data.get("item")
+        {
+            self.output.push(item.clone());
+        }
+    }
+
+    /// Only the fields `responses_to_chat` reads are kept.
+    pub fn finish(self) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in ["id", "created_at", "status", "model", "usage", "incomplete_details"] {
+            out.insert(
+                key.into(),
+                self.response.get(key).cloned().unwrap_or(Value::Null),
+            );
+        }
+        out.insert("object".into(), json!("response"));
+        out.insert("output".into(), Value::Array(self.output));
+        Value::Object(out)
+    }
+}
+```
+
+- [ ] **Step 4: Implement `responses_to_chat`**
 
 ```rust
 /// Translate a Responses reply into a Chat Completions reply. `model` is the
@@ -918,18 +1104,18 @@ pub fn responses_to_chat(resp: &Value, model: &str) -> Value {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test --lib translate::`
-Expected: PASS, fifteen tests. If the fixture tests fail on a field name, the fixture is right and
-the code is wrong — fix the code, and correct the spec table too.
+Expected: PASS, including the seven tests added here. If a fixture test fails on a field name, the
+fixture is right and the code is wrong — fix the code, and correct the spec table too.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 git add src/translate.rs
-git commit -m "feat(translate): convert Responses replies to chat.completion"
+git commit -m "feat(translate): aggregate the Codex SSE stream into chat.completion"
 ```
 
 ---
@@ -941,38 +1127,25 @@ git commit -m "feat(translate): convert Responses replies to chat.completion"
 - Test: inline, reading `tests/fixtures/codex/streaming.sse` and `toolcall-streaming.sse`
 
 **Interfaces:**
-- Consumes: fixtures from Task 1, and the **real event names recorded in Task 1 Step 3** — if they differ from the names below, the real ones win.
+- Consumes: `split_sse_frames(&mut String) -> Vec<(String, Value)>` from Task 6, and the committed
+  fixtures. The event names below are the ones the captures actually contain — do not invent others.
 - Produces: `pub struct SseTranslator`, `SseTranslator::new(model: String) -> Self`, `push(&mut self, event: &str, data: &Value) -> Vec<Value>`, `finish(&mut self) -> Vec<Value>`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
-    /// Split a captured SSE file into (event, data) pairs.
+    /// Split a captured SSE file into (event, data) pairs, using the same
+    /// splitter the proxy uses at runtime (Task 6).
     fn sse_events(name: &str) -> Vec<(String, Value)> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex/");
-        let raw = std::fs::read_to_string(format!("{path}{name}"))
-            .unwrap_or_else(|e| panic!("fixture {name}: {e} — run Task 1 first"));
-        let mut out = Vec::new();
-        let (mut event, mut data) = (String::new(), String::new());
-        for line in raw.lines() {
-            if let Some(e) = line.strip_prefix("event:") {
-                event = e.trim().to_string();
-            } else if let Some(d) = line.strip_prefix("data:") {
-                data = d.trim().to_string();
-            } else if line.is_empty() && !event.is_empty() {
-                if let Ok(v) = serde_json::from_str(&data) {
-                    out.push((std::mem::take(&mut event), v));
-                }
-                event.clear();
-                data.clear();
-            }
-        }
-        out
+        let mut raw = std::fs::read_to_string(format!("{path}{name}"))
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"));
+        split_sse_frames(&mut raw)
     }
 
     #[test]
     fn streams_text_as_content_chunks() {
-        let mut t = SseTranslator::new("gpt-5-codex".into());
+        let mut t = SseTranslator::new("gpt-5.4".into());
         let mut chunks = Vec::new();
         for (event, data) in sse_events("streaming.sse") {
             chunks.extend(t.push(&event, &data));
@@ -987,7 +1160,7 @@ git commit -m "feat(translate): convert Responses replies to chat.completion"
             .iter()
             .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
             .collect();
-        assert!(!text.is_empty(), "no content deltas were emitted");
+        assert_eq!(text, "1\n2\n3\n4\n5", "deltas must reassemble to the captured reply");
 
         let last = chunks.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], json!("stop"));
@@ -1002,24 +1175,26 @@ git commit -m "feat(translate): convert Responses replies to chat.completion"
         }
         chunks.extend(t.finish());
 
-        // The call is announced once, with an id and a name.
+        // The call is announced once, with an id and a name. The id is the
+        // item's call_id, not its own id.
         let announced: Vec<_> = chunks
             .iter()
             .filter(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"].is_string())
             .collect();
         assert_eq!(announced.len(), 1, "the call is announced exactly once");
-        assert!(announced[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()));
+        let call = &announced[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], json!("call_uphHcxpvlpMMt0m2ZeigzBfH"));
+        assert_eq!(call["function"]["name"], json!("get_weather"));
 
-        // Arguments reassemble into valid JSON however they were split.
+        // The capture splits the arguments across six deltas; they must
+        // reassemble byte for byte.
         let args: String = chunks
             .iter()
             .filter_map(|c| {
                 c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
             })
             .collect();
-        serde_json::from_str::<Value>(&args).expect("reassembled arguments must parse");
+        assert_eq!(args, "{\"city\":\"Taipei\"}");
 
         assert_eq!(
             chunks.last().unwrap()["choices"][0]["finish_reason"],
@@ -1171,13 +1346,16 @@ impl SseTranslator {
 }
 ```
 
-If Task 1 recorded different event names, substitute them in the `match` arms. The structure does
-not change.
+The `match` arms above are the event names the captures actually contain. Events the captures also
+carry but this translator ignores — `response.created`, `response.in_progress`,
+`response.content_part.added`/`.done`, `response.output_text.done`,
+`response.function_call_arguments.done`, `response.output_item.done` — are deliberate: their content
+already went out as deltas, and re-emitting it would duplicate the reply.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib translate::`
-Expected: PASS, eighteen tests.
+Expected: PASS, including the three tests added here.
 
 - [ ] **Step 5: Commit**
 
@@ -1192,13 +1370,17 @@ git commit -m "feat(translate): SSE state machine for Responses streams"
 ### Task 8: Wire the non-streaming path into `forward()`
 
 **Files:**
-- Modify: `src/lib.rs:310-330` (translate after compression), `:530+` (translate the reply)
-- Modify: `src/compress.rs:443` (`should_compress` for Codex)
+- Modify: `src/lib.rs` (request translate between the compression block `:323-337` and the
+  `final_body` binding `:415`; reply aggregation before `bytes_stream()` at `:532`)
+- Modify: `src/compress.rs` (`should_compress` for Codex)
 - Test: `tests/codex_translate.rs` (create)
 
 **Interfaces:**
-- Consumes: `translate::chat_to_responses`, `translate::responses_to_chat`, `translate::TranslateError`, `codex::should_translate`.
-- Produces: no new public signatures.
+- Consumes: `translate::chat_to_responses`, `translate::responses_to_chat`,
+  `translate::split_sse_frames`, `translate::ResponseAggregator`, `translate::TranslateError`,
+  `codex::should_translate`.
+- Produces: `client_wants_stream` — a `bool` binding in `forward()` that Task 9 branches on, and
+  `openai_error_response(StatusCode, &str) -> Response<Body>`.
 
 **Critical detail:** the 401 retry at `src/lib.rs:501` re-sends `body_bytes`, while the first send
 uses `final_body` (`:453`). Translation must therefore assign into **`body_bytes`**, before the
@@ -1250,7 +1432,11 @@ async fn post(gw: &str, path: &str, body: Value) -> reqwest::Response {
 fn is_translated_responses_body(req: &HttpMockRequest) -> bool {
     let Some(body) = req.body.as_ref() else { return false };
     let Ok(v) = serde_json::from_slice::<Value>(body) else { return false };
-    v.get("input").is_some() && v.get("messages").is_none() && v["store"] == json!(false)
+    // `stream` is always true: the upstream has no non-streaming mode.
+    v.get("input").is_some()
+        && v.get("messages").is_none()
+        && v["store"] == json!(false)
+        && v["stream"] == json!(true)
 }
 
 /// True only if the body is still in Chat Completions shape.
@@ -1260,8 +1446,26 @@ fn is_untranslated_chat_body(req: &HttpMockRequest) -> bool {
     v.get("messages").is_some() && v.get("input").is_none()
 }
 
+/// A minimal reply in the shape the real backend sends: SSE, with the output
+/// items on `response.output_item.done` and an EMPTY `output` on
+/// `response.completed`.
+const SSE_REPLY: &str = concat!(
+    "event: response.created\n",
+    r#"data: {"type":"response.created","response":{"id":"resp_1","created_at":1,"model":"gpt-5.4","status":"in_progress"}}"#,
+    "\n\n",
+    "event: response.output_text.delta\n",
+    r#"data: {"type":"response.output_text.delta","delta":"hi back"}"#,
+    "\n\n",
+    "event: response.output_item.done\n",
+    r#"data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hi back"}]}}"#,
+    "\n\n",
+    "event: response.completed\n",
+    r#"data: {"type":"response.completed","response":{"id":"resp_1","created_at":1,"model":"gpt-5.4","status":"completed","incomplete_details":null,"output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+    "\n\n",
+);
+
 #[tokio::test]
-async fn translates_request_and_response() {
+async fn translates_request_and_aggregates_the_sse_reply() {
     let upstream = MockServer::start_async().await;
     let m = upstream
         .mock_async(|when, then| {
@@ -1271,10 +1475,47 @@ async fn translates_request_and_response() {
                 .path("/responses")
                 .matches(is_translated_responses_body);
             then.status(200)
-                .header("content-type", "application/json")
-                .body(
-                    r#"{"id":"resp_1","output":[{"type":"message","content":[{"type":"output_text","text":"hi back"}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}"#,
-                );
+                .header("content-type", "text/event-stream")
+                .body(SSE_REPLY);
+        })
+        .await;
+
+    let gw = spawn_gateway(&upstream.base_url(), false).await;
+    // stream is absent, so the client wants a single JSON reply — even
+    // though the upstream can only answer with SSE.
+    let resp = post(
+        &gw,
+        "/codex/v1/chat/completions",
+        json!({"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/json",
+        "the upstream's text/event-stream must not leak to the client"
+    );
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["object"], json!("chat.completion"));
+    assert_eq!(out["model"], json!("gpt-5.4"));
+    assert_eq!(out["choices"][0]["message"]["content"], json!("hi back"));
+    assert_eq!(out["choices"][0]["finish_reason"], json!("stop"));
+    assert_eq!(out["usage"]["prompt_tokens"], json!(3));
+    m.assert_async().await;
+}
+
+#[tokio::test]
+async fn client_stream_false_still_asks_the_upstream_to_stream() {
+    let upstream = MockServer::start_async().await;
+    let m = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .matches(is_translated_responses_body);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(SSE_REPLY);
         })
         .await;
 
@@ -1282,17 +1523,14 @@ async fn translates_request_and_response() {
     let resp = post(
         &gw,
         "/codex/v1/chat/completions",
-        json!({"model": "gpt-5-codex", "messages": [{"role": "user", "content": "hi"}]}),
+        json!({"model": "gpt-5.4", "stream": false,
+               "messages": [{"role": "user", "content": "hi"}]}),
     )
     .await;
 
     assert_eq!(resp.status(), 200);
     let out: Value = resp.json().await.unwrap();
     assert_eq!(out["object"], json!("chat.completion"));
-    assert_eq!(out["model"], json!("gpt-5-codex"));
-    assert_eq!(out["choices"][0]["message"]["content"], json!("hi back"));
-    assert_eq!(out["choices"][0]["finish_reason"], json!("stop"));
-    assert_eq!(out["usage"]["prompt_tokens"], json!(3));
     m.assert_async().await;
 }
 
@@ -1364,7 +1602,11 @@ In `src/compress.rs`, replace the `Provider::Codex => false` arm at `:443`:
         Provider::Codex => codex::should_translate(path),
 ```
 
-Route it to the OpenAI rewriter at `:648`:
+(`compress.rs` imports `codex::should_translate` — add `use crate::codex;` at the top.)
+
+Route it to the OpenAI rewriter (the `Provider::Codex => None` arm at `:646`, in
+`rewrite_request_body`) — the inbound body is a Chat Completions body, which the OpenAI rewriter
+already understands:
 
 ```rust
         Provider::Codex => rewrite_tool_results_openai(&engine, min_tokens, body),
@@ -1372,8 +1614,8 @@ Route it to the OpenAI rewriter at `:648`:
 
 - [ ] **Step 4: Translate the request body**
 
-In `src/lib.rs`, immediately after the compression block (after `:330`, before the `final_body`
-binding at `:408`):
+In `src/lib.rs`, immediately after the compression block (`:337`), before the `final_body` binding
+at `:415`:
 
 ```rust
     // Stage 2: the Codex chat path arrives as Chat Completions and must
@@ -1421,12 +1663,17 @@ fn openai_error_response(status: StatusCode, message: &str) -> Response<Body> {
 }
 ```
 
-- [ ] **Step 5: Translate the response body**
+- [ ] **Step 5: Aggregate the SSE reply into a `chat.completion`**
 
-After the response-header loop (`:531-538`), before the response is returned:
+The upstream answers every request with `text/event-stream` (Global Constraints). What the *client*
+asked for decides what it gets — not the upstream's content type. This task handles
+`client_wants_stream == false`; Task 9 handles the other branch.
+
+After the header-copy loop (`:515-521`), **before** `upstream_resp.bytes_stream()` at `:532` — that
+call consumes the body, so the aggregation must read it first:
 
 ```rust
-    if translating && !is_streaming_response(&response_headers) {
+    if translating && !client_wants_stream {
         let raw = upstream_resp.bytes().await.context("read upstream body")?;
         if !status.is_success() {
             // Pass the upstream's status through, but in a shape an OpenAI
@@ -1434,15 +1681,20 @@ After the response-header loop (`:531-538`), before the response is returned:
             let msg = String::from_utf8_lossy(&raw).to_string();
             return Ok(openai_error_response(status, &msg));
         }
-        let resp_json: serde_json::Value = serde_json::from_slice(&raw)
-            // 502, not the upstream's status: the upstream answered fine and
-            // *we* failed. Conflating the two makes this very hard to trace.
-            .map_err(|e| anyhow::anyhow!("codex reply did not parse: {e}"))?;
+        let mut buf = String::from_utf8_lossy(&raw).into_owned();
+        let mut agg = translate::ResponseAggregator::new();
+        for (event, data) in translate::split_sse_frames(&mut buf) {
+            agg.push(&event, &data);
+        }
         let model = client_model.as_deref().unwrap_or("");
-        let chat = translate::responses_to_chat(&resp_json, model);
+        let chat = translate::responses_to_chat(&agg.finish(), model);
         let out = serde_json::to_vec(&chat)?;
+        // The upstream said text/event-stream; the client is getting JSON.
         response_headers.remove("content-length");
-        let mut builder = Response::builder().status(status);
+        response_headers.remove("content-type");
+        let mut builder = Response::builder()
+            .status(status)
+            .header("content-type", "application/json");
         for (name, value) in response_headers.iter() {
             builder = builder.header(name, value);
         }
@@ -1450,31 +1702,27 @@ After the response-header loop (`:531-538`), before the response is returned:
     }
 ```
 
-`client_model` is captured before translation replaces the body — add beside the `translating`
-binding:
+A stream that ends without `response.completed` needs no special case: the aggregator simply has no
+`usage` or `status`, and `responses_to_chat` defaults the token counts to zero. Whatever items did
+arrive are still returned.
+
+`client_model` and `client_wants_stream` are captured before translation replaces the body — add
+beside the `translating` binding:
 
 ```rust
-    let client_model: Option<String> = if translating {
-        serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| v.get("model").and_then(|m| m.as_str().map(str::to_string)))
+    let (client_model, client_wants_stream) = if translating {
+        let chat = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_default();
+        (
+            chat.get("model")
+                .and_then(|m| m.as_str().map(str::to_string)),
+            chat.get("stream").and_then(serde_json::Value::as_bool) == Some(true),
+        )
     } else {
-        None
+        (None, false)
     };
 ```
 
 Place this **before** the translation block, so it reads the original chat body.
-
-Add the streaming predicate beside `openai_error_response`:
-
-```rust
-fn is_streaming_response(headers: &HeaderMap) -> bool {
-    headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("text/event-stream"))
-}
-```
 
 - [ ] **Step 6: Run tests to verify they pass**
 
@@ -1576,15 +1824,18 @@ Expected: FAIL — the client receives raw Responses events, not chunks.
 
 - [ ] **Step 3: Implement**
 
-Replace the `if translating && !is_streaming_response(…)` guard from Task 8 with a two-armed branch,
-adding the streaming arm ahead of it.
+Replace the `if translating && !client_wants_stream` guard from Task 8 with a two-armed branch,
+adding the streaming arm ahead of it. The client's `stream` flag decides, because the upstream
+always streams (Global Constraints) — the branch cannot key off the response's content type.
 
 `async-stream` and `tokio::sync::mpsc` are both unavailable per the Global Constraints, so build the
 body with `futures_util::stream::unfold`. Its state is a four-tuple; each step drains one upstream
-chunk and returns every translated frame that chunk produced.
+chunk and returns every translated frame that chunk produced. Frames are split with the same
+`split_sse_frames` shape as Task 6 — inline here because this arm consumes the byte stream chunk by
+chunk, and each chunk may carry a partial frame.
 
 ```rust
-    if translating && is_streaming_response(&response_headers) {
+    if translating && client_wants_stream {
         use futures_util::StreamExt;
 
         let model = client_model.clone().unwrap_or_default();
@@ -1757,11 +2008,11 @@ async fn compression_runs_before_translation_on_the_codex_path() {
             when.method(POST)
                 .path("/responses")
                 .matches(is_translated_and_compressed);
+            // The upstream is streaming-only, and the client asked for a plain
+            // reply — the gateway aggregates (Task 8).
             then.status(200)
-                .header("content-type", "application/json")
-                .body(
-                    r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
-                );
+                .header("content-type", "text/event-stream")
+                .body(SSE_REPLY);
         })
         .await;
 

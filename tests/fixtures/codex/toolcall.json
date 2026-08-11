@@ -1,0 +1,30 @@
+{
+  "id": "resp_0a7b3374ca0af918016a7b0e291b7c81919dba76063fcaa1fe",
+  "object": "response",
+  "created_at": 1786449449,
+  "status": "completed",
+  "model": "gpt-5.4",
+  "usage": {
+    "input_tokens": 54,
+    "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 0
+    },
+    "output_tokens": 19,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 73
+  },
+  "incomplete_details": null,
+  "output": [
+    {
+      "id": "fc_0a7b3374ca0af918016a7b0e2a02748191a5f1a4365b5fe97f",
+      "type": "function_call",
+      "status": "completed",
+      "arguments": "{\"city\":\"Taipei\"}",
+      "call_id": "call_uphHcxpvlpMMt0m2ZeigzBfH",
+      "name": "get_weather"
+    }
+  ]
+}
