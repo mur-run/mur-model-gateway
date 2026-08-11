@@ -317,6 +317,130 @@ pub fn responses_to_chat(resp: &Value, model: &str) -> Value {
     })
 }
 
+/// Converts a Responses SSE stream into Chat Completions chunks.
+///
+/// Its whole state is three values: whether the opening role chunk has gone
+/// out, the next tool-call index, and which index each Responses item id was
+/// assigned.
+pub struct SseTranslator {
+    model: String,
+    role_sent: bool,
+    next_index: u64,
+    item_index: std::collections::HashMap<String, u64>,
+    saw_tool_call: bool,
+    finished: bool,
+}
+
+impl SseTranslator {
+    pub fn new(model: String) -> Self {
+        Self {
+            model,
+            role_sent: false,
+            next_index: 0,
+            item_index: std::collections::HashMap::new(),
+            saw_tool_call: false,
+            finished: false,
+        }
+    }
+
+    fn chunk(&self, delta: Value, finish_reason: Value) -> Value {
+        json!({
+            "id": "chatcmpl-codex",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        })
+    }
+
+    /// Feed one SSE event. Returns zero or more chunks to forward.
+    pub fn push(&mut self, event: &str, data: &Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        if !self.role_sent {
+            self.role_sent = true;
+            out.push(self.chunk(json!({"role": "assistant"}), Value::Null));
+        }
+
+        match event {
+            "response.output_text.delta" => {
+                if let Some(d) = data.get("delta").and_then(Value::as_str) {
+                    out.push(self.chunk(json!({"content": d}), Value::Null));
+                }
+            }
+            "response.output_item.added" => {
+                let item = data.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    self.saw_tool_call = true;
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        self.item_index.insert(id.to_string(), index);
+                    }
+                    out.push(self.chunk(
+                        json!({"tool_calls": [{
+                            "index": index,
+                            "id": item.get("call_id").cloned().unwrap_or(Value::Null),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name").cloned().unwrap_or(Value::Null),
+                                "arguments": "",
+                            },
+                        }]}),
+                        Value::Null,
+                    ));
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let index = data
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.item_index.get(id).copied())
+                    .unwrap_or(0);
+                if let Some(d) = data.get("delta").and_then(Value::as_str) {
+                    out.push(self.chunk(
+                        json!({"tool_calls": [{
+                            "index": index,
+                            "function": {"arguments": d},
+                        }]}),
+                        Value::Null,
+                    ));
+                }
+            }
+            "response.completed" => out.extend(self.finish()),
+            "response.failed" | "error" => {
+                self.finished = true;
+                out.push(json!({
+                    "error": {
+                        "message": data
+                            .pointer("/response/error/message")
+                            .or_else(|| data.get("message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("codex stream failed"),
+                        "type": "upstream_error",
+                    }
+                }));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Emit the terminal chunk. Idempotent — safe to call after
+    /// `response.completed` already triggered it.
+    pub fn finish(&mut self) -> Vec<Value> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let reason = if self.saw_tool_call {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        vec![self.chunk(json!({}), json!(reason))]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +800,90 @@ mod tests {
             responses_to_chat(&resp, "m")["choices"][0]["finish_reason"],
             json!("length")
         );
+    }
+
+    /// Split a captured SSE file into (event, data) pairs, using the same
+    /// splitter the proxy uses at runtime (Task 6).
+    fn sse_events(name: &str) -> Vec<(String, Value)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex/");
+        let mut raw = std::fs::read_to_string(format!("{path}{name}"))
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"));
+        split_sse_frames(&mut raw)
+    }
+
+    #[test]
+    fn streams_text_as_content_chunks() {
+        let mut t = SseTranslator::new("gpt-5.4".into());
+        let mut chunks = Vec::new();
+        for (event, data) in sse_events("streaming.sse") {
+            chunks.extend(t.push(&event, &data));
+        }
+        chunks.extend(t.finish());
+
+        assert!(!chunks.is_empty(), "fixture produced no chunks");
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], json!("assistant"));
+        assert_eq!(chunks[0]["object"], json!("chat.completion.chunk"));
+
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(
+            text, "1\n2\n3\n4\n5",
+            "deltas must reassemble to the captured reply"
+        );
+
+        let last = chunks.last().unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], json!("stop"));
+    }
+
+    #[test]
+    fn accumulates_split_tool_call_arguments() {
+        let mut t = SseTranslator::new("m".into());
+        let mut chunks = Vec::new();
+        for (event, data) in sse_events("toolcall-streaming.sse") {
+            chunks.extend(t.push(&event, &data));
+        }
+        chunks.extend(t.finish());
+
+        // The call is announced once, with an id and a name. The id is the
+        // item's call_id, not its own id.
+        let announced: Vec<_> = chunks
+            .iter()
+            .filter(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"].is_string())
+            .collect();
+        assert_eq!(announced.len(), 1, "the call is announced exactly once");
+        let call = &announced[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], json!("call_uphHcxpvlpMMt0m2ZeigzBfH"));
+        assert_eq!(call["function"]["name"], json!("get_weather"));
+
+        // The capture splits the arguments across six deltas; they must
+        // reassemble byte for byte.
+        let args: String = chunks
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert_eq!(args, "{\"city\":\"Taipei\"}");
+
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            json!("tool_calls")
+        );
+    }
+
+    #[test]
+    fn role_chunk_is_emitted_only_once() {
+        let mut t = SseTranslator::new("m".into());
+        let mut chunks = Vec::new();
+        for _ in 0..3 {
+            chunks.extend(t.push("response.output_text.delta", &json!({"delta": "x"})));
+        }
+        let roles = chunks
+            .iter()
+            .filter(|c| c["choices"][0]["delta"]["role"].is_string())
+            .count();
+        assert_eq!(roles, 1);
     }
 }
