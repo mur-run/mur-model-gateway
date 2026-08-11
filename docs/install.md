@@ -2,7 +2,7 @@
 
 `mur-model-gateway install` writes the platform-appropriate service definition and bakes the
 configuration into environment variables. The runtime reads environment variables only
-(`MUR_MODEL_GATEWAY_TOKEN_SOURCE` / `MUR_MODEL_GATEWAY_BIND` / `MUR_MODEL_GATEWAY_UPSTREAM*` /
+(`MUR_MODEL_GATEWAY_TOKEN_SOURCE*` / `MUR_MODEL_GATEWAY_BIND` / `MUR_MODEL_GATEWAY_UPSTREAM*` /
 `MUR_MODEL_GATEWAY_COMPRESS`) — there is no config file.
 
 ## Quick start
@@ -25,6 +25,7 @@ Arguments after `--` are passed through to `mur-model-gateway install` verbatim:
 | Flag | Effect |
 |------|--------|
 | `--token-source <spec>` | Bakes in `MUR_MODEL_GATEWAY_TOKEN_SOURCE` (see below) |
+| `--token-source-codex <spec>` | Bakes in `MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX` — credential source for the `/v1/responses` route (see below) |
 | `--bind <addr>` | Bakes in `MUR_MODEL_GATEWAY_BIND` (default `127.0.0.1:8088`) |
 | `--upstream <url>` | Bakes in `MUR_MODEL_GATEWAY_UPSTREAM` |
 | `--compress` / `--no-compress` | Toggles `MUR_MODEL_GATEWAY_COMPRESS=1` (with neither flag, the environment is sniffed) |
@@ -45,6 +46,22 @@ so `install` rejects them up front.
 
 The token is always re-read per request, so a background refresh by Claude Code takes effect
 automatically.
+
+## Codex token source (`--token-source-codex`)
+
+| spec | Behaviour |
+|------|-----------|
+| `codex` (default) | Reads `~/.codex/auth.json`, the file `codex login` writes |
+| `env:VAR` | Reads the token from environment variable `VAR` on every request |
+| `off` / `disabled` | Pure passthrough on `/v1/responses`, no disguise |
+
+This governs only the `/v1/responses` route — `--token-source` above still governs
+Anthropic/OpenAI/Gemini. `codex` is already the runtime default with no flag needed; a rotated
+access token is written back to `~/.codex/auth.json` automatically when the upstream refreshes it.
+
+**No MUR agent can reach `/v1/responses` yet.** MUR's OpenAI client only speaks Chat Completions,
+not the Responses API, so this route is reachable today only by a client that already speaks the
+Responses API directly (`curl`, the Codex CLI itself).
 
 ## Per platform
 

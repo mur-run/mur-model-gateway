@@ -1,8 +1,8 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use mur_model_gateway::{
-    AppState, DEFAULT_BIND, DEFAULT_UPSTREAM_ANTHROPIC, DEFAULT_UPSTREAM_GEMINI,
-    DEFAULT_UPSTREAM_OPENAI, TokenSource, build_router, install,
+    AppState, DEFAULT_BIND, DEFAULT_UPSTREAM_ANTHROPIC, DEFAULT_UPSTREAM_CODEX,
+    DEFAULT_UPSTREAM_GEMINI, DEFAULT_UPSTREAM_OPENAI, TokenSource, build_router, install,
 };
 use std::net::SocketAddr;
 
@@ -33,6 +33,11 @@ enum Command {
         /// (keychain | off | env:VAR | file | file:/path/to/credentials.json).
         #[arg(long)]
         token_source: Option<String>,
+        /// Bake MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX into the service — credential
+        /// source for the `/v1/responses` route (codex | off | env:VAR). Defaults
+        /// to `codex` (reads `~/.codex/auth.json`) at runtime when unset.
+        #[arg(long)]
+        token_source_codex: Option<String>,
         /// Bake MUR_MODEL_GATEWAY_BIND into the service (e.g. 127.0.0.1:9099).
         #[arg(long)]
         bind: Option<String>,
@@ -62,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
             compress,
             no_compress,
             token_source,
+            token_source_codex,
             bind,
             upstream,
             system,
@@ -70,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
                 // Fail at install time, not first service start.
                 parse_token_source(spec)
                     .with_context(|| format!("invalid --token-source {spec}"))?;
+            }
+            if let Some(spec) = &token_source_codex {
+                parse_token_source(spec)
+                    .with_context(|| format!("invalid --token-source-codex {spec}"))?;
             }
             install::install(install::InstallOpts {
                 compress: if compress {
@@ -80,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
                     None // fall back to MUR_MODEL_GATEWAY_COMPRESS env sniff
                 },
                 token_source,
+                token_source_codex,
                 bind,
                 upstream,
                 system,
@@ -113,6 +124,8 @@ async fn serve() -> anyhow::Result<()> {
         resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_OPENAI", DEFAULT_UPSTREAM_OPENAI);
     let upstream_gemini =
         resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_GEMINI", DEFAULT_UPSTREAM_GEMINI);
+    let upstream_codex =
+        resolve_upstream("MUR_MODEL_GATEWAY_UPSTREAM_CODEX", DEFAULT_UPSTREAM_CODEX);
 
     let token_source = parse_token_source(
         &std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE").unwrap_or_else(|_| "keychain".to_string()),
@@ -129,7 +142,8 @@ async fn serve() -> anyhow::Result<()> {
     // `token_source_codex` to `Disabled`. This explicit call is what wires
     // an unconfigured gateway to the user's real `~/.codex/auth.json` —
     // production-only, deliberately not part of the constructor itself.
-    .with_default_codex_source();
+    .with_default_codex_source()
+    .with_upstream_codex(&upstream_codex);
     if let Ok(spec) = std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX") {
         state.token_source_codex =
             parse_token_source(&spec).context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX")?;
@@ -144,6 +158,7 @@ async fn serve() -> anyhow::Result<()> {
         upstream_anthropic = %upstream_anthropic,
         upstream_openai = %upstream_openai,
         upstream_gemini = %upstream_gemini,
+        upstream_codex = %upstream_codex,
         "mur-model-gateway listening"
     );
 

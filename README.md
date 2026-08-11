@@ -1,5 +1,7 @@
 # mur-model-gateway
 
+[中文說明](README-tw.md)
+
 Local LLM API gateway for the [MUR](https://github.com/mur-run/mur) agent platform.
 It lets your MUR agents (and any other local tool) call **Anthropic, OpenAI, and
 Gemini** through one local endpoint — also provide compress feature.
@@ -12,12 +14,14 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
 
 ## Why
 
-- **Sublet your subscriptions.** Requests that arrive without auth get the right
-  credentials attached from the OS keychain (e.g. the OAuth token Claude Code
-  stores), so agents share the plan you already pay for.
+- **Sublet your subscriptions.** Requests that arrive without auth get the
+  right credentials attached — Claude Code's OAuth token from the OS
+  keychain on `/v1/messages`, or the one Codex CLI stores at
+  `~/.codex/auth.json` on `/v1/responses` — so agents share the plan you
+  already pay for.
 - **One outlet.** Point every tool at `127.0.0.1:8088`; the gateway routes by
   path — `/v1/messages*` → Anthropic, `/v1/chat/completions*` / `/v1/embeddings*`
-  → OpenAI, `/v1beta/models/*` → Gemini.
+  → OpenAI, `/v1beta/models/*` → Gemini, `/v1/responses*` → Codex.
 - **Optional wire compression.** `MUR_MODEL_GATEWAY_COMPRESS=1` applies MUR's
   CCR compression to `tool_result` blocks on all three providers.
 - **Cheap to leave running.** One static Rust binary, ~40 MB resident with
@@ -75,15 +79,24 @@ Agents using that alias now ride your Claude Code login. Because the released
 binary is signed with a stable Developer ID, macOS asks for keychain access
 **once** — "Always Allow" survives every update.
 
+**MUR agents cannot use the Codex route yet.** `/v1/responses` speaks OpenAI's
+Responses API, but MUR's own OpenAI client only speaks Chat Completions
+(`POST $base_url/chat/completions`) — it has no Responses-API client. Until a
+translation layer ships (a future stage), `/v1/responses` is reachable only by
+a client that already speaks the Responses API directly (`curl`, the Codex CLI
+itself) — not by pointing a MUR model registry entry at it.
+
 ## Configuration
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `MUR_MODEL_GATEWAY_BIND` | `127.0.0.1:8088` | Listen address |
 | `MUR_MODEL_GATEWAY_TOKEN_SOURCE` | `keychain` | `keychain`, `off`, `env:<VAR>`, `file`, or `file:<path>` |
+| `MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX` | `codex` | Credential source for `/v1/responses` — `codex`, `off`, `env:<VAR>` |
 | `MUR_MODEL_GATEWAY_UPSTREAM_ANTHROPIC` | `https://api.anthropic.com` | Anthropic upstream |
 | `MUR_MODEL_GATEWAY_UPSTREAM_OPENAI` | `https://api.openai.com` | OpenAI upstream |
 | `MUR_MODEL_GATEWAY_UPSTREAM_GEMINI` | `https://generativelanguage.googleapis.com` | Gemini upstream |
+| `MUR_MODEL_GATEWAY_UPSTREAM_CODEX` | `https://chatgpt.com/backend-api/codex` | Codex upstream |
 | `MUR_MODEL_GATEWAY_COMPRESS` | off | `1` enables tool_result compression |
 
 ## Resource usage and sizing

@@ -1,7 +1,7 @@
 # mur-model-gateway 安裝指南
 
 `mur-model-gateway install` 會寫出平台對應的 service 描述檔，並把設定烘進環境變數。
-Runtime 只讀環境變數（`MUR_MODEL_GATEWAY_TOKEN_SOURCE` / `MUR_MODEL_GATEWAY_BIND` / `MUR_MODEL_GATEWAY_UPSTREAM*` /
+Runtime 只讀環境變數（`MUR_MODEL_GATEWAY_TOKEN_SOURCE*` / `MUR_MODEL_GATEWAY_BIND` / `MUR_MODEL_GATEWAY_UPSTREAM*` /
 `MUR_MODEL_GATEWAY_COMPRESS`），沒有 config 檔。
 
 ## 快速開始
@@ -24,6 +24,7 @@ Runtime 只讀環境變數（`MUR_MODEL_GATEWAY_TOKEN_SOURCE` / `MUR_MODEL_GATEW
 | 旗標 | 效果 |
 |------|------|
 | `--token-source <spec>` | 烘入 `MUR_MODEL_GATEWAY_TOKEN_SOURCE`（見下） |
+| `--token-source-codex <spec>` | 烘入 `MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX` — `/v1/responses` 路由的憑證來源（見下） |
 | `--bind <addr>` | 烘入 `MUR_MODEL_GATEWAY_BIND`（預設 `127.0.0.1:8088`） |
 | `--upstream <url>` | 烘入 `MUR_MODEL_GATEWAY_UPSTREAM` |
 | `--compress` / `--no-compress` | `MUR_MODEL_GATEWAY_COMPRESS=1` 開關（無旗標時嗅探環境變數） |
@@ -42,6 +43,22 @@ Runtime 只讀環境變數（`MUR_MODEL_GATEWAY_TOKEN_SOURCE` / `MUR_MODEL_GATEW
 | `off` / `disabled` | 純 passthrough，不做 disguise |
 
 Token 一律每請求重讀，Claude Code 背景刷新後自動生效。
+
+## Codex token 來源（`--token-source-codex`）
+
+| spec | 行為 |
+|------|------|
+| `codex`（預設） | 讀 `~/.codex/auth.json`，`codex login` 寫的那個檔 |
+| `env:VAR` | 每次請求從環境變數 `VAR` 讀 token |
+| `off` / `disabled` | `/v1/responses` 純 passthrough，不做 disguise |
+
+這只管 `/v1/responses` 路由 — 上面的 `--token-source` 仍然管 Anthropic/OpenAI/Gemini。
+`codex` 本來就是 runtime 預設值，不用加旗標；上游刷新 token 後，新的 access token
+會自動寫回 `~/.codex/auth.json`。
+
+**目前沒有 MUR agent 能碰到 `/v1/responses`。** MUR 的 OpenAI client 只會講 Chat
+Completions，不會講 Responses API，所以現在這條路由只有本來就講 Responses API
+的 client（例如 `curl`、Codex CLI 本身）能用。
 
 ## 各平台
 

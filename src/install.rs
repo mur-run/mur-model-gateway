@@ -28,6 +28,9 @@ pub struct InstallOpts {
     pub compress: Option<bool>,
     /// MUR_MODEL_GATEWAY_TOKEN_SOURCE to bake in (already validated by the caller).
     pub token_source: Option<String>,
+    /// MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX to bake in (already validated by the
+    /// caller) — credential source for the `/v1/responses` route.
+    pub token_source_codex: Option<String>,
     /// MUR_MODEL_GATEWAY_BIND to bake in.
     pub bind: Option<String>,
     /// MUR_MODEL_GATEWAY_UPSTREAM to bake in.
@@ -107,6 +110,10 @@ pub fn env_pairs(opts: &InstallOpts, compress: bool) -> Result<Vec<(String, Stri
     }
     for (key, val) in [
         ("MUR_MODEL_GATEWAY_TOKEN_SOURCE", &opts.token_source),
+        (
+            "MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX",
+            &opts.token_source_codex,
+        ),
         ("MUR_MODEL_GATEWAY_BIND", &opts.bind),
         ("MUR_MODEL_GATEWAY_UPSTREAM", &opts.upstream),
     ] {
@@ -523,6 +530,21 @@ mod tests {
             &env,
         );
         assert!(c.contains("set MUR_MODEL_GATEWAY_COMPRESS=1"));
+    }
+
+    #[test]
+    fn codex_token_source_is_baked_into_the_descriptor() {
+        // Struct-update syntax (not `let mut opts = default(); opts.field = ..;`) —
+        // the latter trips clippy::field_reassign_with_default.
+        let opts = InstallOpts {
+            token_source_codex: Some("codex".to_string()),
+            ..Default::default()
+        };
+        let env = env_pairs(&opts, false).unwrap();
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX" && v == "codex")
+        );
     }
 
     #[test]
