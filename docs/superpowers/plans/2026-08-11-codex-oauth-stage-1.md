@@ -917,7 +917,11 @@ tracked `src/codex.rs`:
 /// What an OAuth refresh grant returns. `refresh_token` is `Some` when the
 /// provider rotates it — ChatGPT does, so it must be persisted or the next
 /// refresh fails.
-#[derive(Clone, Debug)]
+///
+/// No `#[derive(Debug)]`: these are raw credentials, and a derived Debug puts
+/// them in any `{:?}`, tracing capture, or panic message. Hand-write a
+/// redacting impl if one is needed, as `CodexAuth` does.
+#[derive(Clone)]
 pub struct RefreshedTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
