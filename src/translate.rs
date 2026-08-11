@@ -46,11 +46,35 @@ pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
         let text = msg.get("content").and_then(Value::as_str).unwrap_or("");
         match role {
             "system" | "developer" => instructions.push(text.to_string()),
-            "assistant" => input.push(json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
+            "tool" => input.push(json!({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                "output": text,
             })),
+            "assistant" => {
+                // Content and tool_calls can both be present. Emit the
+                // message first, then each call, matching production order.
+                if !text.is_empty() {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    }));
+                }
+                for call in msg
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty)
+                {
+                    let f = call.get("function").unwrap_or(&Value::Null);
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": call.get("id").cloned().unwrap_or(Value::Null),
+                        "name": f.get("name").cloned().unwrap_or(Value::Null),
+                        "arguments": f.get("arguments").cloned().unwrap_or(json!("")),
+                    }));
+                }
+            }
             _ => input.push(json!({
                 "type": "message",
                 "role": "user",
@@ -74,6 +98,22 @@ pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
         if let Some(v) = chat.get(name) {
             out.insert(name.into(), v.clone());
         }
+    }
+
+    if let Some(tools) = chat.get("tools").and_then(Value::as_array) {
+        let flattened: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                let f = t.get("function").unwrap_or(t);
+                json!({
+                    "type": "function",
+                    "name": f.get("name").cloned().unwrap_or(Value::Null),
+                    "description": f.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": f.get("parameters").cloned().unwrap_or(json!({})),
+                })
+            })
+            .collect();
+        out.insert("tools".into(), Value::Array(flattened));
     }
 
     Ok(Value::Object(out))
@@ -181,5 +221,76 @@ mod tests {
             chat_to_responses(&json!([1, 2, 3])),
             Err(TranslateError::NotAnObject)
         ));
+    }
+
+    #[test]
+    fn flattens_tool_definitions() {
+        let chat = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+        let out = chat_to_responses(&chat).unwrap();
+        let tool = &out["tools"][0];
+        // Responses puts name/description/parameters at the top level;
+        // Chat Completions nests them under "function".
+        assert_eq!(tool["type"], json!("function"));
+        assert_eq!(tool["name"], json!("get_weather"));
+        assert_eq!(tool["description"], json!("Get weather"));
+        assert_eq!(tool["parameters"]["type"], json!("object"));
+        assert!(tool.get("function").is_none(), "the nesting is removed");
+    }
+
+    #[test]
+    fn maps_tool_call_round_trip() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Taipei\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_abc", "content": "22C"}
+            ]
+        });
+        let input = chat_to_responses(&chat).unwrap();
+        let input = input["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["type"], json!("function_call"));
+        assert_eq!(input[1]["call_id"], json!("call_abc"));
+        assert_eq!(input[1]["name"], json!("get_weather"));
+        assert_eq!(input[1]["arguments"], json!("{\"city\":\"Taipei\"}"));
+        assert_eq!(input[2]["type"], json!("function_call_output"));
+        assert_eq!(input[2]["call_id"], json!("call_abc"));
+        assert_eq!(input[2]["output"], json!("22C"));
+    }
+
+    #[test]
+    fn assistant_with_content_and_tool_calls_becomes_two_items() {
+        // Spec decision: message first, then the call, in the order the
+        // model produced them.
+        let chat = json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "checking", "tool_calls": [{
+                "id": "call_1",
+                "function": {"name": "f", "arguments": "{}"}
+            }]}]
+        });
+        let out = chat_to_responses(&chat).unwrap();
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], json!("message"));
+        assert_eq!(input[0]["content"][0]["text"], json!("checking"));
+        assert_eq!(input[1]["type"], json!("function_call"));
     }
 }
