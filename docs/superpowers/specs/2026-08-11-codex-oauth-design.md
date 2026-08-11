@@ -25,7 +25,7 @@ with the user's Codex credentials attached, refreshed automatically when they ex
 | Question | Decision |
 |---|---|
 | What the credentials enable | A new ChatGPT/Codex provider path, on top of per-provider token sources |
-| Expired access tokens | Refresh in memory on 401; never write back to `auth.json` |
+| Expired access tokens | Refresh on 401 and write the rotated tokens back to `auth.json` atomically — see Revision below |
 | Routing | Staged — `/v1/responses*` passthrough first; Chat Completions translation is a separate spec |
 | Codex client headers | Hidden behind a build.rs cfg, mirroring the Anthropic disguise |
 
@@ -70,8 +70,30 @@ reusing the TTL cache helper already at `src/keychain.rs:60` rather than adding 
 mechanism.
 
 On a 401 from the ChatGPT backend: refresh once against the OAuth token endpoint using
-`refresh_token`, retry the request exactly once, and keep the new access token in memory. One retry,
-never a loop. `~/.codex/auth.json` is never written — Codex CLI owns that file, and two writers race.
+`refresh_token`, retry the request exactly once, and persist the rotated credentials. One retry,
+never a loop.
+
+## Revision 2026-08-11: refresh tokens rotate
+
+The original decision was to refresh in memory and never write `~/.codex/auth.json`, on the
+reasoning that Codex CLI owns that file and two writers race. Executing the plan's Task 2 gate
+against the live endpoint disproved it: the grant returns **a new `refresh_token` that differs from
+the stored one**. Rotation means the design worked exactly once — the gateway would spend the
+stored token, discard its replacement, and leave both itself and Codex CLI holding a dead
+credential.
+
+With rotating tokens only one process can own the refresh loop. Either Codex CLI owns it and the
+gateway never refreshes (rejected: this machine's `last_refresh` was a month stale, so nothing would
+keep the token warm), or the gateway owns it and must persist what it receives. The latter is now
+the design.
+
+The write race that motivated the original decision is mitigated, not eliminated: write to a
+temporary file in the same directory and `rename(2)` it over `auth.json`, which is atomic on POSIX,
+so a concurrent reader sees either the old file or the new one and never a torn one. Preserve every
+field of the original JSON, replacing only `tokens.access_token`, `tokens.refresh_token`, and
+`last_refresh` — Codex CLI reads keys this gateway does not model. Two processes refreshing
+simultaneously can still leave one holding a retired token; that resolves on the next `codex login`
+and is accepted.
 
 ### Hidden implementation
 

@@ -16,7 +16,7 @@
 - CI gate on ubuntu-latest, macos-14, windows-latest: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`. All three must pass before any task is done.
 - **Every `#[cfg(...)]`-gated `mod x;` declaration MUST carry `#[rustfmt::skip]`.** rustfmt resolves `mod` declarations syntactically and ignores `cfg`, so without it `cargo fmt --check` fails on any clean checkout. This broke CI for a month; fixed in `53c3b08`.
 - Codex OAuth client id, token endpoint, and client header values NEVER appear in tracked source, in commit messages, or in test fixtures. They live only in gitignored `src/codex/codex_impl.rs`.
-- Never write to `~/.codex/auth.json`. Codex CLI owns that file.
+- **Writes to `~/.codex/auth.json` go through a temp file in the same directory plus `rename(2)`.** Never a partial in-place write — Codex CLI reads that file concurrently. Preserve all original JSON fields; replace only `tokens.access_token`, `tokens.refresh_token`, `last_refresh`.
 - Compression stays off for `Provider::Codex` in this stage.
 - Test fixtures use obviously fake tokens (`fake-access-token`, `fake-refresh-token`).
 
@@ -804,7 +804,12 @@ git commit -m "feat(codex): attach Codex credentials on the responses route"
 
 ---
 
-### Task 7: Refresh on 401 and retry once
+### Task 7: Refresh on 401, persist rotation, retry once
+
+**Revised 2026-08-11 after the Task 2 gate.** The gate proved refresh tokens rotate: the grant
+returns a new `refresh_token` differing from the stored one. In-memory-only refresh therefore works
+exactly once and then strands both the gateway and Codex CLI on a dead credential. The rotated pair
+must be persisted. See the spec's "Revision 2026-08-11" section.
 
 **Files:**
 - Modify: `src/lib.rs` (response handling after the upstream call, around line 346), `src/codex.rs`
@@ -901,20 +906,41 @@ pub fn reset_refresh_cache() {
 Run: `cargo test --test codex expired_token_triggers_one_refresh_and_retry`
 Expected: FAIL — the 401 is returned to the caller, no retry.
 
-- [ ] **Step 3: Implement the cached refresh**
+- [ ] **Step 3: Implement the refresh with persistence**
 
-In `src/codex.rs`:
+The hidden `refresh_access_token` must now return the rotated pair, not just the access token.
+Change its return type in **both** places — the stub in `src/codex.rs` (committed in Task 1) and the
+real impl in the gitignored `src/codex/codex_impl.rs` (Task 2) — and add the shared struct to
+tracked `src/codex.rs`:
 
 ```rust
+/// What an OAuth refresh grant returns. `refresh_token` is `Some` when the
+/// provider rotates it — ChatGPT does, so it must be persisted or the next
+/// refresh fails.
+#[derive(Clone, Debug)]
+pub struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
+```
+
+Stub becomes `pub fn refresh_access_token(_rt: &str) -> anyhow::Result<RefreshedTokens>` and still
+bails. The real impl parses both fields out of the grant response.
+
+Then in `src/codex.rs`:
+
+```rust
+use anyhow::Context;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-/// Access token refreshed in memory. `~/.codex/auth.json` is never written —
-/// Codex CLI owns that file and two writers race.
+/// Most recent refresh, memoised so a burst of 401s triggers one grant.
 static REFRESHED: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
 
-/// A usable access token, refreshing via `refresh_token` if the stored one was
-/// rejected. Memoised for `keychain::CACHE_TTL`.
+/// A usable access token, refreshing when the stored one was rejected. The
+/// grant rotates the refresh token, so the new pair is persisted — discarding
+/// it strands both this gateway and Codex CLI on a dead credential.
+/// Memoised for `keychain::CACHE_TTL`.
 pub fn refreshed_access_token(path: &Path) -> Option<String> {
     let cell = REFRESHED.get_or_init(|| Mutex::new(None));
     let mut slot = cell.lock().unwrap();
@@ -925,9 +951,14 @@ pub fn refreshed_access_token(path: &Path) -> Option<String> {
     }
     let rt = read_auth(path)?.refresh_token?;
     match refresh_access_token(&rt) {
-        Ok(tok) => {
-            *slot = Some((Instant::now(), tok.clone()));
-            Some(tok)
+        Ok(new) => {
+            if let Err(e) = persist_rotation(path, &new) {
+                // The access token still serves this request, but a lost
+                // rotation means the next refresh fails. Warn loudly.
+                tracing::warn!(error = %e, "codex token rotation not persisted");
+            }
+            *slot = Some((Instant::now(), new.access_token.clone()));
+            Some(new.access_token)
         }
         Err(e) => {
             tracing::warn!(error = %e, "codex token refresh failed");
@@ -935,6 +966,73 @@ pub fn refreshed_access_token(path: &Path) -> Option<String> {
         }
     }
 }
+
+/// Replace only the rotated fields, atomically. Codex CLI reads keys this
+/// gateway does not model, so the rest of the document is preserved verbatim.
+/// `last_refresh` is deliberately left alone — it is Codex CLI's bookkeeping,
+/// and updating it would need a date dependency this crate does not have.
+fn persist_rotation(path: &Path, new: &RefreshedTokens) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)?;
+    let tokens = doc
+        .get_mut("tokens")
+        .context("auth.json has no tokens object")?;
+    tokens["access_token"] = serde_json::Value::String(new.access_token.clone());
+    if let Some(rt) = &new.refresh_token {
+        tokens["refresh_token"] = serde_json::Value::String(rt.clone());
+    }
+
+    // Temp file in the SAME directory, so the rename stays on one filesystem —
+    // that is what makes it atomic. A concurrent reader sees the old file or
+    // the new one, never a torn one.
+    let dir = path.parent().context("auth.json has no parent dir")?;
+    let tmp = dir.join(".auth.json.mmg-tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+```
+
+Add a unit test proving persistence keeps unmodelled fields:
+
+```rust
+    #[test]
+    fn persist_rotation_preserves_unmodelled_fields() {
+        let dir = std::env::temp_dir().join("mmg-codex-persist");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("auth.json");
+        std::fs::write(
+            &p,
+            r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"some_future_key":42,
+                "tokens":{"id_token":"fake-id","access_token":"old-a","refresh_token":"old-r","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        persist_rotation(
+            &p,
+            &RefreshedTokens {
+                access_token: "new-a".into(),
+                refresh_token: Some("new-r".into()),
+            },
+        )
+        .unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["tokens"]["access_token"], "new-a");
+        assert_eq!(v["tokens"]["refresh_token"], "new-r");
+        // Untouched fields survive — Codex CLI depends on them.
+        assert_eq!(v["tokens"]["id_token"], "fake-id");
+        assert_eq!(v["tokens"]["account_id"], "acct");
+        assert_eq!(v["some_future_key"], 42);
+        assert_eq!(v["auth_mode"], "chatgpt");
+        std::fs::remove_file(&p).ok();
+    }
 ```
 
 - [ ] **Step 4: Implement the retry**
@@ -1071,7 +1169,18 @@ Add the Codex route to the "One outlet" bullet in both READMEs: `/v1/responses*`
 
 State plainly in both READMEs that MUR agents cannot use the Codex route yet: MUR's OpenAI client only speaks `/chat/completions`, so this is reachable only by a client that speaks the Responses API until stage 2 ships.
 
-- [ ] **Step 6: Full gate**
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/install.rs src/main.rs README.md README-tw.md docs/install.md docs/install-tw.md
+git commit -m "feat(codex): install flag, env vars, and documentation"
+```
+
+- [ ] **Step 7: Full gate, after the commit**
+
+Order matters: `git archive HEAD` only sees committed content, so running it
+before the commit verifies stale HEAD and passes for the wrong reason. Task 1
+hit exactly this.
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
@@ -1079,14 +1188,7 @@ R=$(mktemp -d) && git archive HEAD | tar -x -C "$R" && cd "$R" \
   && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-Expected: both pass. The second proves the public build compiles with the Codex stubs and that fmt does not trip over the gitignored module.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/install.rs src/main.rs README.md README-tw.md docs/install.md docs/install-tw.md
-git commit -m "feat(codex): install flag, env vars, and documentation"
-```
+Expected: both pass. The second proves the public build compiles with the Codex stubs and that fmt does not trip over the gitignored module. Confirm the clean-tree run reports the same test count as the working-tree run — a lower count means it verified an older commit.
 
 ---
 
