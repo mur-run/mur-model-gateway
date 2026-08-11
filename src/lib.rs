@@ -133,8 +133,11 @@ pub enum TokenSource {
     /// file (Linux/Windows installs write `~/.claude/.credentials.json`
     /// instead of the OS keychain). Re-read on every request.
     CredentialsFile(std::path::PathBuf),
-    /// Read `tokens.access_token` from a Codex credentials JSON file
-    /// (`~/.codex/auth.json`). Re-read on every request.
+    /// Read `~/.codex/auth.json` and dispatch on `auth_mode`. Re-read on
+    /// every request. Yields the OAuth access token in `chatgpt` mode;
+    /// yields nothing in `apikey` mode, since this generic resolver feeds
+    /// the Anthropic disguise path and an OpenAI API key must never be
+    /// offered there.
     Codex(std::path::PathBuf),
     /// Always return this token. Used by integration tests.
     Static(Arc<String>),
@@ -165,9 +168,14 @@ impl TokenSource {
                 }
             }
             TokenSource::CredentialsFile(path) => keychain::read_credentials_file(path),
-            TokenSource::Codex(path) => {
-                Ok(codex::read_credential(path).map(|c| c.bearer().to_string()))
-            }
+            TokenSource::Codex(path) => Ok(codex::read_credential(path).and_then(|c| match c {
+                // This generic resolver also feeds the Anthropic disguise
+                // path (global `MUR_MODEL_GATEWAY_TOKEN_SOURCE=codex`); an
+                // OpenAI API key must never be offered as an Anthropic
+                // credential, so ApiKey mode resolves to no token here.
+                codex::CodexCredential::OAuth { access_token, .. } => Some(access_token),
+                codex::CodexCredential::ApiKey { .. } => None,
+            })),
             TokenSource::EnvVar(name) => Ok(std::env::var(name).ok()),
             TokenSource::Static(s) => Ok(Some(s.as_ref().clone())),
             TokenSource::Disabled => Ok(None),
@@ -344,7 +352,16 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     let codex_cred: Option<codex::CodexCredential> =
         if provider == Provider::Codex && !has_client_credential(&parts.headers) {
             match state.token_source_for(Provider::Codex) {
-                TokenSource::Codex(path) => codex::read_credential(path),
+                TokenSource::Codex(path) => {
+                    let cred = codex::read_credential(path);
+                    if cred.is_none() {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "codex credential file unreadable or invalid, passing through"
+                        );
+                    }
+                    cred
+                }
                 other => match other.resolve() {
                     Ok(Some(tok)) => Some(codex::CodexCredential::OAuth {
                         access_token: tok,
@@ -895,13 +912,16 @@ mod tests {
         .unwrap();
         let ts = TokenSource::Codex(p.clone());
         assert_eq!(ts.resolve().unwrap().as_deref(), Some("fake-access-token"));
-        // API-key mode resolves to the key, not an OAuth access token.
+        // API-key mode must resolve to no token: this generic resolver also
+        // feeds the Anthropic disguise path (global
+        // MUR_MODEL_GATEWAY_TOKEN_SOURCE=codex), and an OpenAI API key must
+        // never be sent to api.anthropic.com as a Claude credential.
         std::fs::write(
             &p,
             r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake","tokens":null}"#,
         )
         .unwrap();
-        assert_eq!(ts.resolve().unwrap().as_deref(), Some("sk-fake"));
+        assert_eq!(ts.resolve().unwrap(), None);
         std::fs::remove_file(&p).ok();
     }
 
