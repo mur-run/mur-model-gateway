@@ -72,9 +72,11 @@ start_service() {
 
 is_listening() {
   if command -v lsof >/dev/null 2>&1; then
-    lsof -nP "-iTCP:$BIND_PORT" -sTCP:LISTEN 2>/dev/null | grep -q mur-model-gateway
+    # +c 0: without it lsof truncates COMMAND to 9 chars ("mur-model")
+    lsof +c 0 -nP "-iTCP:$BIND_PORT" -sTCP:LISTEN 2>/dev/null | grep -q mur-model-gateway
   elif command -v ss >/dev/null 2>&1; then
-    ss -tlnp 2>/dev/null | grep -q ":$BIND_PORT.*mur-model-gateway"
+    # ss reports /proc/comm, which the kernel caps at 15 chars
+    ss -tlnp 2>/dev/null | grep -q ":$BIND_PORT.*mur-model-gatew"
   else
     (echo >"/dev/tcp/127.0.0.1/$BIND_PORT") 2>/dev/null
   fi
@@ -218,9 +220,8 @@ fi
 log "starting service"
 start_service
 
-# settle: give systemd/launchd time to bring the listener up.
-# 15s, not 5: a freshly codesigned binary pays Gatekeeper verification on first launch.
-for _ in $(seq 15); do
+# settle: give systemd/launchd up to 5s to bring the listener up
+for _ in 1 2 3 4 5; do
   is_listening && break
   sleep 1
 done
