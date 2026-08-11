@@ -21,7 +21,10 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
   already pay for.
 - **One outlet.** Point every tool at `127.0.0.1:8088`; the gateway routes by
   path — `/v1/messages*` → Anthropic, `/v1/chat/completions*` / `/v1/embeddings*`
-  → OpenAI, `/v1beta/models/*` → Gemini, `/v1/responses*` → Codex.
+  → OpenAI, `/v1beta/models/*` → Gemini, `/v1/responses*` → Codex,
+  `/codex/v1/chat/completions` → ChatGPT Codex (translated — Chat Completions
+  in, Responses upstream; point an OpenAI client here to use a ChatGPT
+  subscription).
 - **Optional wire compression.** `MUR_MODEL_GATEWAY_COMPRESS=1` applies MUR's
   CCR compression to `tool_result` blocks on all three providers.
 - **Cheap to leave running.** One static Rust binary, ~40 MB resident with
@@ -79,12 +82,13 @@ Agents using that alias now ride your Claude Code login. Because the released
 binary is signed with a stable Developer ID, macOS asks for keychain access
 **once** — "Always Allow" survives every update.
 
-**MUR agents cannot use the Codex route yet.** `/v1/responses` speaks OpenAI's
-Responses API, but MUR's own OpenAI client only speaks Chat Completions
-(`POST $base_url/chat/completions`) — it has no Responses-API client. Until a
-translation layer ships (a future stage), `/v1/responses` is reachable only by
-a client that already speaks the Responses API directly (`curl`, the Codex CLI
-itself) — not by pointing a MUR model registry entry at it.
+**MUR agents can use Codex through the translated route.** A translation layer
+now lets MUR's Chat-Completions-only OpenAI client reach a ChatGPT subscription:
+point a model registry entry at
+`POST http://127.0.0.1:8088/codex/v1/chat/completions`, and the gateway
+translates to the Responses API upstream. The raw `/v1/responses` endpoint
+remains for clients that already speak the Responses API directly (`curl`, the
+Codex CLI itself).
 
 ## Configuration
 

@@ -20,7 +20,9 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
   讓 agent 共用你已經付費的方案。
 - **單一出口。** 所有工具都指向 `127.0.0.1:8088`，gateway 依路徑分流 —
   `/v1/messages*` → Anthropic、`/v1/chat/completions*` / `/v1/embeddings*`
-  → OpenAI、`/v1beta/models/*` → Gemini、`/v1/responses*` → Codex。
+  → OpenAI、`/v1beta/models/*` → Gemini、`/v1/responses*` → Codex、
+  `/codex/v1/chat/completions` → ChatGPT Codex（轉譯 — Chat Completions 進、
+  Responses 上游；想把 OpenAI client 指過來用 ChatGPT 訂閱就指向這裡）。
 - **可選的 wire 壓縮。** `MUR_MODEL_GATEWAY_COMPRESS=1` 會對三家供應商的
   `tool_result` 區塊套用 MUR 的 CCR 壓縮。
 - **開著不心疼。** 單一靜態 Rust binary，關閉壓縮時常駐約 40 MB —
@@ -75,12 +77,11 @@ models:
 Developer ID 簽章，macOS 只會問**一次** keychain 存取 —「總是允許」在每次更新後
 都還有效。
 
-**MUR agent 現在還不能用 Codex 路由。** `/v1/responses` 講的是 OpenAI 的
-Responses API，但 MUR 自己的 OpenAI client 只會講 Chat Completions
-（`POST $base_url/chat/completions`）— 它沒有 Responses API 的 client。
-在轉譯層（未來的 stage）做出來之前，`/v1/responses` 只有本來就講 Responses
-API 的 client（例如 `curl`、Codex CLI 本身）能用 — 不是把 MUR model registry
-指過去就能用。
+**MUR agent 現在可以用轉譯過的 Codex 路由。** 轉譯層讓 MUR 只會講 Chat
+Completions 的 OpenAI client 也能用到 ChatGPT 訂閱：把 model registry 的項目
+指向 `POST http://127.0.0.1:8088/codex/v1/chat/completions`，gateway 會在上游
+轉譯成 Responses API。原本就講 Responses API 的 client（例如 `curl`、Codex CLI
+本身）還是可以直接用 `/v1/responses`。
 
 ## 設定
 

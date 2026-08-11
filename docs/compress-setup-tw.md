@@ -2,6 +2,8 @@
 
 wire-level tool_result 壓縮的安裝設定。設計背景見
 [specs/2026-07-03-mur-compress-design.md](specs/2026-07-03-mur-compress-design.md)。
+在轉譯過的 Codex chat 路徑（`/codex/v1/chat/completions`）上，壓縮在*轉譯之前*
+執行，所以 rewriter 看到的是它懂的 Chat Completions body。
 
 ## install 參數
 

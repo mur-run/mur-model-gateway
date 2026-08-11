@@ -59,6 +59,19 @@ fn is_untranslated_chat_body(req: &HttpMockRequest) -> bool {
     v.get("messages").is_some() && v.get("input").is_none()
 }
 
+/// The upstream body must be translated AND smaller than the fat input.
+/// If compression ever ran after translation the rewriter would see a
+/// Responses body it does not understand and silently do nothing.
+fn is_translated_and_compressed(req: &HttpMockRequest) -> bool {
+    let Some(body) = req.body.as_ref() else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    v.get("input").is_some() && body.len() < 50_000
+}
+
 /// A minimal reply in the shape the real backend sends: SSE, with the output
 /// items on `response.output_item.done` and an EMPTY `output` on
 /// `response.completed`.
@@ -293,4 +306,66 @@ async fn streams_tool_calls() {
         })
         .collect();
     serde_json::from_str::<Value>(&args).expect("arguments must reassemble into JSON");
+}
+
+/// Log-shaped text large enough that mur-compress reliably fires. A pure run
+/// of repeated characters (`"x".repeat(50_000)`) is deliberately NOT used:
+/// mur-compress's payoff logic refuses to compress degenerate input
+/// (`tokens_saved == 0`), so the body would never shrink below the matcher's
+/// 50_000-byte bar and the ordering claim would be untestable.
+fn fat_log() -> String {
+    (0..2000)
+        .map(|i| {
+            format!(
+                "2026-07-03 12:{:02}:{:02} INFO worker-{}: request {} completed in {}ms status OK",
+                (i / 60) % 60,
+                i % 60,
+                i % 8,
+                100_000 + i,
+                10 + (i % 90)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn compression_runs_before_translation_on_the_codex_path() {
+    // Point the wire rewriter at a fresh store so the test does not depend on
+    // the developer's ~/.mur config (same isolation as compress_e2e).
+    let mur_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("MUR_HOME", mur_home.path()) };
+    let fat = fat_log();
+    let upstream = MockServer::start_async().await;
+    let m = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .matches(is_translated_and_compressed);
+            // The upstream is streaming-only, and the client asked for a plain
+            // reply — the gateway aggregates (Task 8).
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(SSE_REPLY);
+        })
+        .await;
+
+    let gw = spawn_gateway(&upstream.base_url(), true).await;
+    let resp = post(
+        &gw,
+        "/codex/v1/chat/completions",
+        json!({
+            "model": "m",
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "c1", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": fat}
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), 200);
+    m.assert_async().await;
 }

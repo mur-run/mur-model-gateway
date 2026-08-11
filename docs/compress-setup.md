@@ -2,6 +2,8 @@
 
 Install-time setup for wire-level `tool_result` compression. For the design background see
 [specs/2026-07-03-mur-compress-design.md](specs/2026-07-03-mur-compress-design.md).
+On the translated Codex chat path (`/codex/v1/chat/completions`) compression runs *before*
+translation, so the rewriter sees a Chat Completions body it understands.
 
 ## install flags
 
