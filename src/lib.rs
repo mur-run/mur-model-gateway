@@ -422,10 +422,26 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     }
     upstream_req = upstream_req.body(final_body);
 
-    let upstream_resp = upstream_req
+    let mut upstream_resp = upstream_req
         .send()
         .await
         .with_context(|| format!("upstream {target_url}"))?;
+
+    // One retry only. A second 401 goes back to the caller unchanged.
+    if provider == Provider::Codex
+        && upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        && let TokenSource::Codex(path) = state.token_source_for(Provider::Codex)
+        && let Some(fresh) = codex::refreshed_access_token(path)
+    {
+        let account_id = codex::read_auth(path).and_then(|a| a.account_id);
+        let retry = state.client.request(parts.method.clone(), &target_url);
+        let retry = codex::apply_codex_headers(retry, &fresh, account_id.as_deref());
+        upstream_resp = retry
+            .body(body_bytes.clone())
+            .send()
+            .await
+            .with_context(|| format!("upstream retry {target_url}"))?;
+    }
 
     let status = upstream_resp.status();
     let mut response_headers = HeaderMap::new();

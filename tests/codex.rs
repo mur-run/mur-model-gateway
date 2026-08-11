@@ -230,6 +230,80 @@ async fn codex_route_reads_bearer_and_account_id_from_auth_file() {
     mock.assert_async().await;
 }
 
+// Multi-thread flavor (unlike every other test in this file): the refresh
+// grant runs through `codex_impl`'s blocking bridge, which uses
+// `tokio::task::block_in_place` — valid only on a multi-threaded runtime.
+// That matches production (`#[tokio::main]` defaults to multi-thread); a
+// current-thread test runtime would panic before ever reaching the retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_token_triggers_one_refresh_and_retry() {
+    let upstream = MockServer::start_async().await;
+
+    // The stored token is rejected...
+    let stale = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer stale-tok");
+            then.status(401).body(r#"{"error":"expired"}"#);
+        })
+        .await;
+
+    // ...the refreshed one is accepted.
+    let fresh = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer fresh-tok");
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let token_ep = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200).body(r#"{"access_token":"fresh-tok"}"#);
+        })
+        .await;
+
+    let dir = std::env::temp_dir().join("mmg-codex-refresh");
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth = dir.join("auth.json");
+    std::fs::write(
+        &auth,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"stale-tok","refresh_token":"fake-refresh-token","account_id":"acct-fake"}}"#,
+    )
+    .unwrap();
+
+    // SAFETY: edition 2024 makes set_var unsafe; this test owns the process env.
+    unsafe {
+        std::env::set_var(
+            "MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT",
+            format!("{}/oauth/token", upstream.base_url()),
+        );
+    }
+    mur_model_gateway::codex::reset_refresh_cache();
+
+    let proxy = spawn_codex(upstream.base_url(), TokenSource::Codex(auth.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5-codex","input":"say ok"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        stale.hits_async().await,
+        1,
+        "exactly one 401 — never a retry loop"
+    );
+    assert_eq!(token_ep.hits_async().await, 1, "exactly one refresh");
+    assert_eq!(fresh.hits_async().await, 1, "exactly one retry");
+    std::fs::remove_file(&auth).ok();
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────
 //
 // httpmock's `.matches()` takes a bare `fn(&HttpMockRequest) -> bool`, not a

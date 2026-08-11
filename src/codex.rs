@@ -33,14 +33,30 @@ mod codex_impl {
     }
 
     /// Stub: no OAuth constants in the public build.
-    pub fn refresh_access_token(_refresh_token: &str) -> anyhow::Result<String> {
+    pub fn refresh_access_token(_refresh_token: &str) -> anyhow::Result<super::RefreshedTokens> {
         anyhow::bail!("codex refresh unavailable in this build")
     }
 }
 
 pub use codex_impl::*;
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+/// What an OAuth refresh grant returns. `refresh_token` is `Some` when the
+/// provider rotates it — ChatGPT does, so it must be persisted or the next
+/// refresh fails.
+///
+/// No `#[derive(Debug)]`: these are raw credentials, and a derived Debug puts
+/// them in any `{:?}`, tracing capture, or panic message. Hand-write a
+/// redacting impl if one is needed, as `CodexAuth` does.
+#[derive(Clone)]
+pub struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
 
 /// Credentials as Codex CLI stores them in `~/.codex/auth.json`.
 #[derive(Clone)]
@@ -93,6 +109,77 @@ pub fn parse_auth(raw: &str) -> Option<CodexAuth> {
 /// falls through to passthrough.
 pub fn read_auth(path: &Path) -> Option<CodexAuth> {
     parse_auth(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Most recent refresh, memoised so a burst of 401s triggers one grant.
+static REFRESHED: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+
+/// A usable access token, refreshing when the stored one was rejected. The
+/// grant rotates the refresh token, so the new pair is persisted — discarding
+/// it strands both this gateway and Codex CLI on a dead credential.
+/// Memoised for `keychain::CACHE_TTL`.
+pub fn refreshed_access_token(path: &Path) -> Option<String> {
+    let cell = REFRESHED.get_or_init(|| Mutex::new(None));
+    let mut slot = cell.lock().unwrap();
+    if let Some((at, tok)) = slot.as_ref()
+        && at.elapsed() < crate::keychain::CACHE_TTL
+    {
+        return Some(tok.clone());
+    }
+    let rt = read_auth(path)?.refresh_token?;
+    match refresh_access_token(&rt) {
+        Ok(new) => {
+            if let Err(e) = persist_rotation(path, &new) {
+                // The access token still serves this request, but a lost
+                // rotation means the next refresh fails. Warn loudly.
+                tracing::warn!(error = %e, "codex token rotation not persisted");
+            }
+            *slot = Some((Instant::now(), new.access_token.clone()));
+            Some(new.access_token)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "codex token refresh failed");
+            None
+        }
+    }
+}
+
+/// Clear the in-memory refreshed token. Test-only: the cache is process-global
+/// and would otherwise leak between integration tests.
+pub fn reset_refresh_cache() {
+    if let Some(cell) = REFRESHED.get() {
+        *cell.lock().unwrap() = None;
+    }
+}
+
+/// Replace only the rotated fields, atomically. Codex CLI reads keys this
+/// gateway does not model, so the rest of the document is preserved verbatim.
+/// `last_refresh` is deliberately left alone — it is Codex CLI's bookkeeping,
+/// and updating it would need a date dependency this crate does not have.
+fn persist_rotation(path: &Path, new: &RefreshedTokens) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)?;
+    let tokens = doc
+        .get_mut("tokens")
+        .context("auth.json has no tokens object")?;
+    tokens["access_token"] = serde_json::Value::String(new.access_token.clone());
+    if let Some(rt) = &new.refresh_token {
+        tokens["refresh_token"] = serde_json::Value::String(rt.clone());
+    }
+
+    // Temp file in the SAME directory, so the rename stays on one filesystem —
+    // that is what makes it atomic. A concurrent reader sees the old file or
+    // the new one, never a torn one.
+    let dir = path.parent().context("auth.json has no parent dir")?;
+    let tmp = dir.join(".auth.json.mmg-tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -158,5 +245,38 @@ mod tests {
 
         // Verify account_id is NOT redacted
         assert!(debug_str.contains("acct-fake"));
+    }
+
+    #[test]
+    fn persist_rotation_preserves_unmodelled_fields() {
+        let dir = std::env::temp_dir().join("mmg-codex-persist");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("auth.json");
+        std::fs::write(
+            &p,
+            r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"some_future_key":42,
+                "tokens":{"id_token":"fake-id","access_token":"old-a","refresh_token":"old-r","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        persist_rotation(
+            &p,
+            &RefreshedTokens {
+                access_token: "new-a".into(),
+                refresh_token: Some("new-r".into()),
+            },
+        )
+        .unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["tokens"]["access_token"], "new-a");
+        assert_eq!(v["tokens"]["refresh_token"], "new-r");
+        // Untouched fields survive — Codex CLI depends on them.
+        assert_eq!(v["tokens"]["id_token"], "fake-id");
+        assert_eq!(v["tokens"]["account_id"], "acct");
+        assert_eq!(v["some_future_key"], 42);
+        assert_eq!(v["auth_mode"], "chatgpt");
+        std::fs::remove_file(&p).ok();
     }
 }

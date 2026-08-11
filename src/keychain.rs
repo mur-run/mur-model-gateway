@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 const SERVICE: &str = "Claude Code-credentials";
 
-const CACHE_TTL: Duration = Duration::from_secs(60);
+// pub(crate): also memoises `codex::refreshed_access_token`'s refresh cache,
+// so the two don't drift onto different staleness windows.
+pub(crate) const CACHE_TTL: Duration = Duration::from_secs(60);
 type CachedRead = Option<(Instant, Result<Option<String>, KeychainError>)>;
 static CACHE: Mutex<CachedRead> = Mutex::new(None);
 
