@@ -20,7 +20,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, Response, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, Response, StatusCode, Uri, header},
     response::IntoResponse,
     routing::any,
 };
@@ -303,6 +303,28 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         body_bytes
     };
 
+    // Codex: auth-less callers get the stored Codex credential plus the client
+    // headers. Requests that already carry auth pass through untouched, same
+    // rule as the Anthropic path.
+    let codex_cred: Option<(String, Option<String>)> =
+        if provider == Provider::Codex && parts.headers.get(header::AUTHORIZATION).is_none() {
+            match state.token_source_for(Provider::Codex) {
+                TokenSource::Codex(path) => {
+                    codex::read_auth(path).map(|a| (a.access_token, a.account_id))
+                }
+                other => match other.resolve() {
+                    Ok(Some(tok)) => Some((tok, None)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "codex token source failed, passing through");
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
+
     // Disguise gate. Three modes on Messages-shape paths (when the
     // configured TokenSource is NOT Disabled):
     //
@@ -392,6 +414,9 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             &client_betas,
             has_anthropic_version,
         )?;
+    }
+    if let Some((token, account_id)) = codex_cred.as_ref() {
+        upstream_req = codex::apply_codex_headers(upstream_req, token, account_id.as_deref());
     }
     upstream_req = upstream_req.body(final_body);
 
