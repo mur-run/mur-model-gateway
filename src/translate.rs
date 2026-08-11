@@ -394,16 +394,22 @@ impl SseTranslator {
                 let index = data
                     .get("item_id")
                     .and_then(Value::as_str)
-                    .and_then(|id| self.item_index.get(id).copied())
-                    .unwrap_or(0);
-                if let Some(d) = data.get("delta").and_then(Value::as_str) {
-                    out.push(self.chunk(
-                        json!({"tool_calls": [{
-                            "index": index,
-                            "function": {"arguments": d},
-                        }]}),
-                        Value::Null,
-                    ));
+                    .and_then(|id| self.item_index.get(id).copied());
+                if let Some(index) = index {
+                    if let Some(d) = data.get("delta").and_then(Value::as_str) {
+                        out.push(self.chunk(
+                            json!({"tool_calls": [{
+                                "index": index,
+                                "function": {"arguments": d},
+                            }]}),
+                            Value::Null,
+                        ));
+                    }
+                } else {
+                    tracing::warn!(
+                        item_id = ?data.get("item_id"),
+                        "orphaned tool-call argument delta dropped"
+                    );
                 }
             }
             "response.completed" => out.extend(self.finish()),
@@ -870,6 +876,26 @@ mod tests {
         assert_eq!(
             chunks.last().unwrap()["choices"][0]["finish_reason"],
             json!("tool_calls")
+        );
+    }
+
+    #[test]
+    fn drops_orphaned_tool_call_argument_deltas() {
+        let mut t = SseTranslator::new("m".into());
+        // Delta with an item_id that was never announced — must be dropped.
+        let chunks = t.push(
+            "response.function_call_arguments.delta",
+            &json!({"item_id": "unknown_item", "delta": "orphan"}),
+        );
+        // The first push always emits a role chunk, but the orphaned delta
+        // must NOT produce any tool_calls chunk.
+        let tool_call_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c["choices"][0]["delta"]["tool_calls"].is_array())
+            .collect();
+        assert!(
+            tool_call_chunks.is_empty(),
+            "orphaned delta must produce no tool_calls chunks (was silently attached to index 0)"
         );
     }
 
