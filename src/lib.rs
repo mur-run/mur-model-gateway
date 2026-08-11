@@ -307,7 +307,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // headers. Requests that already carry auth pass through untouched, same
     // rule as the Anthropic path.
     let codex_cred: Option<(String, Option<String>)> =
-        if provider == Provider::Codex && parts.headers.get(header::AUTHORIZATION).is_none() {
+        if provider == Provider::Codex && !has_client_credential(&parts.headers) {
             match state.token_source_for(Provider::Codex) {
                 TokenSource::Codex(path) => {
                     codex::read_auth(path).map(|a| (a.access_token, a.account_id))
@@ -394,7 +394,9 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         // them with OAUTH_BETAS rather than overwriting (Claude Code 4.7+
         // sends betas like `clear-thinking-2025-10-15` that the upstream
         // needs to accept the request body).
-        if override_token.is_some() && (name == "authorization" || name == "x-api-key") {
+        if (override_token.is_some() || codex_cred.is_some())
+            && (name == "authorization" || name == "x-api-key")
+        {
             continue;
         }
         if override_token.is_some() && name == "anthropic-beta" {
@@ -473,6 +475,20 @@ fn extract_oauth_shape_token(headers: &HeaderMap) -> Option<String> {
         return Some(rest.to_string());
     }
     None
+}
+
+/// True if the inbound request already carries a non-empty client
+/// credential via `Authorization` or `x-api-key`. Mirrors the Anthropic
+/// path's mode-3 rule (any auth header present → passthrough, don't
+/// second-guess a client that authenticates itself) rather than inventing a
+/// new notion of "already authenticated" for Codex. Unlike `contains_key`,
+/// an empty or whitespace-only header value does not count as a credential.
+fn has_client_credential(headers: &HeaderMap) -> bool {
+    fn non_empty(v: Option<&axum::http::HeaderValue>) -> bool {
+        v.and_then(|v| v.to_str().ok())
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+    non_empty(headers.get(header::AUTHORIZATION)) || non_empty(headers.get("x-api-key"))
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
