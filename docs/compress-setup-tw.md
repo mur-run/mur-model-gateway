@@ -21,7 +21,7 @@ mur-model-gateway install                 # 不帶參數 → 沿用安裝當下�
 ```bash
 ./scripts/setup.sh                          # 重新 build + 安裝 + 重啓服務(不啓壓縮)
 ./scripts/setup.sh -- --compress            # 同上,但啓用壓縮
-./scripts/setup.sh --system -- --compress   # system 層級安裝,啓用壓縮
+./scripts/setup.sh --system -- --compress   # system 層級安裝,啓用壓縮(僅 Linux)
 ```
 
 `--` 之後的參數會傳給 `mur-model-gateway install`,所以 `--compress` 是到處都有效的寫法。

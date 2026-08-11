@@ -21,7 +21,7 @@ definition, so re-running `setup.sh` does not lose it.
 ```bash
 ./scripts/setup.sh                          # rebuild + install + restart the service (compression off)
 ./scripts/setup.sh -- --compress            # same, with compression enabled
-./scripts/setup.sh --system -- --compress   # system-wide install, compression enabled
+./scripts/setup.sh --system -- --compress   # system-wide install, compression enabled (Linux only)
 ```
 
 Everything after `--` goes to `mur-model-gateway install`, so `--compress` is

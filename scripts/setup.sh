@@ -218,8 +218,9 @@ fi
 log "starting service"
 start_service
 
-# settle: give systemd/launchd up to 5s to bring the listener up
-for _ in 1 2 3 4 5; do
+# settle: give systemd/launchd time to bring the listener up.
+# 15s, not 5: a freshly codesigned binary pays Gatekeeper verification on first launch.
+for _ in $(seq 15); do
   is_listening && break
   sleep 1
 done
