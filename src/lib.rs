@@ -165,8 +165,17 @@ pub struct AppState {
     pub upstream_codex: String,
     pub client: reqwest::Client,
     pub token_source: TokenSource,
-    /// Credential source for `Provider::Codex`. Defaults to `~/.codex/auth.json`;
-    /// `token_source` stays the fallback for every other provider.
+    /// Credential source for `Provider::Codex`. `token_source` stays the
+    /// fallback for every other provider.
+    ///
+    /// Fix round 1, finding 6: defaults to `Disabled`, deliberately — NOT
+    /// the user's real `~/.codex/auth.json`. Every constructor here
+    /// (`new`/`with_version`) leaves it `Disabled` unless
+    /// [`AppState::with_default_codex_source`] is called explicitly; only
+    /// `main.rs` calls it. This makes a test-side `AppState` that forgets
+    /// to override this field structurally unable to resolve, read, or
+    /// refresh-and-rewrite the real file — even if it accidentally
+    /// exercises the Codex route — rather than merely unlikely to.
     pub token_source_codex: TokenSource,
     pub version_cache: Arc<cc_version::VersionCache>,
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
@@ -207,13 +216,27 @@ impl AppState {
                 .build()
                 .context("reqwest client")?,
             token_source,
-            token_source_codex: match codex::default_auth_path() {
-                Some(p) => TokenSource::Codex(p),
-                None => TokenSource::Disabled,
-            },
+            // Fix round 1, finding 6: safe by default. See the field doc on
+            // `token_source_codex` and `with_default_codex_source` below.
+            token_source_codex: TokenSource::Disabled,
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
         })
+    }
+
+    /// Point the Codex token source at the user's real `~/.codex/auth.json`
+    /// (or leave it `Disabled` if the home directory can't be resolved).
+    /// This is what gives an unconfigured production gateway a working
+    /// Codex credential — call it from `main.rs` only. Every test-side
+    /// `AppState` should instead either leave the constructor default
+    /// (`Disabled`) alone or call `with_token_source_codex` with a fixture
+    /// path/mock token, never this method (fix round 1, finding 6).
+    pub fn with_default_codex_source(mut self) -> Self {
+        self.token_source_codex = match codex::default_auth_path() {
+            Some(p) => TokenSource::Codex(p),
+            None => TokenSource::Disabled,
+        };
+        self
     }
 
     /// Override the Codex upstream. Used by tests to point at httpmock.
@@ -434,7 +457,28 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         && let Some(fresh) = codex::refreshed_access_token(path)
     {
         let account_id = codex::read_auth(path).and_then(|a| a.account_id);
-        let retry = state.client.request(parts.method.clone(), &target_url);
+        let mut retry = state.client.request(parts.method.clone(), &target_url);
+        // Fix round 1, finding 4: forward the same client headers as the
+        // first attempt (content-type, accept — including
+        // text/event-stream for streaming calls — plus anything else the
+        // client sent), minus hop-by-hop/host/content-length and the auth
+        // headers we're about to replace with the freshly refreshed token.
+        // `apply_codex_headers` only ever sets Authorization, `originator`,
+        // and the account-id header — never content-type or accept — so
+        // without this a real upstream can reject the retry outright. Kept
+        // as its own loop rather than reusing the one above so the
+        // Anthropic disguise path stays untouched by this fix.
+        for (name, value) in parts.headers.iter() {
+            if is_hop_by_hop(name)
+                || name == "host"
+                || name == "content-length"
+                || name == "authorization"
+                || name == "x-api-key"
+            {
+                continue;
+            }
+            retry = retry.header(name, value);
+        }
         let retry = codex::apply_codex_headers(retry, &fresh, account_id.as_deref());
         upstream_resp = retry
             .body(body_bytes.clone())

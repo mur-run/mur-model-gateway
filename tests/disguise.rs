@@ -338,7 +338,13 @@ async fn spawn(upstream: String, token_source: TokenSource) -> String {
             token_source,
             pinned_version(),
         )
-        .unwrap(),
+        .unwrap()
+        // Fix round 1, finding 6: `with_version` already defaults
+        // `token_source_codex` to `Disabled`, so this is belt-and-suspenders
+        // — explicit here so nobody reading this helper has to go check the
+        // library default to know these disguise tests can never resolve,
+        // read, or refresh-and-rewrite the real ~/.codex/auth.json.
+        .with_token_source_codex(TokenSource::Disabled),
     );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

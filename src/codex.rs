@@ -114,18 +114,38 @@ pub fn read_auth(path: &Path) -> Option<CodexAuth> {
 /// Most recent refresh, memoised so a burst of 401s triggers one grant.
 static REFRESHED: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
 
+/// `Mutex::lock` only returns `Err` when a previous holder panicked while
+/// holding the guard. The refresh cache is fine to keep using after that —
+/// worst case a stale entry triggers one extra refresh — so recover it
+/// instead of propagating the panic into every later Codex 401 for the rest
+/// of the process's life (fix round 1, finding 5).
+fn lock_recovering<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A usable access token, refreshing when the stored one was rejected. The
 /// grant rotates the refresh token, so the new pair is persisted — discarding
 /// it strands both this gateway and Codex CLI on a dead credential.
 /// Memoised for `keychain::CACHE_TTL`.
 pub fn refreshed_access_token(path: &Path) -> Option<String> {
     let cell = REFRESHED.get_or_init(|| Mutex::new(None));
-    let mut slot = cell.lock().unwrap();
-    if let Some((at, tok)) = slot.as_ref()
-        && at.elapsed() < crate::keychain::CACHE_TTL
+
+    // Fix round 1, finding 5: the lock is held only long enough to read the
+    // cache. `refresh_access_token` below is a blocking network call —
+    // holding the lock across it would park every other Codex 401 in this
+    // process for a full round trip, and a panic mid-call would poison the
+    // mutex permanently.
     {
-        return Some(tok.clone());
+        let slot = lock_recovering(cell);
+        if let Some((at, tok)) = slot.as_ref()
+            && at.elapsed() < crate::keychain::CACHE_TTL
+        {
+            return Some(tok.clone());
+        }
     }
+
     let rt = read_auth(path)?.refresh_token?;
     match refresh_access_token(&rt) {
         Ok(new) => {
@@ -134,7 +154,7 @@ pub fn refreshed_access_token(path: &Path) -> Option<String> {
                 // rotation means the next refresh fails. Warn loudly.
                 tracing::warn!(error = %e, "codex token rotation not persisted");
             }
-            *slot = Some((Instant::now(), new.access_token.clone()));
+            *lock_recovering(cell) = Some((Instant::now(), new.access_token.clone()));
             Some(new.access_token)
         }
         Err(e) => {
@@ -148,7 +168,7 @@ pub fn refreshed_access_token(path: &Path) -> Option<String> {
 /// and would otherwise leak between integration tests.
 pub fn reset_refresh_cache() {
     if let Some(cell) = REFRESHED.get() {
-        *cell.lock().unwrap() = None;
+        *lock_recovering(cell) = None;
     }
 }
 
@@ -156,6 +176,60 @@ pub fn reset_refresh_cache() {
 /// gateway does not model, so the rest of the document is preserved verbatim.
 /// `last_refresh` is deliberately left alone — it is Codex CLI's bookkeeping,
 /// and updating it would need a date dependency this crate does not have.
+/// Removes its path on drop unless [`Self::keep`] was called. Guarantees a
+/// failed atomic write (create, write, sync, or rename) never leaves a
+/// stray, world-readable-or-not temp file holding a live access/refresh
+/// token pair sitting on disk (fix round 1, finding 1).
+struct TempFileGuard<'a> {
+    path: &'a Path,
+    keep: bool,
+}
+
+impl<'a> TempFileGuard<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path, keep: false }
+    }
+
+    /// Disarm: the file was renamed into place, so there is nothing left
+    /// at `path` to remove.
+    fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TempFileGuard<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            // Best-effort: this path may never have been created (e.g. if
+            // `create_new` itself is what failed), in which case removal
+            // errors and that error is expected and ignored.
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
+/// Open `tmp` for writing, created fresh with no window where it exists at
+/// looser permissions. Fails if `tmp` already exists — see the temp-name
+/// scheme in `persist_rotation` for why that's the correct behaviour, not
+/// a bug (fix round 1, findings 1 and 2).
+#[cfg(unix)]
+fn create_temp_exclusive(tmp: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
+}
+
+#[cfg(not(unix))]
+fn create_temp_exclusive(tmp: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+}
+
 fn persist_rotation(path: &Path, new: &RefreshedTokens) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(path)?;
     let mut doc: serde_json::Value = serde_json::from_str(&raw)?;
@@ -166,19 +240,46 @@ fn persist_rotation(path: &Path, new: &RefreshedTokens) -> anyhow::Result<()> {
     if let Some(rt) = &new.refresh_token {
         tokens["refresh_token"] = serde_json::Value::String(rt.clone());
     }
+    let bytes = serde_json::to_vec_pretty(&doc)?;
 
     // Temp file in the SAME directory, so the rename stays on one filesystem —
     // that is what makes it atomic. A concurrent reader sees the old file or
     // the new one, never a torn one.
+    //
+    // The name includes the pid and a per-process attempt counter (fix
+    // round 1, finding 2): two gateway *processes* refreshing at the same
+    // moment would otherwise both target the fixed name
+    // `.auth.json.mmg-tmp`, and whichever renames second would silently
+    // stomp the first mid-write. `create_new` below turns any surviving
+    // collision (e.g. pid reuse across processes) into an error instead of
+    // one writer clobbering the other.
     let dir = path.parent().context("auth.json has no parent dir")?;
-    let tmp = dir.join(".auth.json.mmg-tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".auth.json.{}.{attempt}.mmg-tmp",
+        std::process::id()
+    ));
+
+    let guard = TempFileGuard::new(&tmp);
+    // 0600 from creation (fix round 1, finding 1): the old `write` then
+    // `set_permissions` left a window where the temp file held a live
+    // token pair at the default (world-readable) mode, and a crash in that
+    // window left it that way.
+    let mut file = create_temp_exclusive(&tmp)
+        .with_context(|| format!("create temp file for {}", path.display()))?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .with_context(|| format!("write temp file for {}", path.display()))?;
+    // Durability (fix round 1, finding 3): without this, the rename below
+    // can hit disk before the data does — a crash between the two leaves
+    // an empty or garbage auth.json.
+    file.sync_all()
+        .with_context(|| format!("sync temp file for {}", path.display()))?;
+    drop(file);
+
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    guard.keep();
     Ok(())
 }
 
@@ -278,5 +379,78 @@ mod tests {
         assert_eq!(v["some_future_key"], 42);
         assert_eq!(v["auth_mode"], "chatgpt");
         std::fs::remove_file(&p).ok();
+    }
+
+    /// Fix round 1, findings 1-3: the rewritten atomic write (create with
+    /// 0600 from birth, unique per-attempt temp name, `sync_all`, rename)
+    /// must still leave the directory exactly as clean as the original
+    /// `write`-then-`chmod` version did — no stray `.auth.json.*.mmg-tmp`
+    /// left behind by a successful run.
+    #[test]
+    fn persist_rotation_leaves_no_temp_file_behind() {
+        let dir = std::env::temp_dir().join("mmg-codex-persist-notemp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("auth.json");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"old-a","refresh_token":"old-r"}}"#,
+        )
+        .unwrap();
+
+        persist_rotation(
+            &p,
+            &RefreshedTokens {
+                access_token: "new-a".into(),
+                refresh_token: Some("new-r".into()),
+            },
+        )
+        .unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("auth.json")],
+            "no leftover temp file after a successful persist"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fix round 1, finding 1: the temp file — and so, after rename, the
+    /// final file — must be owner-only from the moment it exists, never
+    /// created at the default (typically world-readable) mode and tightened
+    /// after the fact.
+    #[cfg(unix)]
+    #[test]
+    fn persist_rotation_creates_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("mmg-codex-persist-perms");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("auth.json");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"old-a","refresh_token":"old-r"}}"#,
+        )
+        .unwrap();
+        // Start deliberately world-readable, so a pass would be a false
+        // positive if the code merely left the original mode alone instead
+        // of actively setting 0600.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        persist_rotation(
+            &p,
+            &RefreshedTokens {
+                access_token: "new-a".into(),
+                refresh_token: None,
+            },
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rotated file must be owner-read-write only");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

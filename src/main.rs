@@ -124,7 +124,12 @@ async fn serve() -> anyhow::Result<()> {
         &upstream_openai,
         &upstream_gemini,
         token_source,
-    )?;
+    )?
+    // Fix round 1, finding 6: `AppState::new`/`with_version` default
+    // `token_source_codex` to `Disabled`. This explicit call is what wires
+    // an unconfigured gateway to the user's real `~/.codex/auth.json` —
+    // production-only, deliberately not part of the constructor itself.
+    .with_default_codex_source();
     if let Ok(spec) = std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX") {
         state.token_source_codex =
             parse_token_source(&spec).context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX")?;

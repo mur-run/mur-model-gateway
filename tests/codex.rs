@@ -9,11 +9,58 @@ use mur_model_gateway::{AppState, TokenSource, build_router};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, MutexGuard};
 
 fn pinned_version() -> Arc<VersionCache> {
     Arc::new(VersionCache::new(VersionStrategy::Static(
         "9.9.9".to_string(),
     )))
+}
+
+// Fix round 1, finding 7: `AppState::with_version` (via `spawn_codex`) reads
+// `MUR_MODEL_GATEWAY_COMPRESS` on every call, and the refresh tests below
+// mutate `MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT`. `std::env::set_var` is
+// `unsafe` in edition 2024 precisely because a concurrent `getenv` on *any*
+// key while a `setenv` on *any* key is in flight is a data race at the libc
+// level — not only same-key races. `cargo test` runs every `#[tokio::test]`
+// in this file on its own thread by default, so every test here is a
+// potential concurrent env reader. Rather than argue a partial lock over
+// just the env-mutating tests is enough, every test in this file acquires
+// this lock for its full body: the file runs effectively single-threaded,
+// and the `unsafe` env blocks below are then actually sound instead of
+// "probably fine in practice."
+//
+// This has to be `tokio::sync::Mutex`, not `std::sync::Mutex`: every test
+// body holds the guard across many `.await` points (mock server startup,
+// the actual request, etc.), and clippy's `await_holding_lock` correctly
+// flags a blocking-lock guard held that way as a hazard (it can park a
+// tokio worker thread while holding a lock nothing async-aware can see).
+// `tokio::sync::Mutex` is designed to be held across `.await` — acquiring
+// it yields instead of blocking the executor.
+static ENV_SERIAL: Mutex<()> = Mutex::const_new(());
+
+/// Acquire the file-wide serialisation lock. `tokio::sync::Mutex` has no
+/// poisoning concept — unlike `std::sync::Mutex`, a task that panics while
+/// holding the guard simply drops and releases it during unwind, so a
+/// previous test panicking mid-body can't brick every later test in the
+/// file; there is no poisoned state to recover from.
+async fn serial_guard() -> MutexGuard<'static, ()> {
+    ENV_SERIAL.lock().await
+}
+
+/// Clears the named env var on drop, including on panic — an `assert!`
+/// failing mid-test must not leak the override into whatever the harness
+/// runs next in this process.
+struct EnvVarGuard(&'static str);
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: the caller obtained this guard while holding
+        // `ENV_SERIAL` (via `serial_guard()`), and every test in this file
+        // acquires that same lock before touching env — no other thread in
+        // this process can be reading or writing env while this runs.
+        unsafe { std::env::remove_var(self.0) }
+    }
 }
 
 /// Same shape as `spawn` in tests/disguise.rs:330, with the Codex upstream and
@@ -40,6 +87,9 @@ async fn spawn_codex(upstream: String, codex_ts: TokenSource) -> String {
 
 #[tokio::test]
 async fn codex_route_attaches_bearer_token() {
+    // Fix round 1, finding 7: serialises this test against every other
+    // test in the file for the env-var reasons on `ENV_SERIAL` above.
+    let _serial = serial_guard().await;
     let upstream = MockServer::start_async().await;
     // path("/responses") also asserts the /v1 strip from Task 3.
     let mock = upstream
@@ -76,6 +126,9 @@ async fn codex_route_attaches_bearer_token() {
 /// unmodified — and never the stored Codex credential.
 #[tokio::test]
 async fn codex_route_preserves_client_authorization_and_withholds_codex_token() {
+    // Fix round 1, finding 7: serialises this test against every other
+    // test in the file for the env-var reasons on `ENV_SERIAL` above.
+    let _serial = serial_guard().await;
     let upstream = MockServer::start_async().await;
     let mock = upstream
         .mock_async(|when, then| {
@@ -114,6 +167,9 @@ async fn codex_route_preserves_client_authorization_and_withholds_codex_token() 
 /// upstream unmodified, with no `Authorization` header injected at all.
 #[tokio::test]
 async fn codex_route_preserves_client_api_key_and_withholds_codex_token() {
+    // Fix round 1, finding 7: serialises this test against every other
+    // test in the file for the env-var reasons on `ENV_SERIAL` above.
+    let _serial = serial_guard().await;
     let upstream = MockServer::start_async().await;
     let mock = upstream
         .mock_async(|when, then| {
@@ -152,6 +208,9 @@ async fn codex_route_preserves_client_api_key_and_withholds_codex_token() {
 /// asserts exactly one `authorization` header upstream, not two.
 #[tokio::test]
 async fn codex_route_treats_empty_authorization_as_unauthenticated() {
+    // Fix round 1, finding 7: serialises this test against every other
+    // test in the file for the env-var reasons on `ENV_SERIAL` above.
+    let _serial = serial_guard().await;
     let upstream = MockServer::start_async().await;
     let mock = upstream
         .mock_async(|when, then| {
@@ -200,6 +259,9 @@ async fn codex_route_reads_bearer_and_account_id_from_auth_file() {
     .unwrap();
     fixture.flush().unwrap();
 
+    // Fix round 1, finding 7: serialises this test against every other
+    // test in the file for the env-var reasons on `ENV_SERIAL` above.
+    let _serial = serial_guard().await;
     let upstream = MockServer::start_async().await;
     let mock = upstream
         .mock_async(|when, then| {
@@ -237,6 +299,9 @@ async fn codex_route_reads_bearer_and_account_id_from_auth_file() {
 // current-thread test runtime would panic before ever reaching the retry.
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_token_triggers_one_refresh_and_retry() {
+    // Fix round 1, finding 7: serialises this test against every other
+    // test in the file for the env-var reasons on `ENV_SERIAL` above.
+    let _serial = serial_guard().await;
     let upstream = MockServer::start_async().await;
 
     // The stored token is rejected...
@@ -275,13 +340,19 @@ async fn expired_token_triggers_one_refresh_and_retry() {
     )
     .unwrap();
 
-    // SAFETY: edition 2024 makes set_var unsafe; this test owns the process env.
+    // SAFETY: `_serial` (acquired above) holds `ENV_SERIAL` for this test's
+    // full body, and every test in this file acquires that same lock before
+    // touching env — no other thread in this process can be reading or
+    // writing env while this runs.
     unsafe {
         std::env::set_var(
             "MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT",
             format!("{}/oauth/token", upstream.base_url()),
         );
     }
+    // Cleared on drop (including on an assert panic below), so a failure
+    // here can't leak the override into whatever the harness runs next.
+    let _env_guard = EnvVarGuard("MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT");
     mur_model_gateway::codex::reset_refresh_cache();
 
     let proxy = spawn_codex(upstream.base_url(), TokenSource::Codex(auth.clone())).await;
@@ -301,6 +372,88 @@ async fn expired_token_triggers_one_refresh_and_retry() {
     );
     assert_eq!(token_ep.hits_async().await, 1, "exactly one refresh");
     assert_eq!(fresh.hits_async().await, 1, "exactly one retry");
+    std::fs::remove_file(&auth).ok();
+}
+
+/// Fix round 1, finding 4: the retry rebuilt the request from scratch with
+/// only `apply_codex_headers` applied (bearer/originator/account-id —
+/// confirmed by inspection that it never sets `content-type` or `accept`),
+/// dropping every other client header. A real upstream can reject that; a
+/// streaming call in particular loses `accept: text/event-stream`. This
+/// mock requires that header on the retried request specifically, so it
+/// fails if the retry ever goes out bare again.
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_forwards_original_request_headers() {
+    let _serial = serial_guard().await;
+    let upstream = MockServer::start_async().await;
+
+    let stale = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer stale-tok");
+            then.status(401).body(r#"{"error":"expired"}"#);
+        })
+        .await;
+
+    let fresh = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer fresh-tok")
+                // The load-bearing condition: only present if the retry
+                // forwarded the client's original headers.
+                .header("accept", "text/event-stream");
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let token_ep = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/oauth/token");
+            then.status(200).body(r#"{"access_token":"fresh-tok"}"#);
+        })
+        .await;
+
+    let dir = std::env::temp_dir().join("mmg-codex-retry-headers");
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth = dir.join("auth.json");
+    std::fs::write(
+        &auth,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"stale-tok","refresh_token":"fake-refresh-token","account_id":"acct-fake"}}"#,
+    )
+    .unwrap();
+
+    // SAFETY: `_serial` (acquired above) holds `ENV_SERIAL` for this test's
+    // full body, and every test in this file acquires that same lock before
+    // touching env.
+    unsafe {
+        std::env::set_var(
+            "MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT",
+            format!("{}/oauth/token", upstream.base_url()),
+        );
+    }
+    let _env_guard = EnvVarGuard("MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT");
+    mur_model_gateway::codex::reset_refresh_cache();
+
+    let proxy = spawn_codex(upstream.base_url(), TokenSource::Codex(auth.clone())).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5-codex","input":"say ok","stream":true}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(stale.hits_async().await, 1, "exactly one 401");
+    assert_eq!(token_ep.hits_async().await, 1, "exactly one refresh");
+    assert_eq!(
+        fresh.hits_async().await,
+        1,
+        "retry must carry the client's original accept header"
+    );
     std::fs::remove_file(&auth).ok();
 }
 
