@@ -650,23 +650,11 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
                         Some(Ok(chunk)) => {
                             buf.push_str(&String::from_utf8_lossy(&chunk));
                             let mut out = Vec::new();
-                            // SSE frames are separated by a blank line.
-                            while let Some(split) = buf.find("\n\n") {
-                                let frame: String = buf.drain(..split + 2).collect();
-                                let (mut event, mut data) = ("", "");
-                                for line in frame.lines() {
-                                    if let Some(e) = line.strip_prefix("event:") {
-                                        event = e.trim();
-                                    }
-                                    if let Some(d) = line.strip_prefix("data:") {
-                                        data = d.trim();
-                                    }
-                                }
-                                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
-                                else {
-                                    continue;
-                                };
-                                for c in translator.push(event, &parsed) {
+                            // Same splitter the non-streaming path uses: it
+                            // tolerates CRLF, which a hand-rolled `find("\n\n")`
+                            // does not.
+                            for (event, data) in translate::split_sse_frames(&mut buf) {
+                                for c in translator.push(&event, &data) {
                                     out.push(format!("data: {c}\n\n"));
                                 }
                             }

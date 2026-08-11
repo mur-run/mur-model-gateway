@@ -315,6 +315,47 @@ async fn translates_a_streaming_response() {
     assert_eq!(frames.last().unwrap(), "[DONE]");
 }
 
+/// A CRLF stream must translate identically: git checks the fixtures out with
+/// CRLF on Windows, and CR is legal in SSE.
+#[tokio::test]
+async fn translates_a_crlf_streaming_response() {
+    let upstream = MockServer::start_async().await;
+    let _m = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(fixture_sse("streaming.sse").replace('\n', "\r\n"));
+        })
+        .await;
+
+    let gw = spawn_gateway(&upstream.base_url(), false).await;
+    let frames = post_sse(
+        &gw,
+        "/codex/v1/chat/completions",
+        json!({
+            "model": "gpt-5-codex",
+            "messages": [{"role": "user", "content": "count"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let first: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(first["choices"][0]["delta"]["role"], json!("assistant"));
+    let text: String = frames
+        .iter()
+        .filter(|f| *f != "[DONE]")
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(!text.is_empty(), "CRLF stream produced no content");
+}
+
 #[tokio::test]
 async fn streams_tool_calls() {
     let upstream = MockServer::start_async().await;
