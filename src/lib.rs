@@ -17,6 +17,7 @@ pub mod compress;
 pub mod disguise;
 pub mod install;
 pub mod keychain;
+pub mod translate;
 
 use anyhow::Context;
 use axum::{
