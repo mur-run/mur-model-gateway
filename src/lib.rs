@@ -96,6 +96,13 @@ pub fn detect_provider(path: &str) -> Provider {
 /// OpenAI-style `/v1/responses`. Strip the `/v1` so the two line up. Every other
 /// provider concatenates the incoming path unchanged.
 pub fn codex_target_path(path_and_query: &str) -> String {
+    // A translated Chat Completions request always becomes a Responses call.
+    // Its inbound query string describes the chat request, not the Responses
+    // one, so it is deliberately dropped — `stream` travels in the body.
+    let path_only = path_and_query.split('?').next().unwrap_or(path_and_query);
+    if codex::should_translate(path_only) {
+        return "/responses".to_string();
+    }
     match path_and_query.strip_prefix("/v1") {
         Some(rest) => rest.to_string(),
         None => path_and_query.to_string(),
@@ -804,6 +811,25 @@ mod tests {
         );
         // Defensive: a path that somehow lacks the prefix is passed through.
         assert_eq!(codex_target_path("/responses"), "/responses");
+    }
+
+    #[test]
+    fn codex_translate_path_targets_responses() {
+        // A translated request goes to /responses regardless of its inbound path.
+        assert_eq!(
+            codex_target_path("/codex/v1/chat/completions"),
+            "/responses"
+        );
+        assert_eq!(
+            codex_target_path("/codex/v1/chat/completions?stream=true"),
+            "/responses"
+        );
+        // Stage 1's behaviour is unchanged.
+        assert_eq!(codex_target_path("/v1/responses"), "/responses");
+        assert_eq!(
+            codex_target_path("/v1/responses?stream=true"),
+            "/responses?stream=true"
+        );
     }
 
     #[test]

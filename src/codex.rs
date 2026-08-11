@@ -10,6 +10,16 @@ pub fn should_route(path: &str) -> bool {
     path == "/v1/responses"
         || path.starts_with("/v1/responses/")
         || path.starts_with("/v1/responses?")
+        || should_translate(path)
+}
+
+/// True if `path` is the Chat Completions path that must be translated into
+/// a Responses request before it goes upstream. Stage 2 only; stage 1's
+/// `/v1/responses*` is forwarded untranslated.
+pub fn should_translate(path: &str) -> bool {
+    path == "/codex/v1/chat/completions"
+        || path.starts_with("/codex/v1/chat/completions/")
+        || path.starts_with("/codex/v1/chat/completions?")
 }
 
 // ── cfg-gated: real impl or stub ──
@@ -327,6 +337,23 @@ mod tests {
         assert!(!should_route("/v1/messages"));
         assert!(!should_route("/v1/chat/completions"));
         assert!(!should_route("/v1/responsesX"));
+    }
+
+    #[test]
+    fn should_translate_matches_codex_chat_path() {
+        assert!(should_translate("/codex/v1/chat/completions"));
+        assert!(should_translate("/codex/v1/chat/completions?stream=true"));
+        assert!(should_translate("/codex/v1/chat/completions/"));
+        // The plain OpenAI path must never translate.
+        assert!(!should_translate("/v1/chat/completions"));
+        // Stage 1's passthrough must never translate.
+        assert!(!should_translate("/v1/responses"));
+        assert!(!should_translate("/codex/v1/chat/completionsX"));
+    }
+
+    #[test]
+    fn translated_path_is_routed_to_codex() {
+        assert!(should_route("/codex/v1/chat/completions"));
     }
 
     #[test]
