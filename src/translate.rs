@@ -152,6 +152,171 @@ pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
     Ok(Value::Object(out))
 }
 
+/// Drain complete SSE frames from `buf`, leaving any trailing partial frame in
+/// place for the next chunk. Returns `(event name, data)` pairs; the `[DONE]`
+/// sentinel and any frame whose data is not JSON are skipped.
+pub fn split_sse_frames(buf: &mut String) -> Vec<(String, Value)> {
+    // The upstream separates frames with "\n\n", but CR is legal in SSE and
+    // costs one line to tolerate.
+    buf.retain(|c| c != '\r');
+
+    let mut frames = Vec::new();
+    while let Some(end) = buf.find("\n\n") {
+        let frame: String = buf.drain(..end + 2).collect();
+        let mut event = String::new();
+        let mut data = String::new();
+        for line in frame.lines() {
+            if let Some(v) = line.strip_prefix("event:") {
+                event = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("data:") {
+                data.push_str(v.trim());
+            }
+        }
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+            if event.is_empty() {
+                event = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            frames.push((event, value));
+        }
+    }
+    frames
+}
+
+/// Rebuilds a Responses object from the upstream's SSE stream. The upstream is
+/// streaming-only, so this is the only way to serve a non-streaming request.
+#[derive(Default)]
+pub struct ResponseAggregator {
+    response: Value,
+    output: Vec<Value>,
+}
+
+impl ResponseAggregator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, _event: &str, data: &Value) {
+        // response.created / .in_progress / .completed each carry the whole
+        // response object; last one wins, so usage and status end up being the
+        // ones from response.completed.
+        if let Some(resp) = data.get("response") {
+            self.response = resp.clone();
+        }
+        // response.completed's own output array is EMPTY on this backend — the
+        // items only ever arrive on response.output_item.done, already in the
+        // exact shape responses_to_chat expects.
+        if data.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+            && let Some(item) = data.get("item")
+        {
+            self.output.push(item.clone());
+        }
+    }
+
+    /// Only the fields `responses_to_chat` reads are kept.
+    pub fn finish(self) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in [
+            "id",
+            "created_at",
+            "status",
+            "model",
+            "usage",
+            "incomplete_details",
+        ] {
+            out.insert(
+                key.into(),
+                self.response.get(key).cloned().unwrap_or(Value::Null),
+            );
+        }
+        out.insert("object".into(), json!("response"));
+        out.insert("output".into(), Value::Array(self.output));
+        Value::Object(out)
+    }
+}
+
+/// Translate a Responses reply into a Chat Completions reply. `model` is the
+/// string the client sent, echoed back verbatim.
+pub fn responses_to_chat(resp: &Value, model: &str) -> Value {
+    let empty = Vec::new();
+    let output = resp
+        .get("output")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+
+    let mut text = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty)
+                {
+                    if part.get("type").and_then(Value::as_str) == Some("output_text")
+                        && let Some(t) = part.get("text").and_then(Value::as_str)
+                    {
+                        text.push_str(t);
+                    }
+                }
+            }
+            Some("function_call") => tool_calls.push(json!({
+                "id": item.get("call_id").cloned().unwrap_or(Value::Null),
+                "type": "function",
+                "function": {
+                    "name": item.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments": item.get("arguments").cloned().unwrap_or(json!("")),
+                },
+            })),
+            // "reasoning" and anything else the API adds later: dropped.
+            // The Chat Completions shape has nowhere to put them.
+            _ => {}
+        }
+    }
+
+    // Truncation is checked before tool calls: a call cut off mid-arguments
+    // is not one the caller can act on.
+    let truncated = resp
+        .get("incomplete_details")
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        == Some("max_output_tokens");
+    let finish_reason = if truncated {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+
+    let mut message = json!({"role": "assistant", "content": text});
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
+    let usage = resp.get("usage").cloned().unwrap_or(Value::Null);
+    json!({
+        "id": resp.get("id").cloned().unwrap_or(json!("chatcmpl-codex")),
+        "object": "chat.completion",
+        "created": resp.get("created_at").cloned().unwrap_or(json!(0)),
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
+            "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
+            "total_tokens": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +555,126 @@ mod tests {
             );
         }
         assert_eq!(out["input"][0]["content"][0]["text"], json!("hi"));
+    }
+
+    fn fixture(name: &str) -> Value {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex/");
+        let raw = std::fs::read_to_string(format!("{path}{name}"))
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"));
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn fixture_raw(name: &str) -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex/");
+        std::fs::read_to_string(format!("{path}{name}"))
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    #[test]
+    fn splits_sse_frames_and_keeps_partials() {
+        let mut buf = String::from("event: a\ndata: {\"x\":1}\n\nevent: b\ndata: {\"y\"");
+        let frames = split_sse_frames(&mut buf);
+        assert_eq!(frames.len(), 1, "only the complete frame is drained");
+        assert_eq!(frames[0].0, "a");
+        assert_eq!(frames[0].1["x"], json!(1));
+        assert_eq!(
+            buf, "event: b\ndata: {\"y\"",
+            "the partial frame stays buffered"
+        );
+
+        // Completing the partial yields it on the next call.
+        buf.push_str(":2}\n\n");
+        let frames = split_sse_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, "b");
+        assert_eq!(frames[0].1["y"], json!(2));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn aggregates_the_captured_text_stream() {
+        // response.completed carries usage and status but an EMPTY output
+        // array; the items arrive on response.output_item.done. Rebuilding
+        // from response.completed alone would silently produce empty replies.
+        let mut buf = fixture_raw("streaming.sse");
+        let mut agg = ResponseAggregator::new();
+        for (event, data) in split_sse_frames(&mut buf) {
+            agg.push(&event, &data);
+        }
+        let rebuilt = agg.finish();
+        assert_eq!(rebuilt, fixture("nonstreaming.json"));
+    }
+
+    #[test]
+    fn aggregates_the_captured_tool_call_stream() {
+        let mut buf = fixture_raw("toolcall-streaming.sse");
+        let mut agg = ResponseAggregator::new();
+        for (event, data) in split_sse_frames(&mut buf) {
+            agg.push(&event, &data);
+        }
+        assert_eq!(agg.finish(), fixture("toolcall.json"));
+    }
+
+    #[test]
+    fn converts_real_nonstreaming_fixture() {
+        let out = responses_to_chat(&fixture("nonstreaming.json"), "gpt-5.4");
+        assert_eq!(out["object"], json!("chat.completion"));
+        assert_eq!(out["model"], json!("gpt-5.4"));
+        let choice = &out["choices"][0];
+        assert_eq!(choice["index"], json!(0));
+        assert_eq!(choice["message"]["role"], json!("assistant"));
+        assert_eq!(choice["message"]["content"], json!("1\n2\n3\n4\n5"));
+        assert_eq!(choice["finish_reason"], json!("stop"));
+        assert_eq!(out["usage"]["prompt_tokens"], json!(9));
+        assert_eq!(out["usage"]["completion_tokens"], json!(13));
+        assert_eq!(out["usage"]["total_tokens"], json!(22));
+    }
+
+    #[test]
+    fn converts_real_toolcall_fixture() {
+        let out = responses_to_chat(&fixture("toolcall.json"), "gpt-5.4");
+        let choice = &out["choices"][0];
+        assert_eq!(choice["finish_reason"], json!("tool_calls"));
+        let call = &choice["message"]["tool_calls"][0];
+        assert_eq!(call["type"], json!("function"));
+        // The OpenAI tool-call id is call_id, NOT the item's own id.
+        assert_eq!(call["id"], json!("call_uphHcxpvlpMMt0m2ZeigzBfH"));
+        assert_eq!(call["function"]["name"], json!("get_weather"));
+        assert_eq!(
+            call["function"]["arguments"],
+            json!("{\"city\":\"Taipei\"}")
+        );
+    }
+
+    #[test]
+    fn drops_reasoning_items() {
+        let resp = json!({
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "answer"}]}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        });
+        let out = responses_to_chat(&resp, "m");
+        assert_eq!(out["choices"][0]["message"]["content"], json!("answer"));
+        assert!(
+            !out.to_string().contains("thinking"),
+            "reasoning must not leak"
+        );
+    }
+
+    #[test]
+    fn truncation_wins_over_tool_calls() {
+        // Spec decision: a call truncated mid-arguments is not actionable,
+        // so "length" beats "tool_calls".
+        let resp = json!({
+            "output": [{"type": "function_call", "call_id": "c", "name": "f", "arguments": "{\"a"}],
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        });
+        assert_eq!(
+            responses_to_chat(&resp, "m")["choices"][0]["finish_reason"],
+            json!("length")
+        );
     }
 }
