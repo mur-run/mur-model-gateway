@@ -353,7 +353,7 @@ async fn expired_token_triggers_one_refresh_and_retry() {
     // Cleared on drop (including on an assert panic below), so a failure
     // here can't leak the override into whatever the harness runs next.
     let _env_guard = EnvVarGuard("MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT");
-    mur_model_gateway::codex::reset_refresh_cache();
+    mur_model_gateway::codex::reset_refresh_cache().await;
 
     let proxy = spawn_codex(upstream.base_url(), TokenSource::Codex(auth.clone())).await;
     let resp = reqwest::Client::new()
@@ -434,7 +434,7 @@ async fn retry_forwards_original_request_headers() {
         );
     }
     let _env_guard = EnvVarGuard("MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT");
-    mur_model_gateway::codex::reset_refresh_cache();
+    mur_model_gateway::codex::reset_refresh_cache().await;
 
     let proxy = spawn_codex(upstream.base_url(), TokenSource::Codex(auth.clone())).await;
     let resp = reqwest::Client::new()
@@ -453,6 +453,125 @@ async fn retry_forwards_original_request_headers() {
         fresh.hits_async().await,
         1,
         "retry must carry the client's original accept header"
+    );
+    std::fs::remove_file(&auth).ok();
+}
+
+// Multi-thread flavor: same reason as `expired_token_triggers_one_refresh_
+// and_retry` — the refresh grant runs through the blocking bridge.
+//
+// Fix round 2, finding A: releasing the cache lock across the network call
+// (round 1, finding 5) restored liveness but lost single-flight — N
+// concurrent cold-cache 401s could each pass the "cache is empty" check
+// before any of them finished refreshing, and each would redeem the same
+// (rotating) refresh token. The first redemption invalidates it, so the
+// losers would get `invalid_grant`, and an interleaved `persist_rotation`
+// could write a superseded token back over a newer one in `auth.json`,
+// stranding the user's real Codex CLI on a dead credential. This test
+// fires many concurrent requests at a cold cache and asserts the token
+// endpoint is hit exactly once. The token endpoint mock is deliberately
+// slow so the race window a broken implementation would need is wide open
+// regardless of scheduling — the assertion is deterministic, not a timing
+// coincidence.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_401s_redeem_the_refresh_token_exactly_once() {
+    let _serial = serial_guard().await;
+    let upstream = MockServer::start_async().await;
+
+    let stale = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer stale-tok");
+            then.status(401).body(r#"{"error":"expired"}"#);
+        })
+        .await;
+
+    let fresh = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer fresh-tok");
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let token_ep = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/oauth/token");
+            // Deliberately slow (fix round 2, finding A's test): widens
+            // the window a non-single-flight implementation would race
+            // through, so 16 concurrently spawned requests are guaranteed
+            // to all reach their own cache check well before this
+            // response lands, regardless of how the OS schedules them.
+            then.status(200)
+                .delay(Duration::from_millis(150))
+                .body(r#"{"access_token":"fresh-tok"}"#);
+        })
+        .await;
+
+    let dir = std::env::temp_dir().join("mmg-codex-concurrent-refresh");
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth = dir.join("auth.json");
+    std::fs::write(
+        &auth,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"stale-tok","refresh_token":"fake-refresh-token","account_id":"acct-fake"}}"#,
+    )
+    .unwrap();
+
+    // SAFETY: `_serial` (acquired above) holds `ENV_SERIAL` for this test's
+    // full body, and every test in this file acquires that same lock before
+    // touching env — no other thread in this process can be reading or
+    // writing env while this runs.
+    unsafe {
+        std::env::set_var(
+            "MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT",
+            format!("{}/oauth/token", upstream.base_url()),
+        );
+    }
+    let _env_guard = EnvVarGuard("MUR_MODEL_GATEWAY_CODEX_TOKEN_ENDPOINT");
+    mur_model_gateway::codex::reset_refresh_cache().await;
+
+    let proxy = spawn_codex(upstream.base_url(), TokenSource::Codex(auth.clone())).await;
+
+    // Fire many requests at once, all racing to refresh the same cold cache.
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let proxy = proxy.clone();
+        handles.push(tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{proxy}/v1/responses"))
+                .header("content-type", "application/json")
+                .body(r#"{"model":"gpt-5-codex","input":"say ok"}"#)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    let mut statuses = Vec::new();
+    for h in handles {
+        statuses.push(h.await.unwrap());
+    }
+
+    assert!(
+        statuses.iter().all(|s| *s == 200),
+        "every concurrent request must succeed via the one refreshed token: {statuses:?}"
+    );
+    assert_eq!(
+        stale.hits_async().await,
+        16,
+        "every request's own first attempt hits the stale token once"
+    );
+    assert_eq!(
+        token_ep.hits_async().await,
+        1,
+        "single-flight: 16 concurrent cold-cache 401s must redeem the refresh token exactly once"
+    );
+    assert_eq!(
+        fresh.hits_async().await,
+        16,
+        "every retry must use the one refreshed token"
     );
     std::fs::remove_file(&auth).ok();
 }

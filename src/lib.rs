@@ -454,7 +454,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     if provider == Provider::Codex
         && upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
         && let TokenSource::Codex(path) = state.token_source_for(Provider::Codex)
-        && let Some(fresh) = codex::refreshed_access_token(path)
+        && let Some(fresh) = codex::refreshed_access_token(path).await
     {
         let account_id = codex::read_auth(path).and_then(|a| a.account_id);
         let mut retry = state.client.request(parts.method.clone(), &target_url);

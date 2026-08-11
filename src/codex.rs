@@ -42,8 +42,15 @@ pub use codex_impl::*;
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
+// `tokio::sync::Mutex`, not `std::sync::Mutex` (fix round 2, finding A):
+// `refreshed_access_token` holds this lock across a blocking network call
+// to restore single-flight. A `tokio`-aware mutex is safe to hold there —
+// acquiring it yields the task instead of parking a worker thread, and it
+// has no poisoning concept — where a `std::sync::Mutex` held the same way
+// was round 1 finding 5's original defect.
+use tokio::sync::Mutex;
 
 /// What an OAuth refresh grant returns. `refresh_token` is `Some` when the
 /// provider rotates it — ChatGPT does, so it must be persisted or the next
@@ -112,38 +119,36 @@ pub fn read_auth(path: &Path) -> Option<CodexAuth> {
 }
 
 /// Most recent refresh, memoised so a burst of 401s triggers one grant.
+/// True single-flight (fix round 2, finding A): `refreshed_access_token`
+/// holds this lock for its *entire* check-refresh-store sequence, so
+/// concurrent cold-cache callers queue behind whichever one gets there
+/// first — the losers, once they acquire the lock, re-check the cache and
+/// reuse the token the winner just stored instead of redeeming the
+/// (rotating) refresh token a second time.
 static REFRESHED: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
-
-/// `Mutex::lock` only returns `Err` when a previous holder panicked while
-/// holding the guard. The refresh cache is fine to keep using after that —
-/// worst case a stale entry triggers one extra refresh — so recover it
-/// instead of propagating the panic into every later Codex 401 for the rest
-/// of the process's life (fix round 1, finding 5).
-fn lock_recovering<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 /// A usable access token, refreshing when the stored one was rejected. The
 /// grant rotates the refresh token, so the new pair is persisted — discarding
 /// it strands both this gateway and Codex CLI on a dead credential.
 /// Memoised for `keychain::CACHE_TTL`.
-pub fn refreshed_access_token(path: &Path) -> Option<String> {
+pub async fn refreshed_access_token(path: &Path) -> Option<String> {
     let cell = REFRESHED.get_or_init(|| Mutex::new(None));
 
-    // Fix round 1, finding 5: the lock is held only long enough to read the
-    // cache. `refresh_access_token` below is a blocking network call —
-    // holding the lock across it would park every other Codex 401 in this
-    // process for a full round trip, and a panic mid-call would poison the
-    // mutex permanently.
+    // Fix round 2, finding A: held for the whole check-then-refresh-then-
+    // store sequence, not just the read. Round 1, finding 5 released this
+    // lock before the network call to stop it from parking every other
+    // Codex 401 in this process for a full round trip and from poisoning
+    // permanently on panic — both `std::sync::Mutex` problems. Neither
+    // applies to `tokio::sync::Mutex`: a task waiting on `.lock().await`
+    // yields instead of blocking a worker thread, and there is no
+    // poisoning to propagate. Holding it here is what makes concurrent
+    // cold-cache 401s single-flight instead of each redeeming the same
+    // rotating refresh token.
+    let mut slot = cell.lock().await;
+    if let Some((at, tok)) = slot.as_ref()
+        && at.elapsed() < crate::keychain::CACHE_TTL
     {
-        let slot = lock_recovering(cell);
-        if let Some((at, tok)) = slot.as_ref()
-            && at.elapsed() < crate::keychain::CACHE_TTL
-        {
-            return Some(tok.clone());
-        }
+        return Some(tok.clone());
     }
 
     let rt = read_auth(path)?.refresh_token?;
@@ -154,7 +159,7 @@ pub fn refreshed_access_token(path: &Path) -> Option<String> {
                 // rotation means the next refresh fails. Warn loudly.
                 tracing::warn!(error = %e, "codex token rotation not persisted");
             }
-            *lock_recovering(cell) = Some((Instant::now(), new.access_token.clone()));
+            *slot = Some((Instant::now(), new.access_token.clone()));
             Some(new.access_token)
         }
         Err(e) => {
@@ -166,9 +171,9 @@ pub fn refreshed_access_token(path: &Path) -> Option<String> {
 
 /// Clear the in-memory refreshed token. Test-only: the cache is process-global
 /// and would otherwise leak between integration tests.
-pub fn reset_refresh_cache() {
+pub async fn reset_refresh_cache() {
     if let Some(cell) = REFRESHED.get() {
-        *lock_recovering(cell) = None;
+        *cell.lock().await = None;
     }
 }
 
@@ -177,9 +182,13 @@ pub fn reset_refresh_cache() {
 /// `last_refresh` is deliberately left alone — it is Codex CLI's bookkeeping,
 /// and updating it would need a date dependency this crate does not have.
 /// Removes its path on drop unless [`Self::keep`] was called. Guarantees a
-/// failed atomic write (create, write, sync, or rename) never leaves a
-/// stray, world-readable-or-not temp file holding a live access/refresh
-/// token pair sitting on disk (fix round 1, finding 1).
+/// failed write, sync, or rename never leaves a stray, world-readable-or-not
+/// temp file holding a live access/refresh token pair sitting on disk (fix
+/// round 1, finding 1). Must only be constructed after the temp file has
+/// actually been created by this call — see the call site in
+/// `persist_rotation` — otherwise a `create_new` collision (EEXIST) would
+/// arm the guard to delete a path this call never created, likely another
+/// process's in-flight rotation (fix round 2, finding B).
 struct TempFileGuard<'a> {
     path: &'a Path,
     keep: bool,
@@ -200,9 +209,14 @@ impl<'a> TempFileGuard<'a> {
 impl Drop for TempFileGuard<'_> {
     fn drop(&mut self) {
         if !self.keep {
-            // Best-effort: this path may never have been created (e.g. if
-            // `create_new` itself is what failed), in which case removal
-            // errors and that error is expected and ignored.
+            // Best-effort: something between construction and drop (write,
+            // sync, rename) may already have consumed this path, in which
+            // case removal errors and that error is expected and ignored.
+            // Safe to assume this path is ours to remove: the guard is
+            // only ever constructed after `create_new` has already
+            // succeeded (fix round 2, finding B), so it can never point at
+            // a different process's in-flight temp file from a
+            // `create_new` collision.
             let _ = std::fs::remove_file(self.path);
         }
     }
@@ -261,13 +275,18 @@ fn persist_rotation(path: &Path, new: &RefreshedTokens) -> anyhow::Result<()> {
         std::process::id()
     ));
 
-    let guard = TempFileGuard::new(&tmp);
+    // Armed only after `create_new` below actually succeeds (fix round 2,
+    // finding B): arming it first meant a collision (EEXIST — e.g. pid
+    // reuse racing another process's in-flight rotation) would delete that
+    // OTHER process's temp file on drop, since `create_new` failing here
+    // means this call never created anything at `tmp` to clean up.
     // 0600 from creation (fix round 1, finding 1): the old `write` then
     // `set_permissions` left a window where the temp file held a live
     // token pair at the default (world-readable) mode, and a crash in that
     // window left it that way.
     let mut file = create_temp_exclusive(&tmp)
         .with_context(|| format!("create temp file for {}", path.display()))?;
+    let guard = TempFileGuard::new(&tmp);
     use std::io::Write;
     file.write_all(&bytes)
         .with_context(|| format!("write temp file for {}", path.display()))?;
