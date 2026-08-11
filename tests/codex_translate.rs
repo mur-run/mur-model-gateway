@@ -22,6 +22,29 @@ async fn spawn_gateway(upstream: &str, compress: bool) -> String {
     addr.to_string()
 }
 
+/// Start a gateway whose Codex route runs in API-key mode: the credential
+/// comes from a temp `auth.json` whose `auth_mode` is "apikey", and the
+/// API-key upstream is pointed at the mock (the production default is the
+/// hard-coded api.openai.com — see the plan's deviation note). Returns the
+/// address and the TempDir; the TempDir must stay alive for the test body,
+/// because the gateway re-reads auth.json on every request.
+async fn spawn_apikey_gateway(upstream: &str, auth_json: &str) -> (String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("auth.json"), auth_json).unwrap();
+    let path = dir.path().join("auth.json");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut state = AppState::new(upstream, upstream, upstream, TokenSource::Disabled)
+        .unwrap()
+        .with_upstream_codex_apikey(upstream)
+        .with_token_source_codex(TokenSource::Codex(path));
+    state.compress = false;
+    let app = build_router(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr.to_string(), dir)
+}
+
 async fn post(gw: &str, path: &str, body: Value) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("http://{gw}{path}"))
@@ -59,6 +82,20 @@ fn is_untranslated_chat_body(req: &HttpMockRequest) -> bool {
     v.get("messages").is_some() && v.get("input").is_none()
 }
 
+/// True only if the request carries none of the ChatGPT client headers the
+/// OAuth `apply_codex_headers` hook would set. API-key mode sends the key
+/// and nothing else.
+///
+/// httpmock 0.7 exposes headers as `Option<Vec<(String, String)>>` — a list,
+/// not a map — so this scans it. Absent headers (`None`) trivially satisfy
+/// the absence check.
+fn has_no_chatgpt_account_id(req: &HttpMockRequest) -> bool {
+    req.headers.as_ref().is_none_or(|hs| {
+        !hs.iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("chatgpt-account-id"))
+    })
+}
+
 /// The upstream body must be translated AND smaller than the fat input.
 /// If compression ever ran after translation the rewriter would see a
 /// Responses body it does not understand and silently do nothing.
@@ -89,6 +126,8 @@ const SSE_REPLY: &str = concat!(
     r#"data: {"type":"response.completed","response":{"id":"resp_1","created_at":1,"model":"gpt-5.4","status":"completed","incomplete_details":null,"output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
     "\n\n",
 );
+
+const APICKEY_AUTH: &str = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test-key","tokens":null}"#;
 
 #[tokio::test]
 async fn translates_request_and_aggregates_the_sse_reply() {
@@ -276,6 +315,47 @@ async fn translates_a_streaming_response() {
     assert_eq!(frames.last().unwrap(), "[DONE]");
 }
 
+/// A CRLF stream must translate identically: git checks the fixtures out with
+/// CRLF on Windows, and CR is legal in SSE.
+#[tokio::test]
+async fn translates_a_crlf_streaming_response() {
+    let upstream = MockServer::start_async().await;
+    let _m = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(fixture_sse("streaming.sse").replace('\n', "\r\n"));
+        })
+        .await;
+
+    let gw = spawn_gateway(&upstream.base_url(), false).await;
+    let frames = post_sse(
+        &gw,
+        "/codex/v1/chat/completions",
+        json!({
+            "model": "gpt-5-codex",
+            "messages": [{"role": "user", "content": "count"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let first: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(first["choices"][0]["delta"]["role"], json!("assistant"));
+    let text: String = frames
+        .iter()
+        .filter(|f| *f != "[DONE]")
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(!text.is_empty(), "CRLF stream produced no content");
+}
+
 #[tokio::test]
 async fn streams_tool_calls() {
     let upstream = MockServer::start_async().await;
@@ -367,5 +447,89 @@ async fn compression_runs_before_translation_on_the_codex_path() {
     .await;
 
     assert_eq!(resp.status(), 200);
+    m.assert_async().await;
+}
+
+#[tokio::test]
+async fn apikey_mode_keeps_v1_and_sends_bearer_key() {
+    let upstream = MockServer::start_async().await;
+    let m = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/responses")
+                .header("authorization", "Bearer sk-test-key")
+                .matches(has_no_chatgpt_account_id);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let (gw, _dir) = spawn_apikey_gateway(&upstream.base_url(), APICKEY_AUTH).await;
+    let resp = post(&gw, "/v1/responses", json!({"model": "m", "input": "hi"})).await;
+
+    assert_eq!(resp.status(), 200);
+    // The mock matches ONLY `/v1/responses` carrying `Bearer sk-test-key`
+    // and no `chatgpt-account-id` header. OAuth mode would hit `/responses`,
+    // never this key, and would attach the account-id header — so a hit
+    // proves all three API-key facts at once.
+    m.assert_async().await;
+}
+
+#[tokio::test]
+async fn apikey_401_is_returned_unchanged_with_no_retry() {
+    let upstream = MockServer::start_async().await;
+    let m = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/responses");
+            then.status(401).body(r#"{"error":"invalid api key"}"#);
+        })
+        .await;
+
+    let (gw, _dir) = spawn_apikey_gateway(&upstream.base_url(), APICKEY_AUTH).await;
+    let resp = post(&gw, "/v1/responses", json!({"model": "m", "input": "hi"})).await;
+
+    assert_eq!(resp.status(), 401);
+    // Exactly one upstream hit: API-key mode has no refresh token to redeem,
+    // so a 401 must not trigger the OAuth refresh-and-retry path.
+    m.assert_hits_async(1).await;
+}
+
+#[tokio::test]
+async fn apikey_mode_translates_chat_completions_to_v1_responses() {
+    let upstream = MockServer::start_async().await;
+    let m = upstream
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v1/responses")
+                .matches(is_translated_responses_body);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(SSE_REPLY);
+        })
+        .await;
+
+    let (gw, _dir) = spawn_apikey_gateway(&upstream.base_url(), APICKEY_AUTH).await;
+    // stream is absent, so the client wants a single JSON reply — the gateway
+    // translates, asks the upstream to stream, and aggregates.
+    let resp = post(
+        &gw,
+        "/codex/v1/chat/completions",
+        json!({"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/json",
+        "the upstream's text/event-stream must not leak to the client"
+    );
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["object"], json!("chat.completion"));
+    assert_eq!(out["choices"][0]["message"]["content"], json!("hi back"));
+    // The upstream saw a translated Responses body at /v1/responses — the
+    // OAuth translate route targets /responses instead, so this proves the
+    // mode-aware path.
     m.assert_async().await;
 }
