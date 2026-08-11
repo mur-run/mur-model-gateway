@@ -40,6 +40,48 @@ mod codex_impl {
 
 pub use codex_impl::*;
 
+use std::path::{Path, PathBuf};
+
+/// Credentials as Codex CLI stores them in `~/.codex/auth.json`.
+#[derive(Clone, Debug)]
+pub struct CodexAuth {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub account_id: Option<String>,
+}
+
+/// `~/.codex/auth.json`.
+pub fn default_auth_path() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|d| d.home_dir().join(".codex/auth.json"))
+}
+
+/// Parse the auth blob. `None` for malformed JSON, missing tokens, or
+/// API-key mode — all of which mean "no OAuth credential available".
+pub fn parse_auth(raw: &str) -> Option<CodexAuth> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if v.get("auth_mode").and_then(|m| m.as_str()) != Some("chatgpt") {
+        return None;
+    }
+    let tokens = v.get("tokens")?;
+    Some(CodexAuth {
+        access_token: tokens.get("access_token")?.as_str()?.to_string(),
+        refresh_token: tokens
+            .get("refresh_token")
+            .and_then(|t| t.as_str())
+            .map(str::to_string),
+        account_id: tokens
+            .get("account_id")
+            .and_then(|t| t.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// Read and parse the auth file. `None` if absent or unusable — the caller
+/// falls through to passthrough.
+pub fn read_auth(path: &Path) -> Option<CodexAuth> {
+    parse_auth(&std::fs::read_to_string(path).ok()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +94,38 @@ mod tests {
         assert!(!should_route("/v1/messages"));
         assert!(!should_route("/v1/chat/completions"));
         assert!(!should_route("/v1/responsesX"));
+    }
+
+    #[test]
+    fn parses_chatgpt_mode_auth() {
+        let raw = r#"{
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "fake-id-token",
+                "access_token": "fake-access-token",
+                "refresh_token": "fake-refresh-token",
+                "account_id": "acct-fake"
+            },
+            "last_refresh": "2026-07-10T00:20:57.310171Z"
+        }"#;
+        let a = parse_auth(raw).expect("should parse");
+        assert_eq!(a.access_token, "fake-access-token");
+        assert_eq!(a.refresh_token.as_deref(), Some("fake-refresh-token"));
+        assert_eq!(a.account_id.as_deref(), Some("acct-fake"));
+    }
+
+    #[test]
+    fn rejects_api_key_mode() {
+        // Stage 1 handles OAuth only; API-key mode resolves to None so the
+        // caller falls through to passthrough rather than sending a bad token.
+        let raw = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake","tokens":null}"#;
+        assert!(parse_auth(raw).is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        assert!(parse_auth("{not json").is_none());
+        assert!(parse_auth("{}").is_none());
     }
 }
