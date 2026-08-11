@@ -43,11 +43,24 @@ pub use codex_impl::*;
 use std::path::{Path, PathBuf};
 
 /// Credentials as Codex CLI stores them in `~/.codex/auth.json`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CodexAuth {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub account_id: Option<String>,
+}
+
+impl std::fmt::Debug for CodexAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexAuth")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 /// `~/.codex/auth.json`.
@@ -127,5 +140,23 @@ mod tests {
     fn rejects_malformed_json() {
         assert!(parse_auth("{not json").is_none());
         assert!(parse_auth("{}").is_none());
+    }
+
+    #[test]
+    fn debug_redacts_tokens() {
+        let auth = CodexAuth {
+            access_token: "fake-access-token".to_string(),
+            refresh_token: Some("fake-refresh-token".to_string()),
+            account_id: Some("acct-fake".to_string()),
+        };
+        let debug_str = format!("{:?}", auth);
+
+        // Verify tokens are redacted
+        assert!(!debug_str.contains("fake-access-token"));
+        assert!(!debug_str.contains("fake-refresh-token"));
+        assert!(debug_str.contains("<redacted>"));
+
+        // Verify account_id is NOT redacted
+        assert!(debug_str.contains("acct-fake"));
     }
 }
