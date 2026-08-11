@@ -104,6 +104,7 @@ impl std::fmt::Debug for CodexAuth {
 /// header shape, and 401 behaviour — which is exactly why they are a tagged
 /// union and not a tuple: a `CodexCredential` forces `forward()` to handle
 /// each mode's coupled choices explicitly.
+#[derive(Clone)]
 pub enum CodexCredential {
     /// ChatGPT subscription OAuth.
     OAuth {
@@ -187,6 +188,10 @@ pub fn read_auth(path: &Path) -> Option<CodexAuth> {
     parse_auth(&std::fs::read_to_string(path).ok()?)
 }
 
+/// Read and parse the auth file into a [`CodexCredential`], dispatching on
+/// `auth_mode`. `None` if absent, malformed, missing its key/token, or an
+/// unrecognised mode — the caller falls through to passthrough, warning
+/// logged. `parse_auth` stays the OAuth arm; API-key mode is handled here.
 pub fn read_credential(path: &Path) -> Option<CodexCredential> {
     let raw = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
