@@ -9,6 +9,7 @@
 //! applies to tool_result blocks for all three providers.
 
 pub mod cc_version;
+pub mod codex;
 pub mod compress;
 pub mod disguise;
 pub mod install;
