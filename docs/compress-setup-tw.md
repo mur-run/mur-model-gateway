@@ -19,9 +19,14 @@ mur-model-gateway install                 # 不帶參數 → 沿用安裝當下�
 ## 套用到本機服務
 
 ```bash
-./scripts/setup.sh                       # 重新 build + 安裝 + 重啓服務(不啓壓縮)
-MUR_MODEL_GATEWAY_COMPRESS=1 ./scripts/setup.sh   # 同上,但啓用壓縮
+./scripts/setup.sh                          # 重新 build + 安裝 + 重啓服務(不啓壓縮)
+./scripts/setup.sh -- --compress            # 同上,但啓用壓縮
+./scripts/setup.sh --system -- --compress   # system 層級安裝,啓用壓縮
 ```
+
+`--` 之後的參數會傳給 `mur-model-gateway install`,所以 `--compress` 是到處都有效的寫法。
+不要用 `MUR_MODEL_GATEWAY_COMPRESS=1 ./scripts/setup.sh`:嗅探只看得到真正傳進 install
+行程的環境,而 `--system` 會經過 `sudo`,sudo 預設會重設環境——變數被丟掉,裝出來的服務壓縮是關的。
 
 ## 驗證
 

@@ -19,9 +19,17 @@ definition, so re-running `setup.sh` does not lose it.
 ## Applying it to the local service
 
 ```bash
-./scripts/setup.sh                       # rebuild + install + restart the service (compression off)
-MUR_MODEL_GATEWAY_COMPRESS=1 ./scripts/setup.sh   # same, but with compression enabled
+./scripts/setup.sh                          # rebuild + install + restart the service (compression off)
+./scripts/setup.sh -- --compress            # same, with compression enabled
+./scripts/setup.sh --system -- --compress   # system-wide install, compression enabled
 ```
+
+Everything after `--` goes to `mur-model-gateway install`, so `--compress` is
+the form that works everywhere. Prefer it to exporting
+`MUR_MODEL_GATEWAY_COMPRESS=1` before `setup.sh`: the sniff only sees what
+reaches the install process, and `--system` shells out through `sudo`, which
+resets the environment — the exported variable is dropped and you get a service
+with compression silently off.
 
 ## Verifying
 
