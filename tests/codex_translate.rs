@@ -196,3 +196,101 @@ async fn plain_openai_path_is_still_untranslated() {
     assert_eq!(resp.status(), 200);
     m.assert_async().await;
 }
+
+/// Collect the `data:` payloads of an SSE response, in order.
+async fn post_sse(gw: &str, path: &str, body: Value) -> Vec<String> {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{gw}{path}"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .json(&body)
+        .send()
+        .await
+        .expect("gateway request");
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    text.lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(|d| d.trim().to_string())
+        .collect()
+}
+
+fn fixture_sse(name: &str) -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex/");
+    std::fs::read_to_string(format!("{path}{name}")).expect("run Task 1 first")
+}
+
+#[tokio::test]
+async fn translates_a_streaming_response() {
+    let upstream = MockServer::start_async().await;
+    let _m = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(fixture_sse("streaming.sse"));
+        })
+        .await;
+
+    let gw = spawn_gateway(&upstream.base_url(), false).await;
+    let frames = post_sse(
+        &gw,
+        "/codex/v1/chat/completions",
+        json!({
+            "model": "gpt-5-codex",
+            "messages": [{"role": "user", "content": "count"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(!frames.is_empty());
+    let first: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(first["object"], json!("chat.completion.chunk"));
+    assert_eq!(first["choices"][0]["delta"]["role"], json!("assistant"));
+
+    let text: String = frames
+        .iter()
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(!text.is_empty(), "content must survive translation");
+
+    assert_eq!(frames.last().unwrap(), "[DONE]");
+}
+
+#[tokio::test]
+async fn streams_tool_calls() {
+    let upstream = MockServer::start_async().await;
+    let _m = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(fixture_sse("toolcall-streaming.sse"));
+        })
+        .await;
+
+    let gw = spawn_gateway(&upstream.base_url(), false).await;
+    let frames = post_sse(
+        &gw,
+        "/codex/v1/chat/completions",
+        json!({"model": "m", "messages": [], "stream": true}),
+    )
+    .await;
+
+    let args: String = frames
+        .iter()
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    serde_json::from_str::<Value>(&args).expect("arguments must reassemble into JSON");
+}

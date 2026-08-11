@@ -558,6 +558,86 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         response_headers.insert(name.clone(), value.clone());
     }
 
+    if translating && client_wants_stream {
+        use futures_util::StreamExt;
+
+        let model = client_model.clone().unwrap_or_default();
+        let state = (
+            upstream_resp.bytes_stream(),
+            String::new(), // partial-frame buffer
+            translate::SseTranslator::new(model),
+            false, // upstream exhausted?
+        );
+
+        let stream = futures_util::stream::unfold(
+            state,
+            |(mut src, mut buf, mut translator, drained)| async move {
+                if drained {
+                    return None;
+                }
+                loop {
+                    match src.next().await {
+                        Some(Ok(chunk)) => {
+                            buf.push_str(&String::from_utf8_lossy(&chunk));
+                            let mut out = Vec::new();
+                            // SSE frames are separated by a blank line.
+                            while let Some(split) = buf.find("\n\n") {
+                                let frame: String = buf.drain(..split + 2).collect();
+                                let (mut event, mut data) = ("", "");
+                                for line in frame.lines() {
+                                    if let Some(e) = line.strip_prefix("event:") {
+                                        event = e.trim();
+                                    }
+                                    if let Some(d) = line.strip_prefix("data:") {
+                                        data = d.trim();
+                                    }
+                                }
+                                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
+                                else {
+                                    continue;
+                                };
+                                for c in translator.push(event, &parsed) {
+                                    out.push(format!("data: {c}\n\n"));
+                                }
+                            }
+                            // A chunk can arrive mid-frame and yield nothing;
+                            // keep pulling rather than emitting an empty item.
+                            if !out.is_empty() {
+                                let bytes = axum::body::Bytes::from(out.concat());
+                                return Some((
+                                    Ok::<_, std::io::Error>(bytes),
+                                    (src, buf, translator, false),
+                                ));
+                            }
+                        }
+                        // End of stream, or a transport error: close the
+                        // conversation cleanly. Headers are already sent, so
+                        // the status can no longer change.
+                        _ => {
+                            let mut tail: Vec<String> = translator
+                                .finish()
+                                .iter()
+                                .map(|c| format!("data: {c}\n\n"))
+                                .collect();
+                            tail.push("data: [DONE]\n\n".to_string());
+                            let bytes = axum::body::Bytes::from(tail.concat());
+                            return Some((Ok(bytes), (src, buf, translator, true)));
+                        }
+                    }
+                }
+            },
+        );
+
+        response_headers.remove("content-length");
+        let mut builder = Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            builder = builder.header(name, value);
+        }
+        return builder
+            .body(Body::from_stream(stream))
+            .context("build translated stream");
+    }
+
     if translating && !client_wants_stream {
         let raw = upstream_resp.bytes().await.context("read upstream body")?;
         if !status.is_success() {
