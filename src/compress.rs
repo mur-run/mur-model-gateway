@@ -695,6 +695,10 @@ mod tests {
             "/v1beta/models/gemini-2.5-flash:embedContent",
             Provider::Gemini
         ));
+
+        // The Responses body is not the messages body; compressing it would
+        // corrupt requests. Deliberately out of scope for stage 1.
+        assert!(!should_compress("/v1/responses", Provider::Codex));
     }
 
     #[test]
