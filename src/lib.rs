@@ -123,7 +123,7 @@ pub fn codex_target_path(path_and_query: &str) -> String {
 /// Credential Manager). [`TokenSource::EnvVar`] reads from a process env
 /// var for platforms where Claude Code's keychain layout isn't supported.
 /// [`TokenSource::Static`] is a test injection point.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum TokenSource {
     /// Read from the OS keychain (Claude Code's `Claude Code-credentials`).
     Keychain,
@@ -668,6 +668,73 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             .with_context(|| format!("upstream retry {target_url}"))?;
     }
 
+    // Anthropic: the owner CLI holds the refresh token, so ask it to refresh
+    // rather than redeeming the token here. One retry only, same as Codex.
+    //
+    // `override_token.is_some()` is an extra guard beyond
+    // `anthropic_retry_eligible`: the predicate only inspects the
+    // *configured* token source, not whether this request actually used it.
+    // Mode 3 (a client-supplied, non-OAuth-shape credential) leaves
+    // `override_token` `None` even when a claude-owned TokenSource is
+    // configured. Same principle as `codex_cred.as_ref()` being `Some`
+    // above — eligibility requires proof *this gateway* attached the
+    // credential that got rejected, so a third party's bad key can never
+    // trigger a probe or spend the user's real refresh token.
+    let anthropic_source = state.token_source_for(Provider::Anthropic);
+    let anthropic_expiry = anthropic_credential_expiry(&state);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if override_token.is_some()
+        && anthropic_retry_eligible(
+            provider,
+            upstream_resp.status(),
+            anthropic_source,
+            anthropic_expiry,
+            now_ms,
+        )
+        && auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, anthropic_expiry)
+            .await
+            == auth_probe::ProbeOutcome::Refreshed
+        && let Ok(Some(fresh)) = anthropic_source.resolve()
+    {
+        let has_anthropic_version = parts.headers.contains_key("anthropic-version");
+        let retry_body: Vec<u8> = if let Some(ver) = cc_version.as_deref() {
+            disguise::inject_billing_prefix(&body_bytes, ver)?
+        } else {
+            body_bytes.to_vec()
+        };
+        let mut retry = state.client.request(parts.method.clone(), &target_url);
+        // Mirrors the Codex retry arm immediately above: forward the same
+        // client headers as the first attempt, minus hop-by-hop/host/
+        // content-length and the auth headers we're about to replace.
+        // `anthropic-beta` is skipped too, same reason it was
+        // captured-and-skipped on the first attempt: `apply_disguise_headers`
+        // below re-adds the merged value, and forwarding the client's raw
+        // header as well would send the upstream two `anthropic-beta`
+        // headers instead of one.
+        for (name, value) in parts.headers.iter() {
+            if is_hop_by_hop(name)
+                || name == "host"
+                || name == "content-length"
+                || name == "authorization"
+                || name == "x-api-key"
+                || name == "anthropic-beta"
+            {
+                continue;
+            }
+            retry = retry.header(name, value);
+        }
+        retry =
+            disguise::apply_disguise_headers(retry, &fresh, &client_betas, has_anthropic_version)?;
+        upstream_resp = retry
+            .body(retry_body)
+            .send()
+            .await
+            .with_context(|| format!("upstream retry {target_url}"))?;
+    }
+
     let status = upstream_resp.status();
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream_resp.headers().iter() {
@@ -825,6 +892,48 @@ fn codex_retry_eligible(
         // credential) is likewise never eligible, as before.
         Some(codex::CodexCredential::ApiKey { .. }) | None => false,
     }
+}
+
+/// Whether an Anthropic 401 is worth a delegated refresh.
+///
+/// A 401 with the stored expiry still in the future means the credential was
+/// revoked upstream, not that it aged out — a refresh cannot fix that, so the
+/// gateway must not spawn a probe for it. A blob with no expiry is allowed
+/// through once; the probe's own cooldown bounds the cost if it is fruitless.
+pub fn anthropic_retry_eligible(
+    provider: Provider,
+    status: reqwest::StatusCode,
+    source: &TokenSource,
+    expires_at_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    // Only a store Claude Code owns can be repaired by asking Claude Code to
+    // refresh. A raw key from the environment is rejected on its own merits.
+    let claude_owned = matches!(
+        source,
+        TokenSource::Keychain | TokenSource::CredentialsFile(_)
+    );
+    provider == Provider::Anthropic
+        && status == reqwest::StatusCode::UNAUTHORIZED
+        && claude_owned
+        && expires_at_ms.is_none_or(|exp| exp <= now_ms)
+}
+
+/// The stored expiry for Anthropic, read from **the same source the token came
+/// from**. Reading the keychain unconditionally would be wrong on every Linux
+/// and Windows install, where Claude Code writes
+/// `~/.claude/.credentials.json` and there is no keychain to read — the expiry
+/// would come back unknown on every request and the probe would fire on every
+/// 401.
+fn anthropic_credential_expiry(state: &AppState) -> Option<i64> {
+    let cred = match state.token_source_for(Provider::Anthropic) {
+        TokenSource::Keychain => keychain::read_claude_code_credential().ok().flatten(),
+        TokenSource::CredentialsFile(p) => {
+            keychain::read_credentials_file_credential(p).ok().flatten()
+        }
+        _ => None,
+    };
+    cred.and_then(|c| c.expires_at_ms)
 }
 
 /// If the inbound request supplies an Anthropic OAuth subscription token

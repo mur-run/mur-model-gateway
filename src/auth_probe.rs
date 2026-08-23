@@ -3,6 +3,7 @@
 //! token itself — see the spec's Rejected section for why.
 
 use crate::AuthProbe;
+use crate::TokenSource;
 use crate::keychain;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -63,26 +64,50 @@ fn cooldown_active() -> bool {
 /// Ask the owner CLI to refresh, then report whether the stored expiry moved.
 ///
 /// `before_ms` is the `expiresAt` observed before the probe; the credential is
-/// re-read afterwards and the two compared. A blob without an expiry compares
-/// as unchanged, which is the safe direction: it costs one wasted retry, not a
-/// spawn loop.
-pub async fn refresh_via_owner(probe: &AuthProbe, before_ms: Option<i64>) -> ProbeOutcome {
-    refresh_via_owner_with(probe, before_ms, || {
-        // Bypass the 60s memoise: the child just rewrote the store, and a
-        // cached read would return the token we already know is dead.
-        keychain::invalidate_cache();
-        keychain::read_claude_code_credential()
-            .ok()
-            .flatten()
-            .and_then(|c| c.expires_at_ms)
+/// re-read afterwards **from `source`** and the two compared. A blob without
+/// an expiry compares as unchanged, which is the safe direction: it costs one
+/// wasted retry, not a spawn loop. Reading a hardcoded Keychain regardless of
+/// `source` would be wrong on every Linux/Windows install, where Claude Code
+/// writes `~/.claude/.credentials.json` instead of using the OS keychain —
+/// the post-probe read would never see the file the probe just rewrote, so a
+/// genuine refresh would be reported as `NoChange` (arming a 15-minute
+/// cooldown over a credential that is actually fine now).
+pub async fn refresh_via_owner(
+    probe: &AuthProbe,
+    source: &TokenSource,
+    before_ms: Option<i64>,
+) -> ProbeOutcome {
+    refresh_via_owner_with(probe, before_ms, || match source {
+        TokenSource::Keychain => {
+            // Bypass the 60s memoise: the child just rewrote the store, and a
+            // cached read would return the token we already know is dead.
+            keychain::invalidate_cache();
+            keychain::read_claude_code_credential()
+                .ok()
+                .flatten()
+                .and_then(|c| c.expires_at_ms)
+        }
+        TokenSource::CredentialsFile(path) => {
+            // Uncached — always reads the file fresh, so there is no
+            // memoise to bypass here.
+            keychain::read_credentials_file_credential(path)
+                .ok()
+                .flatten()
+                .and_then(|c| c.expires_at_ms)
+        }
+        // `anthropic_retry_eligible` (src/lib.rs) only calls this for a
+        // claude-owned source (Keychain or CredentialsFile) in the first
+        // place — unreachable in production, kept so the match stays
+        // exhaustive against future TokenSource variants.
+        _ => None,
     })
     .await
 }
 
 /// The body, with the post-probe credential read injected. Tests drive every
 /// outcome through this; production goes through the wrapper above, which
-/// supplies the real keychain read. Without this seam the `Refreshed` outcome
-/// could not be tested at all — it would depend on the machine's live
+/// supplies a real, source-matched read. Without this seam the `Refreshed`
+/// outcome could not be tested at all — it would depend on the machine's live
 /// keychain. `read_after` is `Fn`, not `FnOnce`: it is called up to twice, once
 /// for the pre-spawn dedup check and again after the child exits.
 pub(crate) async fn refresh_via_owner_with(
@@ -388,5 +413,55 @@ mod tests {
         // dedup check reading what the winner already wrote.
         assert_eq!(r1.unwrap(), ProbeOutcome::Refreshed);
         assert_eq!(r2.unwrap(), ProbeOutcome::Refreshed);
+    }
+
+    /// The bug this fixes: `refresh_via_owner` used to re-read the OS
+    /// keychain unconditionally, so a `CredentialsFile`-sourced gateway
+    /// (every Linux/Windows install) could never observe a probe that
+    /// successfully rewrote the file — it would report `NoChange` even
+    /// though the credential was genuinely repaired. Would fail against
+    /// that version: the fake `claude` below touches only the file, never
+    /// the keychain, so a keychain-only read sees nothing move.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_via_owner_reads_the_configured_source_not_just_the_keychain() {
+        let _serial = test_serial().lock().await;
+        reset_probe_state();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let creds = dir.path().join("creds.json");
+        std::fs::write(
+            &creds,
+            r#"{"claudeAiOauth":{"accessToken":"old","expiresAt":1000}}"#,
+        )
+        .expect("write initial creds");
+
+        // A fake `claude auth status` that rewrites the file with a later
+        // expiry — the CredentialsFile counterpart of the log-writing fake
+        // probe above.
+        let script = dir.path().join("claude");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > '{}' <<'EOF'\n{{\"claudeAiOauth\":{{\"accessToken\":\"new\",\"expiresAt\":9999}}}}\nEOF\n",
+                creds.display()
+            ),
+        )
+        .expect("write fake claude");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake claude");
+        }
+
+        let probe = AuthProbe::Command(script);
+        let source = TokenSource::CredentialsFile(creds);
+        let outcome = refresh_via_owner(&probe, &source, Some(1_000)).await;
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Refreshed,
+            "refresh_via_owner must detect a refresh written to the configured \
+             CredentialsFile, not only to the OS keychain"
+        );
     }
 }
