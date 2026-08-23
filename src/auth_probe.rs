@@ -29,8 +29,14 @@ pub enum ProbeOutcome {
     Skipped,
 }
 
-/// Serialises probes: held across the child's execution so concurrent 401s
-/// queue behind one probe rather than each spawning their own — the same
+/// Serialises probes: held across the child's whole execution so no two
+/// children ever run at once, and so a queued caller re-checks fresh
+/// post-probe state (cooldown, then the dedup check below) instead of the
+/// stale snapshot it saw before waiting. Serialising is necessary but not
+/// sufficient to stop duplicate spawns on its own — see the pre-spawn check
+/// in `refresh_via_owner_with` for the other half: without it, a caller that
+/// wakes up after a *successful* probe would still spawn its own, since
+/// serialising only guarantees no overlap, not "don't bother". Same
 /// single-flight shape as `codex::refreshed_access_token`. `tokio::sync::Mutex`
 /// is deliberate: a waiter yields instead of parking a worker thread, and there
 /// is no poisoning to propagate.
@@ -77,11 +83,12 @@ pub async fn refresh_via_owner(probe: &AuthProbe, before_ms: Option<i64>) -> Pro
 /// outcome through this; production goes through the wrapper above, which
 /// supplies the real keychain read. Without this seam the `Refreshed` outcome
 /// could not be tested at all — it would depend on the machine's live
-/// keychain.
+/// keychain. `read_after` is `Fn`, not `FnOnce`: it is called up to twice, once
+/// for the pre-spawn dedup check and again after the child exits.
 pub(crate) async fn refresh_via_owner_with(
     probe: &AuthProbe,
     before_ms: Option<i64>,
-    read_after: impl FnOnce() -> Option<i64>,
+    read_after: impl Fn() -> Option<i64>,
 ) -> ProbeOutcome {
     let AuthProbe::Command(bin) = probe else {
         return ProbeOutcome::Skipped;
@@ -95,6 +102,18 @@ pub(crate) async fn refresh_via_owner_with(
 
     if cooldown_active() {
         return ProbeOutcome::Skipped;
+    }
+
+    // Dedup: someone else may have already fixed this while we were queued
+    // behind PROBE_LOCK above. Check before spawning our own child. This is
+    // *not* a substitute for PROBE_LOCK — two callers that both reach this
+    // line before either has produced a result both see "unmoved" here and
+    // both spawn; PROBE_LOCK is what forces that not to happen by making one
+    // of them wait until the other has fully finished (spawned, waited, and
+    // re-read) before it even gets this far.
+    if matches!((before_ms, read_after()), (Some(before), Some(after)) if after > before) {
+        *COOLDOWN.lock().unwrap() = None;
+        return ProbeOutcome::Refreshed;
     }
 
     // stdin is closed, not inherited: a probe that decides to prompt must fail
@@ -112,6 +131,12 @@ pub(crate) async fn refresh_via_owner_with(
             if tokio::time::timeout(PROBE_TIMEOUT, c.wait()).await.is_err() {
                 tracing::warn!("auth probe timed out after {PROBE_TIMEOUT:?}");
                 let _ = c.kill().await;
+                // Deliberately falls through to the same re-read below rather
+                // than returning here. A credential that moved has moved
+                // regardless of whether the child exited cleanly or was
+                // killed for running long — reporting NoChange in that case
+                // would arm a 15-minute cooldown over a credential that is
+                // actually fine now.
             }
         }
         Err(e) => {
@@ -260,12 +285,108 @@ mod tests {
     async fn a_missing_binary_reports_no_change_not_a_panic() {
         let _serial = test_serial().lock().await;
         // A transplanted credential is a supported setup: a valid token with
-        // no owner CLI installed.
+        // no owner CLI installed. `read_after` must be non-moving (equal to
+        // `before_ms`, not greater) — with the pre-spawn dedup check, a
+        // moving fixture here would short-circuit to `Refreshed` before ever
+        // attempting the spawn, and this test would stop testing the
+        // missing-binary path it's named for.
         reset_probe_state();
         let probe = AuthProbe::Command("/nonexistent/claude".into());
         assert_eq!(
-            refresh_via_owner_with(&probe, Some(1), || Some(2)).await,
+            refresh_via_owner_with(&probe, Some(1), || Some(1)).await,
             ProbeOutcome::NoChange
         );
+    }
+
+    /// Proves `PROBE_LOCK` actually serialises concurrent callers, not just
+    /// that the module's own tests don't trip over each other. Every test
+    /// above calls `refresh_via_owner_with` from one sequential `.await`
+    /// chain — none of them create two calls in flight at once, so none of
+    /// them can tell a working `PROBE_LOCK` from a deleted one. This one
+    /// does, with two real `tokio::spawn`ed callers.
+    ///
+    /// Needs `flavor = "multi_thread"`: the default current-thread runtime
+    /// every other test in this file uses cannot run two tasks at the same
+    /// instant, which would make the race this test wants to create
+    /// impossible regardless of `PROBE_LOCK`.
+    ///
+    /// Still takes `test_serial()` around its own body — unlike the finding
+    /// that prompted this test suggested ("does not hold TEST_SERIAL"),
+    /// holding it here does not defeat the point: `test_serial()` only
+    /// blocks this test's *outer* task from overlapping a sibling test, it
+    /// does not block the two inner `tokio::spawn`ed tasks below from racing
+    /// each other on `PROBE_LOCK` — that's a different lock, and simply
+    /// holding an already-acquired guard blocks no one else from running.
+    /// Dropping it instead would let this test interleave with any sibling
+    /// mid-assertion on the same process-global `COOLDOWN`, reintroducing
+    /// the exact flake this file's `TEST_SERIAL` exists to prevent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_callers_spawn_exactly_one_child() {
+        let _serial = test_serial().lock().await;
+        reset_probe_state();
+
+        // A real probe binary that sleeps long enough to make the race
+        // observable, then appends one line to `log` — a fake `claude auth
+        // status` that "fixes" the credential the slow way. Args are fixed
+        // to `auth status` by `refresh_via_owner_with`, so the log path is
+        // baked into the script itself rather than passed as an argument.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls.log");
+        let script = dir.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nsleep 0.1\necho x >> {}\n", log.display()),
+        )
+        .expect("write fake probe script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        // `read_after` reports the log's line count as the "expiry": 0
+        // before the fake probe has run, 1 after. Real content, not a
+        // constant — a constant closure can't distinguish "ran before me"
+        // from "hasn't run yet", which is exactly what the pre-spawn dedup
+        // check and the post-spawn re-read need to tell apart.
+        fn line_count(path: &std::path::Path) -> Option<i64> {
+            let n = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .count();
+            Some(n as i64)
+        }
+
+        let probe_a = AuthProbe::Command(script.clone());
+        let log_a = log.clone();
+        let probe_b = AuthProbe::Command(script.clone());
+        let log_b = log.clone();
+
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move {
+                refresh_via_owner_with(&probe_a, Some(0), || line_count(&log_a)).await
+            }),
+            tokio::spawn(async move {
+                refresh_via_owner_with(&probe_b, Some(0), || line_count(&log_b)).await
+            })
+        );
+
+        let lines = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            lines, 1,
+            "PROBE_LOCK must serialise concurrent callers to exactly one \
+             spawn — the second caller should observe the first's result \
+             via the dedup check instead of spawning its own"
+        );
+        // Both callers see a moved expiry by the time they return: the
+        // winner via its own post-spawn read, the loser via the pre-spawn
+        // dedup check reading what the winner already wrote.
+        assert_eq!(r1.unwrap(), ProbeOutcome::Refreshed);
+        assert_eq!(r2.unwrap(), ProbeOutcome::Refreshed);
     }
 }
