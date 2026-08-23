@@ -123,7 +123,14 @@ pub fn codex_target_path(path_and_query: &str) -> String {
 /// Credential Manager). [`TokenSource::EnvVar`] reads from a process env
 /// var for platforms where Claude Code's keychain layout isn't supported.
 /// [`TokenSource::Static`] is a test injection point.
-#[derive(Debug, Clone)]
+///
+/// No `#[derive(Debug)]`: `Static` carries a raw token, and a derived impl
+/// would put it in any `{:?}`, tracing capture, or panic message. "Test
+/// injection point" is a doc comment, not an invariant the type system
+/// enforces — nothing stops production code from constructing this variant
+/// — so it gets the same hand-written, redacting `Debug` the crate already
+/// gives `CodexAuth`/`CodexCredential` (see `src/codex.rs`).
+#[derive(Clone)]
 pub enum TokenSource {
     /// Read from the OS keychain (Claude Code's `Claude Code-credentials`).
     Keychain,
@@ -146,29 +153,66 @@ pub enum TokenSource {
     Disabled,
 }
 
+impl std::fmt::Debug for TokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenSource::Keychain => write!(f, "Keychain"),
+            TokenSource::EnvVar(name) => f.debug_tuple("EnvVar").field(name).finish(),
+            TokenSource::CredentialsFile(path) => {
+                f.debug_tuple("CredentialsFile").field(path).finish()
+            }
+            TokenSource::Codex(path) => f.debug_tuple("Codex").field(path).finish(),
+            // The one variant that carries a raw secret.
+            TokenSource::Static(_) => f.debug_tuple("Static").field(&"<redacted>").finish(),
+            TokenSource::Disabled => write!(f, "Disabled"),
+        }
+    }
+}
+
 impl TokenSource {
+    /// Resolve this source's underlying OAuth credential — access token plus
+    /// its expiry, when the source can supply one. The single shared
+    /// fallback path: `resolve()` below, `anthropic_credential_expiry`, and
+    /// `auth_probe::refresh_via_owner` all go through this rather than each
+    /// re-deriving the Keychain→credentials-file fallback in its own way.
+    ///
+    /// Fix round 1, CRITICAL 1: before this method existed, that fallback
+    /// was implemented once here (inline in `resolve()`) and independently
+    /// reimplemented — Keychain-only, no fallback — at two other call sites.
+    /// `TokenSource::Keychain` is the *production default*, so on every
+    /// default Linux/Windows install (no OS keychain backend, credential
+    /// lives in `~/.claude/.credentials.json`) both of those call sites
+    /// silently saw `None` and the delegated-refresh probe never fired — on
+    /// exactly the platform pairing the feature exists to fix. Routing every
+    /// caller through one method is what stops a fourth instance of the same
+    /// bug: there is now nowhere else to reimplement it.
+    ///
+    /// `Ok(Some)` for `Keychain`/`CredentialsFile` when a credential blob is
+    /// found; `Ok(None)` for every other variant — they have no stored
+    /// expiry to report (a raw token/key has none).
+    pub fn resolve_credential(
+        &self,
+    ) -> Result<Option<keychain::OauthCredential>, keychain::KeychainError> {
+        match self {
+            TokenSource::Keychain => keychain_fallback(
+                cfg!(target_os = "macos"),
+                keychain::read_claude_code_credential(),
+                keychain::default_credentials_path(),
+            ),
+            TokenSource::CredentialsFile(path) => keychain::read_credentials_file_credential(path),
+            TokenSource::Codex(_) | TokenSource::EnvVar(_) | TokenSource::Static(_) => Ok(None),
+            TokenSource::Disabled => Ok(None),
+        }
+    }
+
     /// `Ok(Some)` → token available, disguise applies.
     /// `Ok(None)` → no token, passthrough.
     /// `Err` → backend error, passthrough with a warning logged by the caller.
     pub fn resolve(&self) -> Result<Option<String>, keychain::KeychainError> {
         match self {
-            TokenSource::Keychain => {
-                let from_keychain = keychain::read_claude_code_oauth();
-                // Non-macOS Claude Code installs usually skip the OS keychain
-                // and write ~/.claude/.credentials.json instead; fall back so
-                // the zero-config default works there too.
-                if cfg!(target_os = "macos") {
-                    return from_keychain;
-                }
-                match from_keychain {
-                    Ok(Some(t)) => Ok(Some(t)),
-                    keychain_miss => match keychain::default_credentials_path() {
-                        Some(p) if p.exists() => keychain::read_credentials_file(&p),
-                        _ => keychain_miss,
-                    },
-                }
+            TokenSource::Keychain | TokenSource::CredentialsFile(_) => {
+                Ok(self.resolve_credential()?.map(|c| c.access_token))
             }
-            TokenSource::CredentialsFile(path) => keychain::read_credentials_file(path),
             TokenSource::Codex(path) => Ok(codex::read_credential(path).and_then(|c| match c {
                 // This generic resolver also feeds the Anthropic disguise
                 // path (global `MUR_MODEL_GATEWAY_TOKEN_SOURCE=codex`); an
@@ -181,6 +225,35 @@ impl TokenSource {
             TokenSource::Static(s) => Ok(Some(s.as_ref().clone())),
             TokenSource::Disabled => Ok(None),
         }
+    }
+}
+
+/// Applies the Keychain→credentials-file fallback policy to an
+/// already-attempted keychain read. Non-macOS Claude Code installs usually
+/// skip the OS keychain and write `~/.claude/.credentials.json` instead;
+/// on macOS the keychain result is authoritative, full stop.
+///
+/// Takes `is_macos` as a parameter rather than reading `cfg!(target_os =
+/// "macos")` internally so the non-macOS branch is unit-testable from any
+/// dev machine. `cfg!(...)` (unlike `#[cfg(...)]`) is not conditional
+/// compilation — it bakes a fixed bool into the binary for whichever
+/// platform it's built on, but both branches of code around it are always
+/// compiled in, on every platform. Without this parameter, only the host
+/// platform's branch could ever execute under `cargo test` here.
+fn keychain_fallback(
+    is_macos: bool,
+    from_keychain: Result<Option<keychain::OauthCredential>, keychain::KeychainError>,
+    fallback_path: Option<std::path::PathBuf>,
+) -> Result<Option<keychain::OauthCredential>, keychain::KeychainError> {
+    if is_macos {
+        return from_keychain;
+    }
+    match from_keychain {
+        Ok(Some(c)) => Ok(Some(c)),
+        keychain_miss => match fallback_path {
+            Some(p) if p.exists() => keychain::read_credentials_file_credential(&p),
+            _ => keychain_miss,
+        },
     }
 }
 
@@ -681,12 +754,37 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // credential that got rejected, so a third party's bad key can never
     // trigger a probe or spend the user's real refresh token.
     let anthropic_source = state.token_source_for(Provider::Anthropic);
-    let anthropic_expiry = anthropic_credential_expiry(&state);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
+        // Fail-safe, not a silently-swallowed bug: this only underflows if
+        // the host clock reads before the Unix epoch, which no supported
+        // deployment target allows. Falling back to 0 makes the eligibility
+        // comparison in `anthropic_retry_eligible` fail closed (an
+        // impossibly-old "now" can't be past any stored expiry, so the
+        // credential reads as "not yet expired") instead of panicking the
+        // request.
         .unwrap_or(0);
+    // Fix round 1, IMPORTANT 4: `anthropic_credential_expiry` below can hit
+    // the OS keychain or the filesystem, so — unlike `now_ms` above, a plain
+    // clock read — it must not run on every proxied request. Cheap conjuncts
+    // first: `override_token.is_some()` already implies `provider ==
+    // Provider::Anthropic` (see the disguise-gate comment further up —
+    // override_token is only ever set on that path), so it doubles as the
+    // cheap provider check; `claude_owned` is a plain `matches!` on a
+    // reference already in hand. Only once both hold — plus the status code,
+    // also free — does the `let anthropic_expiry = …` conjunct run the
+    // actual credential-store read. That `let` binds an irrefutable pattern;
+    // it's a conjunct purely to sequence the read after the cheap checks via
+    // short-circuit evaluation, not a refutable match.
+    let claude_owned = matches!(
+        anthropic_source,
+        TokenSource::Keychain | TokenSource::CredentialsFile(_)
+    );
     if override_token.is_some()
+        && claude_owned
+        && upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        && let anthropic_expiry = anthropic_credential_expiry(anthropic_source)
         && anthropic_retry_eligible(
             provider,
             upstream_resp.status(),
@@ -920,20 +1018,20 @@ pub fn anthropic_retry_eligible(
 }
 
 /// The stored expiry for Anthropic, read from **the same source the token came
-/// from**. Reading the keychain unconditionally would be wrong on every Linux
+/// from**, via [`TokenSource::resolve_credential`] — the single shared
+/// fallback path (fix round 1, CRITICAL 1; see that method's doc for why a
+/// second, independent implementation here was the bug). Reading the
+/// keychain unconditionally, with no fallback, would be wrong on every Linux
 /// and Windows install, where Claude Code writes
-/// `~/.claude/.credentials.json` and there is no keychain to read — the expiry
-/// would come back unknown on every request and the probe would fire on every
-/// 401.
-fn anthropic_credential_expiry(state: &AppState) -> Option<i64> {
-    let cred = match state.token_source_for(Provider::Anthropic) {
-        TokenSource::Keychain => keychain::read_claude_code_credential().ok().flatten(),
-        TokenSource::CredentialsFile(p) => {
-            keychain::read_credentials_file_credential(p).ok().flatten()
-        }
-        _ => None,
-    };
-    cred.and_then(|c| c.expires_at_ms)
+/// `~/.claude/.credentials.json` and there may be no keychain backend to
+/// read — the expiry would come back unknown on every request and the probe
+/// would fire on every 401.
+fn anthropic_credential_expiry(source: &TokenSource) -> Option<i64> {
+    source
+        .resolve_credential()
+        .ok()
+        .flatten()
+        .and_then(|c| c.expires_at_ms)
 }
 
 /// If the inbound request supplies an Anthropic OAuth subscription token
@@ -1044,6 +1142,80 @@ mod tests {
     fn token_source_disabled_returns_none() {
         let ts = TokenSource::Disabled;
         assert_eq!(ts.resolve().unwrap(), None);
+    }
+
+    /// Fix round 1, IMPORTANT 3: `TokenSource::Static` carries a raw token —
+    /// the hand-written `Debug` impl above must redact it, matching
+    /// `CodexAuth`/`CodexCredential`'s existing redaction tests in
+    /// `src/codex.rs` (`debug_redacts_tokens`,
+    /// `codex_credential_debug_redacts_secrets`). Non-secret variants are
+    /// asserted the other way: `Static`'s payload is the only thing this
+    /// type must never leak, not a blanket "hide everything."
+    #[test]
+    fn token_source_debug_redacts_only_the_secret_variant() {
+        let static_dbg = format!(
+            "{:?}",
+            TokenSource::Static(Arc::new("sk-ant-oat01-realsecret".to_string()))
+        );
+        assert!(
+            !static_dbg.contains("sk-ant-oat01-realsecret"),
+            "Static's raw token must never appear in Debug output: {static_dbg}"
+        );
+        assert!(static_dbg.contains("<redacted>"));
+
+        // Non-secret variants keep showing their payload — an env-var name
+        // is not a credential, and losing it from logs/panics would make
+        // this type harder to debug for no security benefit.
+        let env_dbg = format!("{:?}", TokenSource::EnvVar("ANTHROPIC_API_KEY".to_string()));
+        assert!(env_dbg.contains("ANTHROPIC_API_KEY"));
+
+        assert_eq!(format!("{:?}", TokenSource::Keychain), "Keychain");
+        assert_eq!(format!("{:?}", TokenSource::Disabled), "Disabled");
+    }
+
+    /// Fix round 1, CRITICAL 1 (pure half — see
+    /// `auth_probe::tests::keychain_default_falls_back_to_credentials_file_on_non_macos`
+    /// for the `ProbeOutcome`-level regression this backs): pins
+    /// `keychain_fallback`'s contract in isolation. On a non-macOS host, a
+    /// keychain miss — `Ok(None)` (no entry) or `Err` (no backend at all)
+    /// alike — falls back to the credentials-file path when one exists
+    /// there, instead of propagating the miss the way the pre-fix,
+    /// independently-reimplemented reads at the two call sites did.
+    #[test]
+    fn keychain_fallback_uses_the_credentials_file_when_keychain_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"from-file","expiresAt":42}}"#,
+        )
+        .unwrap();
+
+        let err = keychain::KeychainError::Backend("no keychain backend available".into());
+        let result = keychain_fallback(false, Err(err), Some(path)).unwrap();
+        assert_eq!(
+            result.map(|c| c.access_token),
+            Some("from-file".to_string())
+        );
+    }
+
+    /// The macOS-branch counterpart: the keychain result is authoritative
+    /// and the fallback path is never consulted, even when a fixture file
+    /// exists at it — a stale leftover file must not shadow a live macOS
+    /// keychain answer of `Ok(None)` (Claude Code genuinely never logged in
+    /// on this machine).
+    #[test]
+    fn keychain_fallback_does_not_consult_the_file_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"must-not-be-used","expiresAt":42}}"#,
+        )
+        .unwrap();
+
+        let result = keychain_fallback(true, Ok(None), Some(path)).unwrap();
+        assert_eq!(result, None);
     }
 
     #[test]

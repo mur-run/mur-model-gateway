@@ -64,42 +64,37 @@ fn cooldown_active() -> bool {
 /// Ask the owner CLI to refresh, then report whether the stored expiry moved.
 ///
 /// `before_ms` is the `expiresAt` observed before the probe; the credential is
-/// re-read afterwards **from `source`** and the two compared. A blob without
-/// an expiry compares as unchanged, which is the safe direction: it costs one
-/// wasted retry, not a spawn loop. Reading a hardcoded Keychain regardless of
-/// `source` would be wrong on every Linux/Windows install, where Claude Code
-/// writes `~/.claude/.credentials.json` instead of using the OS keychain —
-/// the post-probe read would never see the file the probe just rewrote, so a
-/// genuine refresh would be reported as `NoChange` (arming a 15-minute
-/// cooldown over a credential that is actually fine now).
+/// re-read afterwards **from `source`**, via [`TokenSource::resolve_credential`]
+/// — the single shared fallback path (fix round 1, CRITICAL 1) — and the two
+/// compared. A blob without an expiry compares as unchanged, which is the
+/// safe direction: it costs one wasted retry, not a spawn loop.
+///
+/// Before `resolve_credential` existed, this read a hardcoded Keychain-only
+/// call for the `Keychain` variant, ignoring `source`'s non-macOS
+/// credentials-file fallback entirely. That was wrong on every Linux/Windows
+/// install (no OS keychain backend, or `TokenSource::Keychain` with no entry
+/// yet) — the post-probe read would never see the file the probe just
+/// rewrote, so a genuine refresh would be reported as `NoChange` (arming a
+/// 15-minute cooldown over a credential that is actually fine now).
+/// `resolve_credential` fixes that once, for every caller, instead of this
+/// function reimplementing the fallback on its own.
 pub async fn refresh_via_owner(
     probe: &AuthProbe,
     source: &TokenSource,
     before_ms: Option<i64>,
 ) -> ProbeOutcome {
-    refresh_via_owner_with(probe, before_ms, || match source {
-        TokenSource::Keychain => {
-            // Bypass the 60s memoise: the child just rewrote the store, and a
-            // cached read would return the token we already know is dead.
-            keychain::invalidate_cache();
-            keychain::read_claude_code_credential()
-                .ok()
-                .flatten()
-                .and_then(|c| c.expires_at_ms)
-        }
-        TokenSource::CredentialsFile(path) => {
-            // Uncached — always reads the file fresh, so there is no
-            // memoise to bypass here.
-            keychain::read_credentials_file_credential(path)
-                .ok()
-                .flatten()
-                .and_then(|c| c.expires_at_ms)
-        }
-        // `anthropic_retry_eligible` (src/lib.rs) only calls this for a
-        // claude-owned source (Keychain or CredentialsFile) in the first
-        // place — unreachable in production, kept so the match stays
-        // exhaustive against future TokenSource variants.
-        _ => None,
+    refresh_via_owner_with(probe, before_ms, || {
+        // Bypass the 60s memoise: the child may have just rewritten the
+        // keychain-backed store, and a cached read would return the token we
+        // already know is dead. Inert (not a bug) when `source` isn't
+        // keychain-backed at all — `CredentialsFile` reads are already
+        // uncached, so invalidating a cache they never consult is a no-op.
+        keychain::invalidate_cache();
+        source
+            .resolve_credential()
+            .ok()
+            .flatten()
+            .and_then(|c| c.expires_at_ms)
     })
     .await
 }
@@ -462,6 +457,80 @@ mod tests {
             ProbeOutcome::Refreshed,
             "refresh_via_owner must detect a refresh written to the configured \
              CredentialsFile, not only to the OS keychain"
+        );
+    }
+
+    /// Fix round 1, CRITICAL 1: `TokenSource::Keychain` is the *production
+    /// default*. Before `resolve_credential`/`keychain_fallback` existed,
+    /// this function's own `read_after` reimplemented a Keychain-only read
+    /// with no fallback — so on every default Linux/Windows install (no OS
+    /// keychain backend, Claude Code writes `~/.claude/.credentials.json`
+    /// instead) a probe that genuinely repaired the file was reported as
+    /// `NoChange`, not `Refreshed`, silently breaking the whole feature on
+    /// exactly the platform pairing it exists to fix.
+    ///
+    /// Can't drive this through `TokenSource::Keychain::resolve_credential()`
+    /// directly and stay deterministic across dev machines: that method
+    /// calls `keychain_fallback(cfg!(target_os = "macos"), ...)`, which
+    /// bakes in the *real* host platform at compile time — on a macOS test
+    /// runner it would short-circuit straight to the live OS keychain and
+    /// never reach the fallback branch, for any fixture this test could
+    /// write. `keychain_fallback` takes `is_macos` as an explicit parameter
+    /// for exactly this reason (see its doc comment in `src/lib.rs`), so
+    /// `read_after` here calls it directly with `is_macos: false` and a
+    /// synthetic keychain-unavailable `Err` — reproducing exactly what a
+    /// real non-macOS `TokenSource::Keychain::resolve_credential()` call
+    /// computes, without touching this machine's real keychain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keychain_default_falls_back_to_credentials_file_on_non_macos() {
+        let _serial = test_serial().lock().await;
+        reset_probe_state();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let creds = dir.path().join("creds.json");
+        std::fs::write(
+            &creds,
+            r#"{"claudeAiOauth":{"accessToken":"old","expiresAt":1000}}"#,
+        )
+        .expect("write initial creds");
+
+        // Same fake `claude auth status` shape as the test above: rewrites
+        // the credentials-file fixture with a later expiry.
+        let script = dir.path().join("claude");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > '{}' <<'EOF'\n{{\"claudeAiOauth\":{{\"accessToken\":\"new\",\"expiresAt\":9999}}}}\nEOF\n",
+                creds.display()
+            ),
+        )
+        .expect("write fake claude");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake claude");
+        }
+
+        let probe = AuthProbe::Command(script);
+        let creds_for_read = creds.clone();
+
+        let outcome = refresh_via_owner_with(&probe, Some(1_000), || {
+            let err = keychain::KeychainError::Backend("no keychain backend available".into());
+            crate::keychain_fallback(false, Err(err), Some(creds_for_read.clone()))
+                .ok()
+                .flatten()
+                .and_then(|c| c.expires_at_ms)
+        })
+        .await;
+
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Refreshed,
+            "a Keychain-default source with no keychain backend available must \
+             fall back to the credentials file and observe the probe's rewrite \
+             there — reporting NoChange here is the exact symptom of the bug \
+             this test guards against"
         );
     }
 }
