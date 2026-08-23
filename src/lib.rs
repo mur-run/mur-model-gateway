@@ -11,6 +11,7 @@
 //! `MUR_MODEL_GATEWAY_COMPRESS=1`) applies to tool_result blocks for the other three
 //! providers.
 
+pub mod auth_probe;
 pub mod cc_version;
 pub mod codex;
 pub mod compress;

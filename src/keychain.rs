@@ -88,6 +88,14 @@ fn cached<T: Clone>(
     res
 }
 
+/// Drop the memoised read so the next call hits the store. Used after an
+/// external process is believed to have rewritten the credential — a cached
+/// read would otherwise return the token we already know is dead for up to
+/// `CACHE_TTL`.
+pub fn invalidate_cache() {
+    *CACHE.lock().unwrap() = None;
+}
+
 /// Default path of Claude Code's on-disk credentials file (Linux/Windows/WSL
 /// installs that don't use the OS keychain): `~/.claude/.credentials.json`.
 pub fn default_credentials_path() -> Option<std::path::PathBuf> {
