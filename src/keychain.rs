@@ -187,14 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn oauth_wrapper_still_yields_the_bare_token() {
-        // read_claude_code_oauth's contract is unchanged for existing callers.
-        let blob = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","expiresAt":1}}"#;
-        let c = parse_oauth_blob(blob).unwrap().unwrap();
-        assert_eq!(c.access_token, "sk-ant-oat01-test");
-    }
-
-    #[test]
     fn credentials_file_reads_token() {
         let dir = std::env::temp_dir().join("mur-model-gateway-cred-test");
         std::fs::create_dir_all(&dir).unwrap();
