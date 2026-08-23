@@ -21,7 +21,7 @@ const SERVICE: &str = "Claude Code-credentials";
 // pub(crate): also memoises `codex::refreshed_access_token`'s refresh cache,
 // so the two don't drift onto different staleness windows.
 pub(crate) const CACHE_TTL: Duration = Duration::from_secs(60);
-type CachedRead = Option<(Instant, Result<Option<String>, KeychainError>)>;
+type CachedRead = Option<(Instant, Result<Option<OauthCredential>, KeychainError>)>;
 static CACHE: Mutex<CachedRead> = Mutex::new(None);
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -32,16 +32,33 @@ pub enum KeychainError {
     Malformed(String),
 }
 
-/// Read the current Claude Code OAuth access token from the OS keychain.
+/// A Claude Code OAuth credential: the token the gateway forwards, plus the
+/// non-secret expiry that shipped with it. The refresh token is deliberately
+/// NOT represented here — the gateway never redeems it (see the spec's
+/// Rejected section), so it must not be able to leak it either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OauthCredential {
+    pub access_token: String,
+    /// `claudeAiOauth.expiresAt`, milliseconds since the Unix epoch.
+    /// `None` when the blob omits it — treat as "unknown", never as expired.
+    pub expires_at_ms: Option<i64>,
+}
+
+/// Read the current Claude Code OAuth credential from the OS keychain.
 ///
 /// `Ok(Some)` — entry found and parsed.
 /// `Ok(None)` — no entry exists (Claude Code never logged in).
 /// `Err(_)` — backend error (locked keychain / permission denied / parse failure).
-pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
+pub fn read_claude_code_credential() -> Result<Option<OauthCredential>, KeychainError> {
     cached(&CACHE, CACHE_TTL, read_keychain_uncached)
 }
 
-fn read_keychain_uncached() -> Result<Option<String>, KeychainError> {
+/// Back-compat wrapper: just the access token, for callers that forward it.
+pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
+    Ok(read_claude_code_credential()?.map(|c| c.access_token))
+}
+
+fn read_keychain_uncached() -> Result<Option<OauthCredential>, KeychainError> {
     let user = whoami::username();
     let entry = keyring::Entry::new(SERVICE, &user)
         .map_err(|e| KeychainError::Backend(format!("entry::new({SERVICE}, {user}): {e}")))?;
@@ -55,11 +72,11 @@ fn read_keychain_uncached() -> Result<Option<String>, KeychainError> {
 /// TTL cache. The lock is held across `fetch` on purpose: concurrent requests
 /// trigger at most one macOS keychain permission dialog instead of one each,
 /// and once it's answered the rest are served from cache.
-fn cached(
-    cache: &Mutex<CachedRead>,
+fn cached<T: Clone>(
+    cache: &Mutex<Option<(Instant, Result<T, KeychainError>)>>,
     ttl: Duration,
-    fetch: impl FnOnce() -> Result<Option<String>, KeychainError>,
-) -> Result<Option<String>, KeychainError> {
+    fetch: impl FnOnce() -> Result<T, KeychainError>,
+) -> Result<T, KeychainError> {
     let mut slot = cache.lock().unwrap();
     if let Some((at, res)) = slot.as_ref()
         && at.elapsed() < ttl
@@ -77,9 +94,10 @@ pub fn default_credentials_path() -> Option<std::path::PathBuf> {
     directories::BaseDirs::new().map(|d| d.home_dir().join(".claude/.credentials.json"))
 }
 
-/// Read the OAuth token from a Claude Code credentials JSON file.
-/// Same blob shape as the keychain entry. `Ok(None)` if the file doesn't exist.
-pub fn read_credentials_file(path: &std::path::Path) -> Result<Option<String>, KeychainError> {
+/// Read a credential from a Claude Code credentials JSON file (same blob).
+pub fn read_credentials_file_credential(
+    path: &std::path::Path,
+) -> Result<Option<OauthCredential>, KeychainError> {
     match std::fs::read_to_string(path) {
         Ok(raw) => parse_oauth_blob(&raw),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -90,16 +108,27 @@ pub fn read_credentials_file(path: &std::path::Path) -> Result<Option<String>, K
     }
 }
 
-/// Extract `claudeAiOauth.accessToken` from a Claude Code keychain blob.
-fn parse_oauth_blob(raw: &str) -> Result<Option<String>, KeychainError> {
+/// Back-compat wrapper for the file source.
+pub fn read_credentials_file(path: &std::path::Path) -> Result<Option<String>, KeychainError> {
+    Ok(read_credentials_file_credential(path)?.map(|c| c.access_token))
+}
+
+/// Extract `claudeAiOauth.{accessToken,expiresAt}` from a Claude Code blob.
+fn parse_oauth_blob(raw: &str) -> Result<Option<OauthCredential>, KeychainError> {
     let creds: Value = serde_json::from_str(raw.trim())
         .map_err(|e| KeychainError::Malformed(format!("not JSON: {e}")))?;
-    let token = creds
+    let oauth = creds
         .get("claudeAiOauth")
-        .and_then(|o| o.get("accessToken"))
+        .ok_or_else(|| KeychainError::Malformed("missing claudeAiOauth".into()))?;
+    let access_token = oauth
+        .get("accessToken")
         .and_then(|t| t.as_str())
-        .ok_or_else(|| KeychainError::Malformed("missing claudeAiOauth.accessToken".into()))?;
-    Ok(Some(token.to_string()))
+        .ok_or_else(|| KeychainError::Malformed("missing claudeAiOauth.accessToken".into()))?
+        .to_string();
+    Ok(Some(OauthCredential {
+        access_token,
+        expires_at_ms: oauth.get("expiresAt").and_then(Value::as_i64),
+    }))
 }
 
 #[cfg(test)]
@@ -110,8 +139,8 @@ mod tests {
     fn parse_extracts_access_token() {
         let blob = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","refreshToken":"x"}}"#;
         assert_eq!(
-            parse_oauth_blob(blob).unwrap().as_deref(),
-            Some("sk-ant-oat01-test")
+            parse_oauth_blob(blob).unwrap().unwrap().access_token,
+            "sk-ant-oat01-test"
         );
     }
 
@@ -131,6 +160,38 @@ mod tests {
     fn parse_rejects_wrong_shape() {
         let r = parse_oauth_blob(r#"{"foo":"bar"}"#);
         assert!(matches!(r, Err(KeychainError::Malformed(_))));
+    }
+
+    #[test]
+    fn parse_blob_keeps_expiry() {
+        let blob = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","refreshToken":"x","expiresAt":1787497765291}}"#;
+        let c = parse_oauth_blob(blob).unwrap().unwrap();
+        assert_eq!(c.access_token, "sk-ant-oat01-test");
+        assert_eq!(c.expires_at_ms, Some(1_787_497_765_291));
+    }
+
+    #[test]
+    fn parse_blob_without_expiry_is_still_valid() {
+        // Older Claude Code writes omitted expiresAt. A missing expiry must
+        // not fail the read — it degrades to "unknown", never to an error.
+        let blob = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}}"#;
+        let c = parse_oauth_blob(blob).unwrap().unwrap();
+        assert_eq!(c.access_token, "sk-ant-oat01-test");
+        assert_eq!(c.expires_at_ms, None);
+    }
+
+    #[test]
+    fn parse_blob_ignores_non_integer_expiry() {
+        let blob = r#"{"claudeAiOauth":{"accessToken":"t","expiresAt":"soon"}}"#;
+        assert_eq!(parse_oauth_blob(blob).unwrap().unwrap().expires_at_ms, None);
+    }
+
+    #[test]
+    fn oauth_wrapper_still_yields_the_bare_token() {
+        // read_claude_code_oauth's contract is unchanged for existing callers.
+        let blob = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","expiresAt":1}}"#;
+        let c = parse_oauth_blob(blob).unwrap().unwrap();
+        assert_eq!(c.access_token, "sk-ant-oat01-test");
     }
 
     #[test]
@@ -171,7 +232,12 @@ mod tests {
 
     #[test]
     fn cached_serves_within_ttl_and_refetches_after_expiry() {
-        let cache: Mutex<CachedRead> = Mutex::new(None);
+        // Local String-payload cache: this test is about TTL mechanics, not
+        // credential shape, so it deliberately doesn't reuse `CachedRead`
+        // (which now holds `OauthCredential`).
+        #[allow(clippy::type_complexity)]
+        let cache: Mutex<Option<(Instant, Result<Option<String>, KeychainError>)>> =
+            Mutex::new(None);
         let ttl = Duration::from_secs(60);
         let r1 = cached(&cache, ttl, || Ok(Some("first".into())));
         let r2 = cached(&cache, ttl, || Ok(Some("second".into())));
@@ -185,7 +251,10 @@ mod tests {
     #[test]
     fn cached_caches_errors_too() {
         // A denied keychain prompt must not re-prompt on every retry.
-        let cache: Mutex<CachedRead> = Mutex::new(None);
+        // Same rationale as above: String payload, independent of `CachedRead`.
+        #[allow(clippy::type_complexity)]
+        let cache: Mutex<Option<(Instant, Result<Option<String>, KeychainError>)>> =
+            Mutex::new(None);
         let ttl = Duration::from_secs(60);
         let r1 = cached(&cache, ttl, || Err(KeychainError::Backend("denied".into())));
         let r2 = cached(&cache, ttl, || Ok(Some("never-fetched".into())));
