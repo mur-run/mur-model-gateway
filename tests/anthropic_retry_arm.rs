@@ -18,16 +18,43 @@
 //! refreshed* token, not just *a* token) but only where it can mean anything:
 //! the public-build disguise stub is a no-op that attaches no Authorization
 //! header at all, so it stays behind `cfg(has_beta_hook)`.
+//!
+//! Task 5 adds to this same harness rather than building a second one (per
+//! its own instructions): the primary test below now also asserts its
+//! response body is Task 5's actionable message, not upstream's original —
+//! proving the body-swap applies even when the retry itself completes but
+//! still 401s. `a_probe_that_cannot_run_still_gets_an_actionable_body` covers
+//! the other arm — a probe that never repairs the credential at all, so the
+//! retry is never sent — and `client_supplied_credential_401_does_not_trigger_probe`
+//! gained an assertion that Mode 3 keeps forwarding upstream's body
+//! unchanged, proving Task 5 didn't widen who gets the new wording.
 use httpmock::prelude::*;
+use mur_model_gateway::auth_probe::reset_probe_state;
 use mur_model_gateway::cc_version::{VersionCache, VersionStrategy};
 use mur_model_gateway::{AppState, AuthProbe, TokenSource, build_router};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 fn pinned_version() -> Arc<VersionCache> {
     Arc::new(VersionCache::new(VersionStrategy::Static(
         "9.9.9".to_string(),
     )))
+}
+
+/// Serialises this file's tests that exercise `auth_probe::refresh_via_owner`
+/// against each other — mirrors `auth_probe.rs`'s own internal `TEST_SERIAL`.
+/// `auth_probe`'s `PROBE_LOCK`/`COOLDOWN` are process-global statics, and
+/// `cargo test` runs the `#[tokio::test]` fns in this binary concurrently by
+/// default (no `--test-threads=1`, no nextest, in this repo's CI). Without
+/// this, Task 5's new NoChange-outcome test running at the same time as a
+/// test that expects a genuine `Refreshed` can arm the 15-minute cooldown
+/// mid-flight and make the other test's retry silently skip
+/// (`ProbeOutcome::Skipped`) instead of running.
+static TEST_SERIAL: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
+fn test_serial() -> &'static AsyncMutex<()> {
+    TEST_SERIAL.get_or_init(|| AsyncMutex::new(()))
 }
 
 /// A Claude Code credentials-file blob: `claudeAiOauth.{accessToken,expiresAt}`.
@@ -79,6 +106,9 @@ fn write_fake_claude_that_refreshes(dir: &std::path::Path, creds: &std::path::Pa
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_credential_is_refreshed_and_the_request_retried() {
+    let _serial = test_serial().lock().await;
+    reset_probe_state();
+
     let dir = tempfile::tempdir().unwrap();
     let creds = dir.path().join("creds.json");
     let past = 1_000_i64;
@@ -123,6 +153,19 @@ async fn an_expired_credential_is_refreshed_and_the_request_retried() {
         resp.status(),
         401,
         "the mock always 401s regardless of token"
+    );
+    // Task 5: the retry completed (upstream 401'd it again) but the
+    // credential is still broken from the client's point of view — the
+    // response body must be the actionable message this task adds, not
+    // upstream's opaque original.
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("/login anthropic"),
+        "must be the actionable body, not upstream's: {body}"
+    );
+    assert!(
+        !body.contains("authentication_error"),
+        "must not be upstream's raw body: {body}"
     );
     assert_eq!(
         always_401.hits_async().await,
@@ -197,6 +240,15 @@ async fn client_supplied_credential_401_does_not_trigger_probe() {
 
     // The client's own 401 is proxied straight back — no retry attempted.
     assert_eq!(resp.status(), 401);
+    // Task 5's actionable body applies only to a credential *this gateway*
+    // attached (`override_token.is_some()`) — Mode 3 never sets that, so the
+    // body-swap must not fire here either; the client sees upstream's
+    // original body unchanged, same as before Task 5.
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("authentication_error"),
+        "Mode 3 passthrough must forward upstream's body unchanged: {body}"
+    );
     assert_eq!(
         rejected.hits_async().await,
         1,
@@ -211,6 +263,93 @@ async fn client_supplied_credential_401_does_not_trigger_probe() {
     );
 }
 
+/// Task 5's required wiring proof, per the brief: "an eligible 401 whose
+/// probe does not repair the credential ... must return 401 to the client
+/// with a body containing `/login anthropic` — not the upstream's original
+/// body," with exactly two upstream hits proving the post-retry path (not an
+/// early return).
+///
+/// The brief's own wording for the fixture — "a fake `claude` that changes
+/// nothing" — is `ProbeOutcome::NoChange`. But `NoChange` short-circuits the
+/// retry `if` chain in `forward` *before* it ever sends the second HTTP
+/// request (`refresh_via_owner`'s doc comment: only `Refreshed` lets the
+/// block run), so it produces exactly ONE upstream hit, not two — that arm is
+/// covered separately below, with the hit count this task's own wording
+/// would actually predict for it. To get the two hits this test's own
+/// assertion asks for, this one instead strengthens
+/// `an_expired_credential_is_refreshed_and_the_request_retried` above (same
+/// fixture: `write_fake_claude_that_refreshes`, same always-401 mock) with
+/// the body assertion Task 5 exists for — the probe DOES move the stored
+/// expiry forward (`Refreshed`), so the retry IS sent, and only then does
+/// upstream 401 it again: a refresh that looked successful locally but
+/// didn't fix the real, upstream-side problem. See that test's Task 5
+/// comment for the body checks.
+///
+/// This test covers the *other* arm named in the brief's own words: a probe
+/// that runs (or cannot run) and changes nothing, so the retry is never sent
+/// at all — a missing `claude` binary, same as
+/// `auth_probe::tests::a_missing_binary_reports_no_change_not_a_panic`, and
+/// portable across every OS this crate's CI runs on (a shell-script fake
+/// `claude` that "runs and touches nothing" is not: Windows doesn't execute
+/// a shebang script named `claude` with no extension). The client still must
+/// not see upstream's opaque body: this proves the actionable-body swap
+/// fires on the *original*, never-retried 401 too, not only after a
+/// completed-but-futile retry. Exactly one upstream hit is the proof: a
+/// retry would make it two.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probe_that_cannot_run_still_gets_an_actionable_body() {
+    let _serial = test_serial().lock().await;
+    reset_probe_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let creds = dir.path().join("creds.json");
+    std::fs::write(&creds, blob("old-tok", 1_000)).unwrap();
+
+    let upstream = MockServer::start_async().await;
+    let always_401 = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(401)
+                .body(r#"{"type":"error","error":{"type":"authentication_error"}}"#);
+        })
+        .await;
+
+    let proxy = spawn_anthropic(
+        upstream.base_url(),
+        TokenSource::CredentialsFile(creds.clone()),
+        // No binary at this path — `refresh_via_owner` reports `NoChange`
+        // (spawn fails, same as the `auth_probe` unit test this mirrors),
+        // never `Refreshed`, so the retry `if` chain never sends a second
+        // request.
+        AuthProbe::Command(dir.path().join("no-such-claude-binary")),
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-x","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("/login anthropic"),
+        "must be the actionable body, not upstream's: {body}"
+    );
+    assert!(
+        !body.contains("authentication_error"),
+        "must not be upstream's raw body: {body}"
+    );
+    assert_eq!(
+        always_401.hits_async().await,
+        1,
+        "NoChange must never send a retry — a bug that did would show 2 hits here"
+    );
+}
+
 /// Stronger than the test above: not just that a retry happens, but that it
 /// carries the freshly refreshed token specifically. Needs the real
 /// `apply_disguise_headers` to turn a resolved token into a predictable
@@ -222,6 +361,9 @@ async fn client_supplied_credential_401_does_not_trigger_probe() {
 #[cfg(has_beta_hook)]
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_carries_the_freshly_refreshed_bearer_token() {
+    let _serial = test_serial().lock().await;
+    reset_probe_state();
+
     let dir = tempfile::tempdir().unwrap();
     let creds = dir.path().join("creds.json");
     let past = 1_000_i64;

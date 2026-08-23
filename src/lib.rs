@@ -773,27 +773,42 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // override_token is only ever set on that path), so it doubles as the
     // cheap provider check; `claude_owned` is a plain `matches!` on a
     // reference already in hand. Only once both hold — plus the status code,
-    // also free — does the `let anthropic_expiry = …` conjunct run the
-    // actual credential-store read. That `let` binds an irrefutable pattern;
-    // it's a conjunct purely to sequence the read after the cheap checks via
-    // short-circuit evaluation, not a refutable match.
+    // also free — does `anthropic_expiry` run the actual credential-store
+    // read.
+    //
+    // Task 5: hoisted out of the retry `if`'s own conjunct chain (it used to
+    // be an inline `&& let anthropic_expiry = …` there) so the SAME read
+    // backs both the retry-eligibility check below and the client-facing
+    // error wording further down if the 401 survives the retry. A second,
+    // independent read at the error site would repeat the exact mistake
+    // `anthropic_credential_expiry`'s own doc comment describes — this plan
+    // has already hardcoded or reimplemented that read wrongly three times.
+    // `Option<Option<i64>>`: the outer `None` means the cheap conjuncts
+    // below didn't hold (this 401 isn't for a credential this gateway
+    // attached, so there's nothing here for the error path to explain
+    // either); `Some` means they did, and the inner `Option<i64>` is the
+    // stored expiry, or `None` if the blob doesn't carry one.
     let claude_owned = matches!(
         anthropic_source,
         TokenSource::Keychain | TokenSource::CredentialsFile(_)
     );
-    if override_token.is_some()
+    let anthropic_expiry: Option<Option<i64>> = if override_token.is_some()
         && claude_owned
         && upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
-        && let anthropic_expiry = anthropic_credential_expiry(anthropic_source)
+    {
+        Some(anthropic_credential_expiry(anthropic_source))
+    } else {
+        None
+    };
+    if let Some(expiry) = anthropic_expiry
         && anthropic_retry_eligible(
             provider,
             upstream_resp.status(),
             anthropic_source,
-            anthropic_expiry,
+            expiry,
             now_ms,
         )
-        && auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, anthropic_expiry)
-            .await
+        && auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, expiry).await
             == auth_probe::ProbeOutcome::Refreshed
         && let Ok(Some(fresh)) = anthropic_source.resolve()
     {
@@ -840,6 +855,32 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             continue;
         }
         response_headers.insert(name.clone(), value.clone());
+    }
+
+    // Task 5: the retry arm above tried what it could. If the client is
+    // still looking at a 401 for a credential *this gateway* attached
+    // (`anthropic_expiry` is `Some` only when the cheap conjuncts held for
+    // the first attempt — see the comment where it's computed above), swap
+    // upstream's opaque "re-authenticate" body for one that names the
+    // credential and where it lives, instead of leaving the reader to guess.
+    //
+    // Rechecking `status` here, rather than reusing `anthropic_retry_eligible`'s
+    // verdict, is what makes this fire for the revoked-but-not-expired case
+    // too: eligibility was false there and no retry was ever attempted, but
+    // the client is still owed an explanation. It's also what makes this
+    // skip cleanly once a retry actually repairs the credential: `status` is
+    // the final response's status (the retry's, if one was sent), so it is
+    // no longer 401 by this point.
+    //
+    // `expired` reads the expiry captured before the retry ran — the
+    // question it answers is "did the original 401 look like an expiry
+    // problem", which is what decided whether a refresh was even attempted,
+    // not a fresh re-read (the probe above may just have rewritten it).
+    if let Some(expiry) = anthropic_expiry
+        && status == StatusCode::UNAUTHORIZED
+    {
+        let expired = expiry.is_none_or(|exp| exp <= now_ms);
+        return Ok(anthropic_auth_error_response(anthropic_source, expired));
     }
 
     if translating && client_wants_stream {
@@ -1034,6 +1075,70 @@ fn anthropic_credential_expiry(source: &TokenSource) -> Option<i64> {
         .and_then(|c| c.expires_at_ms)
 }
 
+/// A 401 the caller can act on. The upstream body names no location, which is
+/// what left users guessing which credential had gone stale.
+///
+/// The store is derived from the source the token actually came from — NOT a
+/// hardcoded keychain string. On a Linux or Windows install the credential
+/// lives in a file, and an error that confidently names the wrong store sends
+/// the reader to a place that does not exist. This is the same mistake the
+/// expiry read made in three separate places earlier in this plan; do not
+/// reintroduce it here.
+pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String {
+    let what = if expired {
+        "Anthropic OAuth expired and an automatic refresh did not resolve it"
+    } else {
+        "Anthropic OAuth was revoked (the stored credential has not aged out)"
+    };
+    format!(
+        "{what} — credential: {}. \
+         Fix: run `/login anthropic` in murmur, or `claude auth login`.",
+        describe_credential_store(source, cfg!(target_os = "macos"))
+    )
+}
+
+/// Where a reader should go to look at the credential, in words. Never prints
+/// the credential itself — `TokenSource`'s own `Debug` redacts, and this must
+/// not become a way around that.
+///
+/// `is_macos` is a parameter rather than a `cfg!(target_os = "macos")` read
+/// inside this function, same reason `keychain_fallback` above takes one (see
+/// its doc comment): it makes the non-macOS branch unit-testable from a
+/// macOS dev machine. Naming the keychain for an install that has none is
+/// this plan's most-repeated mistake — the fourth occurrence, per the Task 5
+/// brief — and without the parameter that branch could only ever be proven
+/// by CI's Linux/Windows runners, never locally.
+fn describe_credential_store(source: &TokenSource, is_macos: bool) -> String {
+    match source {
+        TokenSource::Keychain => {
+            if is_macos {
+                "keychain \"Claude Code-credentials\"".to_string()
+            } else {
+                // The non-macOS fallback `resolve_credential` uses.
+                keychain::default_credentials_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.claude/.credentials.json".to_string())
+            }
+        }
+        TokenSource::CredentialsFile(p) => p.display().to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The 401 returned to the client when the retry arm above did not repair an
+/// Anthropic credential this gateway attached. A fresh response, not
+/// upstream's headers with a swapped body — same shape as
+/// [`openai_error_response`] below: the message is plain text, not
+/// upstream's original content-type, and nothing else about the upstream
+/// response is worth preserving (its body doesn't survive either).
+fn anthropic_auth_error_response(source: &TokenSource, expired: bool) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(anthropic_auth_error_body(source, expired)))
+        .expect("static error response builds")
+}
+
 /// If the inbound request supplies an Anthropic OAuth subscription token
 /// (sk-ant-oat*) via either `x-api-key` or `Authorization: Bearer`, return
 /// it so the proxy can upgrade it to a fully-disguised Bearer request.
@@ -1216,6 +1321,40 @@ mod tests {
 
         let result = keychain_fallback(true, Ok(None), Some(path)).unwrap();
         assert_eq!(result, None);
+    }
+
+    /// Task 5, the plan's fourth brush with this exact bug (per the brief):
+    /// an error that confidently names the keychain on an install that has
+    /// none sends the reader somewhere that doesn't exist. `is_macos` is
+    /// explicit (see `describe_credential_store`'s own doc comment)
+    /// precisely so both branches are provable here, on whatever OS happens
+    /// to run `cargo test`, rather than only by CI's Linux/Windows legs.
+    #[test]
+    fn describe_credential_store_names_the_keychain_only_on_macos() {
+        let macos = describe_credential_store(&TokenSource::Keychain, true);
+        assert!(
+            macos.contains("Claude Code-credentials"),
+            "macOS install: {macos}"
+        );
+
+        let other = describe_credential_store(&TokenSource::Keychain, false);
+        assert!(
+            !other.contains("Claude Code-credentials"),
+            "non-macOS install must not name a keychain it doesn't have: {other}"
+        );
+        assert!(
+            other.contains(".claude") && other.contains("credentials"),
+            "non-macOS install must name the credentials-file path instead: {other}"
+        );
+    }
+
+    #[test]
+    fn describe_credential_store_names_the_configured_file_path() {
+        let d = describe_credential_store(
+            &TokenSource::CredentialsFile("/home/u/.claude/.credentials.json".into()),
+            true, // even a macOS host must defer to the configured file, not the keychain
+        );
+        assert_eq!(d, "/home/u/.claude/.credentials.json");
     }
 
     #[test]

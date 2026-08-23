@@ -106,3 +106,54 @@ fn other_providers_are_never_eligible() {
         ));
     }
 }
+
+#[test]
+fn error_body_names_the_fix() {
+    let b = mur_model_gateway::anthropic_auth_error_body(&TokenSource::Keychain, true);
+    assert!(b.contains("/login anthropic"), "names the fix: {b}");
+    assert!(
+        b.contains("claude auth login"),
+        "names the CLI fallback: {b}"
+    );
+}
+
+#[test]
+fn error_body_names_the_store_the_token_came_from() {
+    // A file-backed install must not be told to look in a keychain it does not
+    // have. This is the fourth place in this plan where hardcoding the keychain
+    // would have been wrong.
+    let b = mur_model_gateway::anthropic_auth_error_body(
+        &TokenSource::CredentialsFile("/home/u/.claude/.credentials.json".into()),
+        true,
+    );
+    assert!(b.contains("/home/u/.claude/.credentials.json"), "{b}");
+    assert!(
+        !b.contains("Claude Code-credentials"),
+        "must not name the keychain for a file source: {b}"
+    );
+}
+
+#[test]
+fn revoked_body_does_not_promise_a_refresh() {
+    // Re-running a refresh cannot fix a revoked credential; saying so would
+    // send the user in circles.
+    let b = mur_model_gateway::anthropic_auth_error_body(&TokenSource::Keychain, false);
+    assert!(b.contains("revoked"), "{b}");
+    assert!(!b.contains("expired"), "{b}");
+}
+
+#[test]
+fn error_body_never_contains_the_token() {
+    // describe_credential_store falls through to `{other:?}` for the remaining
+    // variants, and TokenSource::Static holds a real token. The redacting Debug
+    // added in Task 4 is what keeps this true — this test is its guard from the
+    // other side.
+    let b = mur_model_gateway::anthropic_auth_error_body(
+        &TokenSource::Static(std::sync::Arc::new("sk-ant-secret-value".to_string())),
+        true,
+    );
+    assert!(
+        !b.contains("sk-ant-secret-value"),
+        "token leaked into an error body: {b}"
+    );
+}
