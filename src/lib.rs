@@ -1210,17 +1210,57 @@ mod tests {
     #[test]
     fn kill_switch_keeps_the_probe_disabled() {
         // with_default_auth_probe is the only enabling path, and it must
-        // honour the opt-out even when `claude` is on PATH.
-        temp_env::with_var(PROBE_KILL_SWITCH_ENV, Some("1"), || {
-            let s = AppState::new(
-                "https://a.test",
-                "https://o.test",
-                "https://g.test",
-                TokenSource::Disabled,
-            )
-            .unwrap()
-            .with_default_auth_probe();
-            assert_eq!(s.auth_probe, AuthProbe::Disabled);
+        // honour the opt-out even when `claude` genuinely resolves on PATH —
+        // not just when this machine happens to lack a `claude` install
+        // (which would make the assertion vacuous: which_claude() returns
+        // None either way, kill switch or not). Fixture: a plain file named
+        // `claude` (which_claude only checks is_file(), no exec bit needed)
+        // in a temp dir, prepended onto PATH via std::env::join_paths.
+        let dir = tempfile::tempdir().unwrap();
+        let fake_claude = dir.path().join("claude");
+        std::fs::write(&fake_claude, "").unwrap();
+        let ambient_path = std::env::var_os("PATH").unwrap_or_default();
+        let path_with_fake = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&ambient_path)),
+        )
+        .unwrap();
+
+        temp_env::with_var("PATH", Some(path_with_fake), || {
+            temp_env::with_var(PROBE_KILL_SWITCH_ENV, Some("1"), || {
+                let s = AppState::new(
+                    "https://a.test",
+                    "https://o.test",
+                    "https://g.test",
+                    TokenSource::Disabled,
+                )
+                .unwrap()
+                .with_default_auth_probe();
+                assert_eq!(
+                    s.auth_probe,
+                    AuthProbe::Disabled,
+                    "kill switch: expected Disabled even with a resolvable `claude` on PATH"
+                );
+            });
+
+            // Negative control: same PATH, kill switch unset. This is what
+            // proves the fixture above actually works — if this assertion
+            // fails, the fixture never put a resolvable `claude` on PATH and
+            // the Disabled assertion above proved nothing.
+            temp_env::with_var_unset(PROBE_KILL_SWITCH_ENV, || {
+                let s = AppState::new(
+                    "https://a.test",
+                    "https://o.test",
+                    "https://g.test",
+                    TokenSource::Disabled,
+                )
+                .unwrap()
+                .with_default_auth_probe();
+                assert_eq!(
+                    s.auth_probe,
+                    AuthProbe::Command(fake_claude.clone()),
+                    "control: fake `claude` on PATH did not arm the probe — PATH fixture is broken, so the Disabled assertion above proved nothing"
+                );
+            });
         });
     }
 }
