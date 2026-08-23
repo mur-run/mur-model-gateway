@@ -183,6 +183,25 @@ impl TokenSource {
     }
 }
 
+/// Opt-out for the delegated-refresh probe. Set to `1` to make the gateway
+/// return the upstream 401 unchanged instead of asking Claude Code to refresh.
+pub const PROBE_KILL_SWITCH_ENV: &str = "MUR_MODEL_GATEWAY_NO_AUTH_PROBE";
+
+/// How the gateway asks the credential's owner to refresh it.
+///
+/// `Disabled` by default in every constructor — same discipline as
+/// `AppState::token_source_codex`. Enabling spawns a real binary that can
+/// rewrite the user's Claude Code credential, so a test-side `AppState` must
+/// be structurally unable to reach it rather than merely unlikely to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthProbe {
+    Disabled,
+    /// Absolute path to the `claude` binary, resolved once at startup. Stored
+    /// resolved (not looked up per call) so a later PATH change cannot swap
+    /// which binary a long-running gateway executes.
+    Command(std::path::PathBuf),
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub upstream_anthropic: String,
@@ -212,6 +231,9 @@ pub struct AppState {
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
     /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
+    /// See [`AuthProbe`]. `Disabled` by default in every constructor; only
+    /// `with_default_auth_probe` (called from `main.rs`) can arm it.
+    pub auth_probe: AuthProbe,
 }
 
 impl AppState {
@@ -253,6 +275,9 @@ impl AppState {
             token_source_codex: TokenSource::Disabled,
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
+            // Structurally safe by default — see the AuthProbe doc and
+            // with_default_auth_probe (the only enabling path, main.rs-only).
+            auth_probe: AuthProbe::Disabled,
         })
     }
 
@@ -268,6 +293,20 @@ impl AppState {
             Some(p) => TokenSource::Codex(p),
             None => TokenSource::Disabled,
         };
+        self
+    }
+
+    /// Point the auth probe at the `claude` binary on PATH. Call from
+    /// `main.rs` only — see the `AuthProbe` doc. A no-op when the kill switch
+    /// is set or `claude` is not installed (a transplanted credential is a
+    /// supported setup: a working token with no owner CLI).
+    pub fn with_default_auth_probe(mut self) -> Self {
+        if std::env::var(PROBE_KILL_SWITCH_ENV).is_ok_and(|v| v == "1") {
+            return self;
+        }
+        if let Some(p) = which_claude() {
+            self.auth_probe = AuthProbe::Command(p);
+        }
         self
     }
 
@@ -308,6 +347,15 @@ impl AppState {
             _ => &self.token_source,
         }
     }
+}
+
+/// Resolve `claude` on PATH to an absolute path. Deliberately not `which`:
+/// one small lookup does not earn a dependency.
+fn which_claude() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("claude"))
+        .find(|c| c.is_file())
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -1126,5 +1174,53 @@ mod tests {
                 .as_deref(),
             Some("codex-tok")
         );
+    }
+
+    #[test]
+    fn auth_probe_is_disabled_in_every_constructor() {
+        // Mirrors token_source_codex: a test-side AppState must be unable to
+        // spawn the real `claude`, not merely unlikely to. Both constructors
+        // are checked — the safety property is that NO path out of this impl
+        // block leaves the probe armed, so testing only `new` would let
+        // `with_version` regress silently.
+        let by_new = AppState::new(
+            "https://a.test",
+            "https://o.test",
+            "https://g.test",
+            TokenSource::Disabled,
+        )
+        .unwrap();
+        assert_eq!(by_new.auth_probe, AuthProbe::Disabled, "AppState::new");
+
+        let by_version = AppState::with_version(
+            "https://a.test",
+            "https://o.test",
+            "https://g.test",
+            TokenSource::Disabled,
+            Arc::new(cc_version::VersionCache::detect_or_fallback()),
+        )
+        .unwrap();
+        assert_eq!(
+            by_version.auth_probe,
+            AuthProbe::Disabled,
+            "AppState::with_version"
+        );
+    }
+
+    #[test]
+    fn kill_switch_keeps_the_probe_disabled() {
+        // with_default_auth_probe is the only enabling path, and it must
+        // honour the opt-out even when `claude` is on PATH.
+        temp_env::with_var(PROBE_KILL_SWITCH_ENV, Some("1"), || {
+            let s = AppState::new(
+                "https://a.test",
+                "https://o.test",
+                "https://g.test",
+                TokenSource::Disabled,
+            )
+            .unwrap()
+            .with_default_auth_probe();
+            assert_eq!(s.auth_probe, AuthProbe::Disabled);
+        });
     }
 }
