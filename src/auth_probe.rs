@@ -311,6 +311,16 @@ mod tests {
     /// that check only special-cases `(Some,Some)` and deliberately does not
     /// short-circuit `(None, Some(_))` — see the comment above it — so this
     /// test exercises the post-spawn match, the arm this finding is about.
+    ///
+    /// Unlike the file's other `/usr/bin/true` fixtures, this one is not
+    /// merely unix-flavored shell — the assertion is reachable only if the
+    /// spawn itself *succeeds*: `before_ms: None` means the pre-spawn dedup
+    /// shortcut (which only special-cases `(Some, Some)`) never fires, and a
+    /// failed spawn's `Err` arm hard-returns `NoChange` before the match this
+    /// test is proving is ever reached. On a platform with no
+    /// `/usr/bin/true`, that `Err` arm - not the assertion below - decides
+    /// the outcome. Gated the same way C1 gates its four fixtures.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_credential_that_gains_an_expiry_is_a_refresh() {
         let _serial = test_serial().lock().await;
