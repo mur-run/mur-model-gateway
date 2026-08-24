@@ -257,8 +257,16 @@ fn keychain_fallback(
     }
 }
 
-/// Opt-out for the delegated-refresh probe. Set to `1` to make the gateway
-/// return the upstream 401 unchanged instead of asking Claude Code to refresh.
+/// Opt-out for the delegated-refresh probe. Set to `1` to stop the gateway
+/// from arming the probe at startup, so an Anthropic 401 never spawns
+/// `claude auth status` and is never retried.
+///
+/// This does NOT change what the client receives on that 401: the
+/// actionable error body (naming the credential store and how to fix it) is
+/// swapped in either way, because that swap depends only on the request
+/// being Anthropic + 401 + claude-owned — never on `auth_probe`. With the
+/// kill switch set, the client still gets the actionable body, just without
+/// a retry ever having been attempted first.
 pub const PROBE_KILL_SWITCH_ENV: &str = "MUR_MODEL_GATEWAY_NO_AUTH_PROBE";
 
 /// How the gateway asks the credential's owner to refresh it.
@@ -425,11 +433,33 @@ impl AppState {
 
 /// Resolve `claude` on PATH to an absolute path. Deliberately not `which`:
 /// one small lookup does not earn a dependency.
+///
+/// I2: checks more than `.is_file()` — see [`is_executable_file`]. A stale
+/// or permission-stripped `claude` left on PATH would otherwise arm the
+/// probe with a binary that can never run, turning every Anthropic 401 into
+/// one guaranteed-failing spawn before the real error body. This pass does
+/// NOT add a `.cmd`/`.exe` Windows lookup (tracked separately) — on
+/// non-unix, `is_executable_file` is still exactly the old `.is_file()`.
 fn which_claude() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join("claude"))
-        .find(|c| c.is_file())
+        .find(|c| is_executable_file(c))
+}
+
+/// `.is_file()` plus, on unix, the executable bit (`mode & 0o111`). A file
+/// that exists but isn't executable (`644`, or stripped by a broken
+/// install) would fail every spawn attempt — plain `.is_file()` can't tell
+/// that apart from a real, runnable binary.
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -1090,10 +1120,21 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String 
     } else {
         "Anthropic OAuth was revoked (the stored credential has not aged out)"
     };
+    // I1: only read the keychain when `source` is actually `Keychain` — for
+    // `CredentialsFile`/`Codex`/etc. this would be a pointless (and on some
+    // Linux setups, dialog-prompting) read of a store the credential never
+    // came from. Cache-backed (`keychain::CACHE_TTL`): `forward()` already
+    // called `anthropic_credential_expiry` moments earlier on this same
+    // request, so this is a cache hit, not a second live keychain round trip.
+    let from_keychain = if matches!(source, TokenSource::Keychain) {
+        keychain::read_claude_code_credential()
+    } else {
+        Ok(None)
+    };
     format!(
         "{what} — credential: {}. \
          Fix: run `/login anthropic` in murmur, or `claude auth login`.",
-        describe_credential_store(source, cfg!(target_os = "macos"))
+        describe_credential_store(source, cfg!(target_os = "macos"), &from_keychain)
     )
 }
 
@@ -1108,10 +1149,27 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String 
 /// this plan's most-repeated mistake — the fourth occurrence, per the Task 5
 /// brief — and without the parameter that branch could only ever be proven
 /// by CI's Linux/Windows runners, never locally.
-fn describe_credential_store(source: &TokenSource, is_macos: bool) -> String {
+///
+/// I1: `from_keychain` is the caller's own keychain read for this same
+/// request (`Ok(None)` when `source` isn't `Keychain` at all). Before this
+/// parameter existed, the `TokenSource::Keychain` branch named the file on
+/// every non-macOS host unconditionally — but `keychain_fallback` (what
+/// `resolve_credential` actually calls) prefers the keychain result whenever
+/// it resolved to `Ok(Some(_))`, platform aside. So a non-macOS install with
+/// a working keychain backend got a *wrong* answer: told to look at a file
+/// that isn't where its token came from. This does not fully re-run
+/// `keychain_fallback`'s policy (it still doesn't check whether the fallback
+/// file exists before naming it) — just enough to fix the one case where the
+/// two disagreed. A full provenance refactor is an explicitly out-of-scope
+/// follow-up.
+fn describe_credential_store(
+    source: &TokenSource,
+    is_macos: bool,
+    from_keychain: &Result<Option<keychain::OauthCredential>, keychain::KeychainError>,
+) -> String {
     match source {
         TokenSource::Keychain => {
-            if is_macos {
+            if is_macos || matches!(from_keychain, Ok(Some(_))) {
                 "keychain \"Claude Code-credentials\"".to_string()
             } else {
                 // The non-macOS fallback `resolve_credential` uses.
@@ -1331,13 +1389,19 @@ mod tests {
     /// to run `cargo test`, rather than only by CI's Linux/Windows legs.
     #[test]
     fn describe_credential_store_names_the_keychain_only_on_macos() {
-        let macos = describe_credential_store(&TokenSource::Keychain, true);
+        let macos = describe_credential_store(&TokenSource::Keychain, true, &Ok(None));
         assert!(
             macos.contains("Claude Code-credentials"),
             "macOS install: {macos}"
         );
 
-        let other = describe_credential_store(&TokenSource::Keychain, false);
+        // `Err`, not `Ok(None)`: a non-macOS host with no keychain backend at
+        // all — the case this test is named for. `Ok(Some(_))` is covered
+        // separately below (I1: that case must name the keychain even here).
+        let no_backend = Err(keychain::KeychainError::Backend(
+            "no keychain backend available".into(),
+        ));
+        let other = describe_credential_store(&TokenSource::Keychain, false, &no_backend);
         assert!(
             !other.contains("Claude Code-credentials"),
             "non-macOS install must not name a keychain it doesn't have: {other}"
@@ -1348,11 +1412,32 @@ mod tests {
         );
     }
 
+    /// I1: `describe_credential_store` must mirror `keychain_fallback`'s
+    /// actual decision, not just platform. `keychain_fallback` prefers the
+    /// keychain result whenever it resolved to `Ok(Some(_))`, regardless of
+    /// `is_macos` — so a non-macOS install with a *working* keychain backend
+    /// must be told to look at the keychain, not unconditionally pointed at
+    /// the fallback file it never used. Would fail against the old
+    /// `is_macos`-only branch, which named the file here unconditionally.
+    #[test]
+    fn describe_credential_store_prefers_a_resolved_keychain_even_off_macos() {
+        let from_keychain = Ok(Some(keychain::OauthCredential {
+            access_token: "sk-ant-oat01-test".to_string(),
+            expires_at_ms: Some(1_000),
+        }));
+        let d = describe_credential_store(&TokenSource::Keychain, false, &from_keychain);
+        assert!(
+            d.contains("Claude Code-credentials"),
+            "a resolved non-macOS keychain read must be named, not the fallback file: {d}"
+        );
+    }
+
     #[test]
     fn describe_credential_store_names_the_configured_file_path() {
         let d = describe_credential_store(
             &TokenSource::CredentialsFile("/home/u/.claude/.credentials.json".into()),
-            true, // even a macOS host must defer to the configured file, not the keychain
+            true,      // even a macOS host must defer to the configured file, not the keychain
+            &Ok(None), // irrelevant: the CredentialsFile branch never reads it
         );
         assert_eq!(d, "/home/u/.claude/.credentials.json");
     }
@@ -1634,12 +1719,20 @@ mod tests {
         // honour the opt-out even when `claude` genuinely resolves on PATH —
         // not just when this machine happens to lack a `claude` install
         // (which would make the assertion vacuous: which_claude() returns
-        // None either way, kill switch or not). Fixture: a plain file named
-        // `claude` (which_claude only checks is_file(), no exec bit needed)
-        // in a temp dir, prepended onto PATH via std::env::join_paths.
+        // None either way, kill switch or not). Fixture: a file named
+        // `claude` in a temp dir, prepended onto PATH via
+        // std::env::join_paths. Chmod +x on unix (I2: which_claude now checks
+        // the executable bit there, not just is_file()) — without it this
+        // fixture stops resolving at all and the control below would fail
+        // for the wrong reason.
         let dir = tempfile::tempdir().unwrap();
         let fake_claude = dir.path().join("claude");
         std::fs::write(&fake_claude, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let ambient_path = std::env::var_os("PATH").unwrap_or_default();
         let path_with_fake = std::env::join_paths(
             std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&ambient_path)),
@@ -1682,6 +1775,41 @@ mod tests {
                     "control: fake `claude` on PATH did not arm the probe — PATH fixture is broken, so the Disabled assertion above proved nothing"
                 );
             });
+        });
+    }
+
+    /// I2: `which_claude` used to accept any `is_file()` match regardless of
+    /// permissions — a stale or permission-stripped `claude` left earlier on
+    /// PATH would shadow a perfectly good one later on PATH, silently arming
+    /// the probe with a binary that fails every spawn. Two PATH entries, in
+    /// order: a non-executable `claude` first, an executable one second —
+    /// proving this is a skip-and-continue past the bad entry, not merely
+    /// "reject a lone bad file" (which a stricter-but-still-wrong early
+    /// return could also satisfy).
+    #[cfg(unix)]
+    #[test]
+    fn which_claude_skips_a_non_executable_file_in_favor_of_an_executable_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let unusable = dir_a.path().join("claude");
+        std::fs::write(&unusable, "").unwrap();
+        std::fs::set_permissions(&unusable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let usable = dir_b.path().join("claude");
+        std::fs::write(&usable, "").unwrap();
+        std::fs::set_permissions(&usable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = std::env::join_paths([dir_a.path(), dir_b.path()]).unwrap();
+        temp_env::with_var("PATH", Some(path), || {
+            assert_eq!(
+                which_claude(),
+                Some(usable.clone()),
+                "a non-executable claude earlier on PATH must be skipped in \
+                 favor of an executable one later on PATH — not returned, and \
+                 not treated as though PATH had no claude at all"
+            );
         });
     }
 }

@@ -36,12 +36,27 @@ pub enum KeychainError {
 /// non-secret expiry that shipped with it. The refresh token is deliberately
 /// NOT represented here — the gateway never redeems it (see the spec's
 /// Rejected section), so it must not be able to leak it either.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OauthCredential {
     pub access_token: String,
     /// `claudeAiOauth.expiresAt`, milliseconds since the Unix epoch.
     /// `None` when the blob omits it — treat as "unknown", never as expired.
     pub expires_at_ms: Option<i64>,
+}
+
+/// Hand-written, not derived: this crate's discipline is that any `Debug` on
+/// a type holding a live secret must redact it (see `CodexAuth`/
+/// `CodexCredential` in `codex.rs`). A derived impl here would print
+/// `access_token` in full on any `{:?}` — a log line, a `dbg!()`, a panic
+/// message — which is exactly the leak the redaction discipline exists to
+/// prevent.
+impl std::fmt::Debug for OauthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OauthCredential")
+            .field("access_token", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
 }
 
 /// Read the current Claude Code OAuth credential from the OS keychain.
@@ -51,11 +66,6 @@ pub struct OauthCredential {
 /// `Err(_)` — backend error (locked keychain / permission denied / parse failure).
 pub fn read_claude_code_credential() -> Result<Option<OauthCredential>, KeychainError> {
     cached(&CACHE, CACHE_TTL, read_keychain_uncached)
-}
-
-/// Back-compat wrapper: just the access token, for callers that forward it.
-pub fn read_claude_code_oauth() -> Result<Option<String>, KeychainError> {
-    Ok(read_claude_code_credential()?.map(|c| c.access_token))
 }
 
 fn read_keychain_uncached() -> Result<Option<OauthCredential>, KeychainError> {
@@ -114,11 +124,6 @@ pub fn read_credentials_file_credential(
             path.display()
         ))),
     }
-}
-
-/// Back-compat wrapper for the file source.
-pub fn read_credentials_file(path: &std::path::Path) -> Result<Option<String>, KeychainError> {
-    Ok(read_credentials_file_credential(path)?.map(|c| c.access_token))
 }
 
 /// Extract `claudeAiOauth.{accessToken,expiresAt}` from a Claude Code blob.
@@ -205,15 +210,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_credentials_file(&path).unwrap().as_deref(),
-            Some("sk-ant-oat01-file")
+            read_credentials_file_credential(&path)
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "sk-ant-oat01-file"
         );
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn credentials_file_missing_is_none() {
-        let r = read_credentials_file(std::path::Path::new("/nonexistent/creds.json"));
+        let r = read_credentials_file_credential(std::path::Path::new("/nonexistent/creds.json"));
         assert!(matches!(r, Ok(None)));
     }
 
@@ -224,7 +232,7 @@ mod tests {
         let path = dir.join("garbage.json");
         std::fs::write(&path, "not json").unwrap();
         assert!(matches!(
-            read_credentials_file(&path),
+            read_credentials_file_credential(&path),
             Err(KeychainError::Malformed(_))
         ));
         std::fs::remove_file(&path).ok();
@@ -260,5 +268,30 @@ mod tests {
         let r2 = cached(&cache, ttl, || Ok(Some("never-fetched".into())));
         assert!(matches!(r1, Err(KeychainError::Backend(_))));
         assert!(matches!(r2, Err(KeychainError::Backend(_))));
+    }
+
+    /// I3: `OauthCredential` holds a live access token and its `Debug` is
+    /// hand-written, not derived — this proves the redaction actually
+    /// happens rather than merely compiling. Would fail against a plain
+    /// `#[derive(Debug)]`: the raw token would appear verbatim in `dbg`.
+    #[test]
+    fn oauth_credential_debug_redacts_the_access_token() {
+        let cred = OauthCredential {
+            access_token: "sk-ant-oat01-super-secret".to_string(),
+            expires_at_ms: Some(1_787_497_765_291),
+        };
+        let dbg = format!("{cred:?}");
+        assert!(
+            !dbg.contains("sk-ant-oat01-super-secret"),
+            "access_token leaked into Debug output: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug output must show the field was deliberately redacted: {dbg}"
+        );
+        assert!(
+            dbg.contains("1787497765291"),
+            "expires_at_ms is not a secret and must still be visible: {dbg}"
+        );
     }
 }

@@ -104,6 +104,9 @@ fn write_fake_claude_that_refreshes(dir: &std::path::Path, creds: &std::path::Pa
     }
 }
 
+// C1: writes and executes a `#!/bin/sh` fixture (`write_fake_claude_that_refreshes`)
+// — must not compile in on Windows, not merely skip at run time.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_credential_is_refreshed_and_the_request_retried() {
     let _serial = test_serial().lock().await;
@@ -419,5 +422,95 @@ async fn retry_carries_the_freshly_refreshed_bearer_token() {
         1,
         "exactly one retry, and it must carry the refreshed token \
          (this mock only matches Bearer new-tok)"
+    );
+}
+
+/// T5's ungated counterpart to `retry_carries_the_freshly_refreshed_bearer_token`
+/// above. The finding that prompted this test asked for a single always-200
+/// mock, matched on method + path only (`always_401`'s own style, no header
+/// matcher), proving "a repaired 401 returns upstream's success unchanged" —
+/// so the claim runs in real CI instead of only under `cfg(has_beta_hook)`.
+///
+/// That literal 401-then-200 sequence cannot be built ungated, and this test
+/// deliberately does not attempt it. Two structural facts rule it out:
+/// httpmock has no stateful "first call gets X, second gets Y" matching
+/// (confirmed by reading its vendored source — `find_mock` walks a
+/// `BTreeMap` and returns the first registered match, every time, forever;
+/// there is no hit-count-based expiry or fallthrough on `Mock`/`Then`), and
+/// the public-build disguise stub (`src/disguise.rs`,
+/// `#[cfg(not(has_beta_hook))]`) adds no header and changes no byte of the
+/// body — so in this build the first attempt and a retry are wire-identical
+/// requests. A single always-200 mock is reachable by either one,
+/// indistinguishably, so it cannot prove a *sequence* at all.
+///
+/// What this proves instead, ungated, and why it still matters for T5's
+/// underlying concern: an upstream 200 — even for a request carrying a
+/// claude-owned, expired-looking stored credential, with a real probe armed
+/// and ready to run — never triggers the probe and never swaps in the
+/// actionable body. `anthropic_expiry` (`src/lib.rs`) is only ever computed
+/// from a `401` response in the first place, so this is the ungated proof
+/// that the swap guard's dependency on that holds at the boundary. It is
+/// NOT a proof of the 401-then-200 causal chain the finding's wording
+/// describes — that chain is exercised only by the gated test above, and is
+/// structurally unreachable without the real disguise implementation.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_success_never_triggers_the_probe_or_the_actionable_body() {
+    let _serial = test_serial().lock().await;
+    reset_probe_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let creds = dir.path().join("creds.json");
+    // Expired and claude-owned: the most favorable fixture for the bug this
+    // guards against — if anything could wrongly arm the probe against a
+    // 200, an already-stale-looking stored credential is what would do it.
+    let fixture = blob("old-tok", 1_000);
+    std::fs::write(&creds, &fixture).unwrap();
+    write_fake_claude_that_refreshes(dir.path(), &creds);
+
+    let upstream = MockServer::start_async().await;
+
+    // Matched on method + path only, same style as `always_401` above — no
+    // header matcher, because none would be reachable (see the doc comment).
+    let always_200 = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(200).body(r#"{"ok":true}"#);
+        })
+        .await;
+
+    let proxy = spawn_anthropic(
+        upstream.base_url(),
+        TokenSource::CredentialsFile(creds.clone()),
+        AuthProbe::Command(dir.path().join("claude")),
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-x","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        body, r#"{"ok":true}"#,
+        "an upstream success must reach the client unchanged, never Task 5's \
+         actionable body: {body}"
+    );
+    assert_eq!(
+        always_200.hits_async().await,
+        1,
+        "an upstream 200 must never trigger a retry — a bug that armed the \
+         probe against a 200 would show 2 hits here"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&creds).unwrap(),
+        fixture,
+        "the credentials file must be byte-for-byte unchanged — proof the \
+         probe never ran; the fake claude fixture here would rewrite it if \
+         it did"
     );
 }

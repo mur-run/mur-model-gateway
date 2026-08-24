@@ -102,6 +102,7 @@ Codex CLI itself).
 | `MUR_MODEL_GATEWAY_UPSTREAM_GEMINI` | `https://generativelanguage.googleapis.com` | Gemini upstream |
 | `MUR_MODEL_GATEWAY_UPSTREAM_CODEX` | `https://chatgpt.com/backend-api/codex` | Codex OAuth (ChatGPT) upstream |
 | `MUR_MODEL_GATEWAY_COMPRESS` | off | `1` enables tool_result compression |
+| `MUR_MODEL_GATEWAY_NO_AUTH_PROBE` | off | `1` disables the delegated-refresh probe (no `claude auth status` spawn on an Anthropic 401) |
 
 When `~/.codex/auth.json` is in `auth_mode = "apikey"`, the gateway sends
 requests to `https://api.openai.com` instead; that host is deliberately not

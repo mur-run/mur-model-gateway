@@ -66,8 +66,20 @@ fn cooldown_active() -> bool {
 /// `before_ms` is the `expiresAt` observed before the probe; the credential is
 /// re-read afterwards **from `source`**, via [`TokenSource::resolve_credential`]
 /// — the single shared fallback path (fix round 1, CRITICAL 1) — and the two
-/// compared. A blob without an expiry compares as unchanged, which is the
-/// safe direction: it costs one wasted retry, not a spawn loop.
+/// compared:
+///
+/// - `(Some(before), Some(after))` — `Refreshed` iff `after > before`.
+/// - `(None, Some(_))` — the blob had no expiry before the probe and has one
+///   now: also `Refreshed`. A missing `before_ms` most commonly means the
+///   *pre-probe* read failed to resolve a credential at all (no entry yet, or
+///   a backend error), so gaining one is itself the signal, not something to
+///   compare against a value that never existed.
+/// - `(None, None)` — still `NoChange`. This is a real, permanent gap: a
+///   Claude Code install that never writes `expiresAt` at all makes this
+///   feature unable to ever detect its own refresh, on every call, forever.
+///   It is bounded, not unbounded, damage — `PROBE_COOLDOWN` caps it at one
+///   wasted retry per cooldown window, not a spawn loop — but it does not
+///   self-heal the way the `(None, Some(_))` case does.
 ///
 /// Before `resolve_credential` existed, this read a hardcoded Keychain-only
 /// call for the `Keychain` variant, ignoring `source`'s non-macOS
@@ -131,6 +143,15 @@ pub(crate) async fn refresh_via_owner_with(
     // both spawn; PROBE_LOCK is what forces that not to happen by making one
     // of them wait until the other has fully finished (spawned, waited, and
     // re-read) before it even gets this far.
+    //
+    // Deliberately narrower than the post-spawn match below: this early-out
+    // only fires on `(Some(before), Some(after))`, not also on
+    // `(None, Some(_))`. A queued caller with a `None` `before_ms` falls
+    // through and spawns its own probe even when the winner ahead of it in
+    // PROBE_LOCK already repaired the credential. That's a bounded cost
+    // (one extra child, under PROBE_LOCK's serialisation, not a loop), not a
+    // correctness bug — the post-spawn match a few lines down still reports
+    // it as `Refreshed` — so it's left as-is rather than widened to match.
     if matches!((before_ms, read_after()), (Some(before), Some(after)) if after > before) {
         *COOLDOWN.lock().unwrap() = None;
         return ProbeOutcome::Refreshed;
@@ -175,6 +196,13 @@ pub(crate) async fn refresh_via_owner_with(
             *COOLDOWN.lock().unwrap() = None;
             ProbeOutcome::Refreshed
         }
+        // No expiry existed before the probe and one exists now: the blob
+        // gained an expiry, which is itself evidence of a refresh — there is
+        // nothing to compare it against, so treat gaining one as the signal.
+        (None, Some(_)) => {
+            *COOLDOWN.lock().unwrap() = None;
+            ProbeOutcome::Refreshed
+        }
         _ => {
             tracing::warn!(
                 "auth probe did not refresh the credential; backing off for {PROBE_COOLDOWN:?}"
@@ -188,6 +216,11 @@ pub(crate) async fn refresh_via_owner_with(
 /// Clear the cooldown. Test-only: the state is process-global and would
 /// otherwise leak between tests in the same binary. Sync, and touches only
 /// `COOLDOWN`, so it is safe to call from inside a `#[tokio::test]`.
+///
+/// Public because `tests/anthropic_retry_arm.rs` (an external integration
+/// test binary) calls it directly — not because it's part of the crate's
+/// intended API surface.
+#[doc(hidden)]
 pub fn reset_probe_state() {
     *COOLDOWN.lock().unwrap() = None;
 }
@@ -267,6 +300,26 @@ mod tests {
         assert_eq!(outcome, ProbeOutcome::Refreshed);
     }
 
+    /// I4: `before_ms` is `None` — the pre-probe read found no expiry at all
+    /// (no entry yet, or a blob that omits `expiresAt`) — and the post-probe
+    /// read finds one. Must report `Refreshed`: with only the old
+    /// `(Some,Some) if after > before` arm, this falls into the catch-all and
+    /// reports `NoChange` — permanently, since `before_ms` can never become
+    /// `Some` for a credential that starts with no expiry, so this outcome
+    /// would repeat on every single call. Uses `/usr/bin/true` (a real spawn
+    /// that touches nothing) rather than the pre-spawn dedup check, since
+    /// that check only special-cases `(Some,Some)` and deliberately does not
+    /// short-circuit `(None, Some(_))` — see the comment above it — so this
+    /// test exercises the post-spawn match, the arm this finding is about.
+    #[tokio::test]
+    async fn a_credential_that_gains_an_expiry_is_a_refresh() {
+        let _serial = test_serial().lock().await;
+        reset_probe_state();
+        let probe = AuthProbe::Command("/usr/bin/true".into());
+        let outcome = refresh_via_owner_with(&probe, None, || Some(2_000)).await;
+        assert_eq!(outcome, ProbeOutcome::Refreshed);
+    }
+
     #[tokio::test]
     async fn an_expiry_that_moves_backwards_is_not_a_refresh() {
         let _serial = test_serial().lock().await;
@@ -340,6 +393,11 @@ mod tests {
     /// Dropping it instead would let this test interleave with any sibling
     /// mid-assertion on the same process-global `COOLDOWN`, reintroducing
     /// the exact flake this file's `TEST_SERIAL` exists to prevent.
+    // C1: writes and executes a `#!/bin/sh` fixture — Windows has no shebang
+    // interpreter, so this must not even compile the test in on that target,
+    // not merely skip running it (a `#[cfg(unix)]` inner chmod block alone
+    // still leaves the spawn itself attempted on Windows).
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_callers_spawn_exactly_one_child() {
         let _serial = test_serial().lock().await;
@@ -417,6 +475,9 @@ mod tests {
     /// though the credential was genuinely repaired. Would fail against
     /// that version: the fake `claude` below touches only the file, never
     /// the keychain, so a keychain-only read sees nothing move.
+    // C1: writes and executes a `#!/bin/sh` fixture (the fake `claude`) —
+    // must not compile in on Windows, not merely skip at run time.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn refresh_via_owner_reads_the_configured_source_not_just_the_keychain() {
         let _serial = test_serial().lock().await;
@@ -481,6 +542,9 @@ mod tests {
     /// synthetic keychain-unavailable `Err` — reproducing exactly what a
     /// real non-macOS `TokenSource::Keychain::resolve_credential()` call
     /// computes, without touching this machine's real keychain.
+    // C1: writes and executes a `#!/bin/sh` fixture (the fake `claude`) —
+    // must not compile in on Windows, not merely skip at run time.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn keychain_default_falls_back_to_credentials_file_on_non_macos() {
         let _serial = test_serial().lock().await;
