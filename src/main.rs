@@ -143,7 +143,11 @@ async fn serve() -> anyhow::Result<()> {
     // an unconfigured gateway to the user's real `~/.codex/auth.json` —
     // production-only, deliberately not part of the constructor itself.
     .with_default_codex_source()
-    .with_upstream_codex(&upstream_codex);
+    .with_upstream_codex(&upstream_codex)
+    // Same discipline as with_default_codex_source above: AppState::new/
+    // with_version default auth_probe to Disabled, and this is the one
+    // place that arms it. MUR_MODEL_GATEWAY_NO_AUTH_PROBE=1 opts back out.
+    .with_default_auth_probe();
     if let Ok(spec) = std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX") {
         state.token_source_codex = parse_token_source_codex(&spec)
             .context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX")?;

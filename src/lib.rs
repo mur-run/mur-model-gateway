@@ -11,6 +11,7 @@
 //! `MUR_MODEL_GATEWAY_COMPRESS=1`) applies to tool_result blocks for the other three
 //! providers.
 
+pub mod auth_probe;
 pub mod cc_version;
 pub mod codex;
 pub mod compress;
@@ -122,6 +123,13 @@ pub fn codex_target_path(path_and_query: &str) -> String {
 /// Credential Manager). [`TokenSource::EnvVar`] reads from a process env
 /// var for platforms where Claude Code's keychain layout isn't supported.
 /// [`TokenSource::Static`] is a test injection point.
+///
+/// No `#[derive(Debug)]`: `Static` carries a raw token, and a derived impl
+/// would put it in any `{:?}`, tracing capture, or panic message. "Test
+/// injection point" is a doc comment, not an invariant the type system
+/// enforces — nothing stops production code from constructing this variant
+/// — so it gets the same hand-written, redacting `Debug` the crate already
+/// gives `CodexAuth`/`CodexCredential` (see `src/codex.rs`).
 #[derive(Clone)]
 pub enum TokenSource {
     /// Read from the OS keychain (Claude Code's `Claude Code-credentials`).
@@ -145,29 +153,66 @@ pub enum TokenSource {
     Disabled,
 }
 
+impl std::fmt::Debug for TokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenSource::Keychain => write!(f, "Keychain"),
+            TokenSource::EnvVar(name) => f.debug_tuple("EnvVar").field(name).finish(),
+            TokenSource::CredentialsFile(path) => {
+                f.debug_tuple("CredentialsFile").field(path).finish()
+            }
+            TokenSource::Codex(path) => f.debug_tuple("Codex").field(path).finish(),
+            // The one variant that carries a raw secret.
+            TokenSource::Static(_) => f.debug_tuple("Static").field(&"<redacted>").finish(),
+            TokenSource::Disabled => write!(f, "Disabled"),
+        }
+    }
+}
+
 impl TokenSource {
+    /// Resolve this source's underlying OAuth credential — access token plus
+    /// its expiry, when the source can supply one. The single shared
+    /// fallback path: `resolve()` below, `anthropic_credential_expiry`, and
+    /// `auth_probe::refresh_via_owner` all go through this rather than each
+    /// re-deriving the Keychain→credentials-file fallback in its own way.
+    ///
+    /// Fix round 1, CRITICAL 1: before this method existed, that fallback
+    /// was implemented once here (inline in `resolve()`) and independently
+    /// reimplemented — Keychain-only, no fallback — at two other call sites.
+    /// `TokenSource::Keychain` is the *production default*, so on every
+    /// default Linux/Windows install (no OS keychain backend, credential
+    /// lives in `~/.claude/.credentials.json`) both of those call sites
+    /// silently saw `None` and the delegated-refresh probe never fired — on
+    /// exactly the platform pairing the feature exists to fix. Routing every
+    /// caller through one method is what stops a fourth instance of the same
+    /// bug: there is now nowhere else to reimplement it.
+    ///
+    /// `Ok(Some)` for `Keychain`/`CredentialsFile` when a credential blob is
+    /// found; `Ok(None)` for every other variant — they have no stored
+    /// expiry to report (a raw token/key has none).
+    pub fn resolve_credential(
+        &self,
+    ) -> Result<Option<keychain::OauthCredential>, keychain::KeychainError> {
+        match self {
+            TokenSource::Keychain => keychain_fallback(
+                cfg!(target_os = "macos"),
+                keychain::read_claude_code_credential(),
+                keychain::default_credentials_path(),
+            ),
+            TokenSource::CredentialsFile(path) => keychain::read_credentials_file_credential(path),
+            TokenSource::Codex(_) | TokenSource::EnvVar(_) | TokenSource::Static(_) => Ok(None),
+            TokenSource::Disabled => Ok(None),
+        }
+    }
+
     /// `Ok(Some)` → token available, disguise applies.
     /// `Ok(None)` → no token, passthrough.
     /// `Err` → backend error, passthrough with a warning logged by the caller.
     pub fn resolve(&self) -> Result<Option<String>, keychain::KeychainError> {
         match self {
-            TokenSource::Keychain => {
-                let from_keychain = keychain::read_claude_code_oauth();
-                // Non-macOS Claude Code installs usually skip the OS keychain
-                // and write ~/.claude/.credentials.json instead; fall back so
-                // the zero-config default works there too.
-                if cfg!(target_os = "macos") {
-                    return from_keychain;
-                }
-                match from_keychain {
-                    Ok(Some(t)) => Ok(Some(t)),
-                    keychain_miss => match keychain::default_credentials_path() {
-                        Some(p) if p.exists() => keychain::read_credentials_file(&p),
-                        _ => keychain_miss,
-                    },
-                }
+            TokenSource::Keychain | TokenSource::CredentialsFile(_) => {
+                Ok(self.resolve_credential()?.map(|c| c.access_token))
             }
-            TokenSource::CredentialsFile(path) => keychain::read_credentials_file(path),
             TokenSource::Codex(path) => Ok(codex::read_credential(path).and_then(|c| match c {
                 // This generic resolver also feeds the Anthropic disguise
                 // path (global `MUR_MODEL_GATEWAY_TOKEN_SOURCE=codex`); an
@@ -181,6 +226,62 @@ impl TokenSource {
             TokenSource::Disabled => Ok(None),
         }
     }
+}
+
+/// Applies the Keychain→credentials-file fallback policy to an
+/// already-attempted keychain read. Non-macOS Claude Code installs usually
+/// skip the OS keychain and write `~/.claude/.credentials.json` instead;
+/// on macOS the keychain result is authoritative, full stop.
+///
+/// Takes `is_macos` as a parameter rather than reading `cfg!(target_os =
+/// "macos")` internally so the non-macOS branch is unit-testable from any
+/// dev machine. `cfg!(...)` (unlike `#[cfg(...)]`) is not conditional
+/// compilation — it bakes a fixed bool into the binary for whichever
+/// platform it's built on, but both branches of code around it are always
+/// compiled in, on every platform. Without this parameter, only the host
+/// platform's branch could ever execute under `cargo test` here.
+fn keychain_fallback(
+    is_macos: bool,
+    from_keychain: Result<Option<keychain::OauthCredential>, keychain::KeychainError>,
+    fallback_path: Option<std::path::PathBuf>,
+) -> Result<Option<keychain::OauthCredential>, keychain::KeychainError> {
+    if is_macos {
+        return from_keychain;
+    }
+    match from_keychain {
+        Ok(Some(c)) => Ok(Some(c)),
+        keychain_miss => match fallback_path {
+            Some(p) if p.exists() => keychain::read_credentials_file_credential(&p),
+            _ => keychain_miss,
+        },
+    }
+}
+
+/// Opt-out for the delegated-refresh probe. Set to `1` to stop the gateway
+/// from arming the probe at startup, so an Anthropic 401 never spawns
+/// `claude auth status` and is never retried.
+///
+/// This does NOT change what the client receives on that 401: the
+/// actionable error body (naming the credential store and how to fix it) is
+/// swapped in either way, because that swap depends only on the request
+/// being Anthropic + 401 + claude-owned — never on `auth_probe`. With the
+/// kill switch set, the client still gets the actionable body, just without
+/// a retry ever having been attempted first.
+pub const PROBE_KILL_SWITCH_ENV: &str = "MUR_MODEL_GATEWAY_NO_AUTH_PROBE";
+
+/// How the gateway asks the credential's owner to refresh it.
+///
+/// `Disabled` by default in every constructor — same discipline as
+/// `AppState::token_source_codex`. Enabling spawns a real binary that can
+/// rewrite the user's Claude Code credential, so a test-side `AppState` must
+/// be structurally unable to reach it rather than merely unlikely to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthProbe {
+    Disabled,
+    /// Absolute path to the `claude` binary, resolved once at startup. Stored
+    /// resolved (not looked up per call) so a later PATH change cannot swap
+    /// which binary a long-running gateway executes.
+    Command(std::path::PathBuf),
 }
 
 #[derive(Clone)]
@@ -212,6 +313,9 @@ pub struct AppState {
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
     /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
+    /// See [`AuthProbe`]. `Disabled` by default in every constructor; only
+    /// `with_default_auth_probe` (called from `main.rs`) can arm it.
+    pub auth_probe: AuthProbe,
 }
 
 impl AppState {
@@ -253,6 +357,9 @@ impl AppState {
             token_source_codex: TokenSource::Disabled,
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
+            // Structurally safe by default — see the AuthProbe doc and
+            // with_default_auth_probe (the only enabling path, main.rs-only).
+            auth_probe: AuthProbe::Disabled,
         })
     }
 
@@ -268,6 +375,20 @@ impl AppState {
             Some(p) => TokenSource::Codex(p),
             None => TokenSource::Disabled,
         };
+        self
+    }
+
+    /// Point the auth probe at the `claude` binary on PATH. Call from
+    /// `main.rs` only — see the `AuthProbe` doc. A no-op when the kill switch
+    /// is set or `claude` is not installed (a transplanted credential is a
+    /// supported setup: a working token with no owner CLI).
+    pub fn with_default_auth_probe(mut self) -> Self {
+        if std::env::var(PROBE_KILL_SWITCH_ENV).is_ok_and(|v| v == "1") {
+            return self;
+        }
+        if let Some(p) = which_claude() {
+            self.auth_probe = AuthProbe::Command(p);
+        }
         self
     }
 
@@ -308,6 +429,37 @@ impl AppState {
             _ => &self.token_source,
         }
     }
+}
+
+/// Resolve `claude` on PATH to an absolute path. Deliberately not `which`:
+/// one small lookup does not earn a dependency.
+///
+/// I2: checks more than `.is_file()` — see [`is_executable_file`]. A stale
+/// or permission-stripped `claude` left on PATH would otherwise arm the
+/// probe with a binary that can never run, turning every Anthropic 401 into
+/// one guaranteed-failing spawn before the real error body. This pass does
+/// NOT add a `.cmd`/`.exe` Windows lookup (tracked separately) — on
+/// non-unix, `is_executable_file` is still exactly the old `.is_file()`.
+fn which_claude() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("claude"))
+        .find(|c| is_executable_file(c))
+}
+
+/// `.is_file()` plus, on unix, the executable bit (`mode & 0o111`). A file
+/// that exists but isn't executable (`644`, or stripped by a broken
+/// install) would fail every spawn attempt — plain `.is_file()` can't tell
+/// that apart from a real, runnable binary.
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -619,6 +771,113 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             .with_context(|| format!("upstream retry {target_url}"))?;
     }
 
+    // Anthropic: the owner CLI holds the refresh token, so ask it to refresh
+    // rather than redeeming the token here. One retry only, same as Codex.
+    //
+    // `override_token.is_some()` is an extra guard beyond
+    // `anthropic_retry_eligible`: the predicate only inspects the
+    // *configured* token source, not whether this request actually used it.
+    // Mode 3 (a client-supplied, non-OAuth-shape credential) leaves
+    // `override_token` `None` even when a claude-owned TokenSource is
+    // configured. Same principle as `codex_cred.as_ref()` being `Some`
+    // above — eligibility requires proof *this gateway* attached the
+    // credential that got rejected, so a third party's bad key can never
+    // trigger a probe or spend the user's real refresh token.
+    let anthropic_source = state.token_source_for(Provider::Anthropic);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        // Fail-safe, not a silently-swallowed bug: this only underflows if
+        // the host clock reads before the Unix epoch, which no supported
+        // deployment target allows. Falling back to 0 makes the eligibility
+        // comparison in `anthropic_retry_eligible` fail closed (an
+        // impossibly-old "now" can't be past any stored expiry, so the
+        // credential reads as "not yet expired") instead of panicking the
+        // request.
+        .unwrap_or(0);
+    // Fix round 1, IMPORTANT 4: `anthropic_credential_expiry` below can hit
+    // the OS keychain or the filesystem, so — unlike `now_ms` above, a plain
+    // clock read — it must not run on every proxied request. Cheap conjuncts
+    // first: `override_token.is_some()` already implies `provider ==
+    // Provider::Anthropic` (see the disguise-gate comment further up —
+    // override_token is only ever set on that path), so it doubles as the
+    // cheap provider check; `claude_owned` is a plain `matches!` on a
+    // reference already in hand. Only once both hold — plus the status code,
+    // also free — does `anthropic_expiry` run the actual credential-store
+    // read.
+    //
+    // Task 5: hoisted out of the retry `if`'s own conjunct chain (it used to
+    // be an inline `&& let anthropic_expiry = …` there) so the SAME read
+    // backs both the retry-eligibility check below and the client-facing
+    // error wording further down if the 401 survives the retry. A second,
+    // independent read at the error site would repeat the exact mistake
+    // `anthropic_credential_expiry`'s own doc comment describes — this plan
+    // has already hardcoded or reimplemented that read wrongly three times.
+    // `Option<Option<i64>>`: the outer `None` means the cheap conjuncts
+    // below didn't hold (this 401 isn't for a credential this gateway
+    // attached, so there's nothing here for the error path to explain
+    // either); `Some` means they did, and the inner `Option<i64>` is the
+    // stored expiry, or `None` if the blob doesn't carry one.
+    let claude_owned = matches!(
+        anthropic_source,
+        TokenSource::Keychain | TokenSource::CredentialsFile(_)
+    );
+    let anthropic_expiry: Option<Option<i64>> = if override_token.is_some()
+        && claude_owned
+        && upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
+    {
+        Some(anthropic_credential_expiry(anthropic_source))
+    } else {
+        None
+    };
+    if let Some(expiry) = anthropic_expiry
+        && anthropic_retry_eligible(
+            provider,
+            upstream_resp.status(),
+            anthropic_source,
+            expiry,
+            now_ms,
+        )
+        && auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, expiry).await
+            == auth_probe::ProbeOutcome::Refreshed
+        && let Ok(Some(fresh)) = anthropic_source.resolve()
+    {
+        let has_anthropic_version = parts.headers.contains_key("anthropic-version");
+        let retry_body: Vec<u8> = if let Some(ver) = cc_version.as_deref() {
+            disguise::inject_billing_prefix(&body_bytes, ver)?
+        } else {
+            body_bytes.to_vec()
+        };
+        let mut retry = state.client.request(parts.method.clone(), &target_url);
+        // Mirrors the Codex retry arm immediately above: forward the same
+        // client headers as the first attempt, minus hop-by-hop/host/
+        // content-length and the auth headers we're about to replace.
+        // `anthropic-beta` is skipped too, same reason it was
+        // captured-and-skipped on the first attempt: `apply_disguise_headers`
+        // below re-adds the merged value, and forwarding the client's raw
+        // header as well would send the upstream two `anthropic-beta`
+        // headers instead of one.
+        for (name, value) in parts.headers.iter() {
+            if is_hop_by_hop(name)
+                || name == "host"
+                || name == "content-length"
+                || name == "authorization"
+                || name == "x-api-key"
+                || name == "anthropic-beta"
+            {
+                continue;
+            }
+            retry = retry.header(name, value);
+        }
+        retry =
+            disguise::apply_disguise_headers(retry, &fresh, &client_betas, has_anthropic_version)?;
+        upstream_resp = retry
+            .body(retry_body)
+            .send()
+            .await
+            .with_context(|| format!("upstream retry {target_url}"))?;
+    }
+
     let status = upstream_resp.status();
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream_resp.headers().iter() {
@@ -626,6 +885,32 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             continue;
         }
         response_headers.insert(name.clone(), value.clone());
+    }
+
+    // Task 5: the retry arm above tried what it could. If the client is
+    // still looking at a 401 for a credential *this gateway* attached
+    // (`anthropic_expiry` is `Some` only when the cheap conjuncts held for
+    // the first attempt — see the comment where it's computed above), swap
+    // upstream's opaque "re-authenticate" body for one that names the
+    // credential and where it lives, instead of leaving the reader to guess.
+    //
+    // Rechecking `status` here, rather than reusing `anthropic_retry_eligible`'s
+    // verdict, is what makes this fire for the revoked-but-not-expired case
+    // too: eligibility was false there and no retry was ever attempted, but
+    // the client is still owed an explanation. It's also what makes this
+    // skip cleanly once a retry actually repairs the credential: `status` is
+    // the final response's status (the retry's, if one was sent), so it is
+    // no longer 401 by this point.
+    //
+    // `expired` reads the expiry captured before the retry ran — the
+    // question it answers is "did the original 401 look like an expiry
+    // problem", which is what decided whether a refresh was even attempted,
+    // not a fresh re-read (the probe above may just have rewritten it).
+    if let Some(expiry) = anthropic_expiry
+        && status == StatusCode::UNAUTHORIZED
+    {
+        let expired = expiry.is_none_or(|exp| exp <= now_ms);
+        return Ok(anthropic_auth_error_response(anthropic_source, expired));
     }
 
     if translating && client_wants_stream {
@@ -778,6 +1063,140 @@ fn codex_retry_eligible(
     }
 }
 
+/// Whether an Anthropic 401 is worth a delegated refresh.
+///
+/// A 401 with the stored expiry still in the future means the credential was
+/// revoked upstream, not that it aged out — a refresh cannot fix that, so the
+/// gateway must not spawn a probe for it. A blob with no expiry is allowed
+/// through once; the probe's own cooldown bounds the cost if it is fruitless.
+pub fn anthropic_retry_eligible(
+    provider: Provider,
+    status: reqwest::StatusCode,
+    source: &TokenSource,
+    expires_at_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    // Only a store Claude Code owns can be repaired by asking Claude Code to
+    // refresh. A raw key from the environment is rejected on its own merits.
+    let claude_owned = matches!(
+        source,
+        TokenSource::Keychain | TokenSource::CredentialsFile(_)
+    );
+    provider == Provider::Anthropic
+        && status == reqwest::StatusCode::UNAUTHORIZED
+        && claude_owned
+        && expires_at_ms.is_none_or(|exp| exp <= now_ms)
+}
+
+/// The stored expiry for Anthropic, read from **the same source the token came
+/// from**, via [`TokenSource::resolve_credential`] — the single shared
+/// fallback path (fix round 1, CRITICAL 1; see that method's doc for why a
+/// second, independent implementation here was the bug). Reading the
+/// keychain unconditionally, with no fallback, would be wrong on every Linux
+/// and Windows install, where Claude Code writes
+/// `~/.claude/.credentials.json` and there may be no keychain backend to
+/// read — the expiry would come back unknown on every request and the probe
+/// would fire on every 401.
+fn anthropic_credential_expiry(source: &TokenSource) -> Option<i64> {
+    source
+        .resolve_credential()
+        .ok()
+        .flatten()
+        .and_then(|c| c.expires_at_ms)
+}
+
+/// A 401 the caller can act on. The upstream body names no location, which is
+/// what left users guessing which credential had gone stale.
+///
+/// The store is derived from the source the token actually came from — NOT a
+/// hardcoded keychain string. On a Linux or Windows install the credential
+/// lives in a file, and an error that confidently names the wrong store sends
+/// the reader to a place that does not exist. This is the same mistake the
+/// expiry read made in three separate places earlier in this plan; do not
+/// reintroduce it here.
+pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String {
+    let what = if expired {
+        "Anthropic OAuth expired and an automatic refresh did not resolve it"
+    } else {
+        "Anthropic OAuth was revoked (the stored credential has not aged out)"
+    };
+    // I1: only read the keychain when `source` is actually `Keychain` — for
+    // `CredentialsFile`/`Codex`/etc. this would be a pointless (and on some
+    // Linux setups, dialog-prompting) read of a store the credential never
+    // came from. Cache-backed (`keychain::CACHE_TTL`): `forward()` already
+    // called `anthropic_credential_expiry` moments earlier on this same
+    // request, so this is a cache hit, not a second live keychain round trip.
+    let from_keychain = if matches!(source, TokenSource::Keychain) {
+        keychain::read_claude_code_credential()
+    } else {
+        Ok(None)
+    };
+    format!(
+        "{what} — credential: {}. \
+         Fix: run `/login anthropic` in murmur, or `claude auth login`.",
+        describe_credential_store(source, cfg!(target_os = "macos"), &from_keychain)
+    )
+}
+
+/// Where a reader should go to look at the credential, in words. Never prints
+/// the credential itself — `TokenSource`'s own `Debug` redacts, and this must
+/// not become a way around that.
+///
+/// `is_macos` is a parameter rather than a `cfg!(target_os = "macos")` read
+/// inside this function, same reason `keychain_fallback` above takes one (see
+/// its doc comment): it makes the non-macOS branch unit-testable from a
+/// macOS dev machine. Naming the keychain for an install that has none is
+/// this plan's most-repeated mistake — the fourth occurrence, per the Task 5
+/// brief — and without the parameter that branch could only ever be proven
+/// by CI's Linux/Windows runners, never locally.
+///
+/// I1: `from_keychain` is the caller's own keychain read for this same
+/// request (`Ok(None)` when `source` isn't `Keychain` at all). Before this
+/// parameter existed, the `TokenSource::Keychain` branch named the file on
+/// every non-macOS host unconditionally — but `keychain_fallback` (what
+/// `resolve_credential` actually calls) prefers the keychain result whenever
+/// it resolved to `Ok(Some(_))`, platform aside. So a non-macOS install with
+/// a working keychain backend got a *wrong* answer: told to look at a file
+/// that isn't where its token came from. This does not fully re-run
+/// `keychain_fallback`'s policy (it still doesn't check whether the fallback
+/// file exists before naming it) — just enough to fix the one case where the
+/// two disagreed. A full provenance refactor is an explicitly out-of-scope
+/// follow-up.
+fn describe_credential_store(
+    source: &TokenSource,
+    is_macos: bool,
+    from_keychain: &Result<Option<keychain::OauthCredential>, keychain::KeychainError>,
+) -> String {
+    match source {
+        TokenSource::Keychain => {
+            if is_macos || matches!(from_keychain, Ok(Some(_))) {
+                "keychain \"Claude Code-credentials\"".to_string()
+            } else {
+                // The non-macOS fallback `resolve_credential` uses.
+                keychain::default_credentials_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.claude/.credentials.json".to_string())
+            }
+        }
+        TokenSource::CredentialsFile(p) => p.display().to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The 401 returned to the client when the retry arm above did not repair an
+/// Anthropic credential this gateway attached. A fresh response, not
+/// upstream's headers with a swapped body — same shape as
+/// [`openai_error_response`] below: the message is plain text, not
+/// upstream's original content-type, and nothing else about the upstream
+/// response is worth preserving (its body doesn't survive either).
+fn anthropic_auth_error_response(source: &TokenSource, expired: bool) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(anthropic_auth_error_body(source, expired)))
+        .expect("static error response builds")
+}
+
 /// If the inbound request supplies an Anthropic OAuth subscription token
 /// (sk-ant-oat*) via either `x-api-key` or `Authorization: Bearer`, return
 /// it so the proxy can upgrade it to a fully-disguised Bearer request.
@@ -886,6 +1305,141 @@ mod tests {
     fn token_source_disabled_returns_none() {
         let ts = TokenSource::Disabled;
         assert_eq!(ts.resolve().unwrap(), None);
+    }
+
+    /// Fix round 1, IMPORTANT 3: `TokenSource::Static` carries a raw token —
+    /// the hand-written `Debug` impl above must redact it, matching
+    /// `CodexAuth`/`CodexCredential`'s existing redaction tests in
+    /// `src/codex.rs` (`debug_redacts_tokens`,
+    /// `codex_credential_debug_redacts_secrets`). Non-secret variants are
+    /// asserted the other way: `Static`'s payload is the only thing this
+    /// type must never leak, not a blanket "hide everything."
+    #[test]
+    fn token_source_debug_redacts_only_the_secret_variant() {
+        let static_dbg = format!(
+            "{:?}",
+            TokenSource::Static(Arc::new("sk-ant-oat01-realsecret".to_string()))
+        );
+        assert!(
+            !static_dbg.contains("sk-ant-oat01-realsecret"),
+            "Static's raw token must never appear in Debug output: {static_dbg}"
+        );
+        assert!(static_dbg.contains("<redacted>"));
+
+        // Non-secret variants keep showing their payload — an env-var name
+        // is not a credential, and losing it from logs/panics would make
+        // this type harder to debug for no security benefit.
+        let env_dbg = format!("{:?}", TokenSource::EnvVar("ANTHROPIC_API_KEY".to_string()));
+        assert!(env_dbg.contains("ANTHROPIC_API_KEY"));
+
+        assert_eq!(format!("{:?}", TokenSource::Keychain), "Keychain");
+        assert_eq!(format!("{:?}", TokenSource::Disabled), "Disabled");
+    }
+
+    /// Fix round 1, CRITICAL 1 (pure half — see
+    /// `auth_probe::tests::keychain_default_falls_back_to_credentials_file_on_non_macos`
+    /// for the `ProbeOutcome`-level regression this backs): pins
+    /// `keychain_fallback`'s contract in isolation. On a non-macOS host, a
+    /// keychain miss — `Ok(None)` (no entry) or `Err` (no backend at all)
+    /// alike — falls back to the credentials-file path when one exists
+    /// there, instead of propagating the miss the way the pre-fix,
+    /// independently-reimplemented reads at the two call sites did.
+    #[test]
+    fn keychain_fallback_uses_the_credentials_file_when_keychain_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"from-file","expiresAt":42}}"#,
+        )
+        .unwrap();
+
+        let err = keychain::KeychainError::Backend("no keychain backend available".into());
+        let result = keychain_fallback(false, Err(err), Some(path)).unwrap();
+        assert_eq!(
+            result.map(|c| c.access_token),
+            Some("from-file".to_string())
+        );
+    }
+
+    /// The macOS-branch counterpart: the keychain result is authoritative
+    /// and the fallback path is never consulted, even when a fixture file
+    /// exists at it — a stale leftover file must not shadow a live macOS
+    /// keychain answer of `Ok(None)` (Claude Code genuinely never logged in
+    /// on this machine).
+    #[test]
+    fn keychain_fallback_does_not_consult_the_file_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"must-not-be-used","expiresAt":42}}"#,
+        )
+        .unwrap();
+
+        let result = keychain_fallback(true, Ok(None), Some(path)).unwrap();
+        assert_eq!(result, None);
+    }
+
+    /// Task 5, the plan's fourth brush with this exact bug (per the brief):
+    /// an error that confidently names the keychain on an install that has
+    /// none sends the reader somewhere that doesn't exist. `is_macos` is
+    /// explicit (see `describe_credential_store`'s own doc comment)
+    /// precisely so both branches are provable here, on whatever OS happens
+    /// to run `cargo test`, rather than only by CI's Linux/Windows legs.
+    #[test]
+    fn describe_credential_store_names_the_keychain_only_on_macos() {
+        let macos = describe_credential_store(&TokenSource::Keychain, true, &Ok(None));
+        assert!(
+            macos.contains("Claude Code-credentials"),
+            "macOS install: {macos}"
+        );
+
+        // `Err`, not `Ok(None)`: a non-macOS host with no keychain backend at
+        // all — the case this test is named for. `Ok(Some(_))` is covered
+        // separately below (I1: that case must name the keychain even here).
+        let no_backend = Err(keychain::KeychainError::Backend(
+            "no keychain backend available".into(),
+        ));
+        let other = describe_credential_store(&TokenSource::Keychain, false, &no_backend);
+        assert!(
+            !other.contains("Claude Code-credentials"),
+            "non-macOS install must not name a keychain it doesn't have: {other}"
+        );
+        assert!(
+            other.contains(".claude") && other.contains("credentials"),
+            "non-macOS install must name the credentials-file path instead: {other}"
+        );
+    }
+
+    /// I1: `describe_credential_store` must mirror `keychain_fallback`'s
+    /// actual decision, not just platform. `keychain_fallback` prefers the
+    /// keychain result whenever it resolved to `Ok(Some(_))`, regardless of
+    /// `is_macos` — so a non-macOS install with a *working* keychain backend
+    /// must be told to look at the keychain, not unconditionally pointed at
+    /// the fallback file it never used. Would fail against the old
+    /// `is_macos`-only branch, which named the file here unconditionally.
+    #[test]
+    fn describe_credential_store_prefers_a_resolved_keychain_even_off_macos() {
+        let from_keychain = Ok(Some(keychain::OauthCredential {
+            access_token: "sk-ant-oat01-test".to_string(),
+            expires_at_ms: Some(1_000),
+        }));
+        let d = describe_credential_store(&TokenSource::Keychain, false, &from_keychain);
+        assert!(
+            d.contains("Claude Code-credentials"),
+            "a resolved non-macOS keychain read must be named, not the fallback file: {d}"
+        );
+    }
+
+    #[test]
+    fn describe_credential_store_names_the_configured_file_path() {
+        let d = describe_credential_store(
+            &TokenSource::CredentialsFile("/home/u/.claude/.credentials.json".into()),
+            true,      // even a macOS host must defer to the configured file, not the keychain
+            &Ok(None), // irrelevant: the CredentialsFile branch never reads it
+        );
+        assert_eq!(d, "/home/u/.claude/.credentials.json");
     }
 
     #[test]
@@ -1126,5 +1680,136 @@ mod tests {
                 .as_deref(),
             Some("codex-tok")
         );
+    }
+
+    #[test]
+    fn auth_probe_is_disabled_in_every_constructor() {
+        // Mirrors token_source_codex: a test-side AppState must be unable to
+        // spawn the real `claude`, not merely unlikely to. Both constructors
+        // are checked — the safety property is that NO path out of this impl
+        // block leaves the probe armed, so testing only `new` would let
+        // `with_version` regress silently.
+        let by_new = AppState::new(
+            "https://a.test",
+            "https://o.test",
+            "https://g.test",
+            TokenSource::Disabled,
+        )
+        .unwrap();
+        assert_eq!(by_new.auth_probe, AuthProbe::Disabled, "AppState::new");
+
+        let by_version = AppState::with_version(
+            "https://a.test",
+            "https://o.test",
+            "https://g.test",
+            TokenSource::Disabled,
+            Arc::new(cc_version::VersionCache::detect_or_fallback()),
+        )
+        .unwrap();
+        assert_eq!(
+            by_version.auth_probe,
+            AuthProbe::Disabled,
+            "AppState::with_version"
+        );
+    }
+
+    #[test]
+    fn kill_switch_keeps_the_probe_disabled() {
+        // with_default_auth_probe is the only enabling path, and it must
+        // honour the opt-out even when `claude` genuinely resolves on PATH —
+        // not just when this machine happens to lack a `claude` install
+        // (which would make the assertion vacuous: which_claude() returns
+        // None either way, kill switch or not). Fixture: a file named
+        // `claude` in a temp dir, prepended onto PATH via
+        // std::env::join_paths. Chmod +x on unix (I2: which_claude now checks
+        // the executable bit there, not just is_file()) — without it this
+        // fixture stops resolving at all and the control below would fail
+        // for the wrong reason.
+        let dir = tempfile::tempdir().unwrap();
+        let fake_claude = dir.path().join("claude");
+        std::fs::write(&fake_claude, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ambient_path = std::env::var_os("PATH").unwrap_or_default();
+        let path_with_fake = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&ambient_path)),
+        )
+        .unwrap();
+
+        temp_env::with_var("PATH", Some(path_with_fake), || {
+            temp_env::with_var(PROBE_KILL_SWITCH_ENV, Some("1"), || {
+                let s = AppState::new(
+                    "https://a.test",
+                    "https://o.test",
+                    "https://g.test",
+                    TokenSource::Disabled,
+                )
+                .unwrap()
+                .with_default_auth_probe();
+                assert_eq!(
+                    s.auth_probe,
+                    AuthProbe::Disabled,
+                    "kill switch: expected Disabled even with a resolvable `claude` on PATH"
+                );
+            });
+
+            // Negative control: same PATH, kill switch unset. This is what
+            // proves the fixture above actually works — if this assertion
+            // fails, the fixture never put a resolvable `claude` on PATH and
+            // the Disabled assertion above proved nothing.
+            temp_env::with_var_unset(PROBE_KILL_SWITCH_ENV, || {
+                let s = AppState::new(
+                    "https://a.test",
+                    "https://o.test",
+                    "https://g.test",
+                    TokenSource::Disabled,
+                )
+                .unwrap()
+                .with_default_auth_probe();
+                assert_eq!(
+                    s.auth_probe,
+                    AuthProbe::Command(fake_claude.clone()),
+                    "control: fake `claude` on PATH did not arm the probe — PATH fixture is broken, so the Disabled assertion above proved nothing"
+                );
+            });
+        });
+    }
+
+    /// I2: `which_claude` used to accept any `is_file()` match regardless of
+    /// permissions — a stale or permission-stripped `claude` left earlier on
+    /// PATH would shadow a perfectly good one later on PATH, silently arming
+    /// the probe with a binary that fails every spawn. Two PATH entries, in
+    /// order: a non-executable `claude` first, an executable one second —
+    /// proving this is a skip-and-continue past the bad entry, not merely
+    /// "reject a lone bad file" (which a stricter-but-still-wrong early
+    /// return could also satisfy).
+    #[cfg(unix)]
+    #[test]
+    fn which_claude_skips_a_non_executable_file_in_favor_of_an_executable_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let unusable = dir_a.path().join("claude");
+        std::fs::write(&unusable, "").unwrap();
+        std::fs::set_permissions(&unusable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let usable = dir_b.path().join("claude");
+        std::fs::write(&usable, "").unwrap();
+        std::fs::set_permissions(&usable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = std::env::join_paths([dir_a.path(), dir_b.path()]).unwrap();
+        temp_env::with_var("PATH", Some(path), || {
+            assert_eq!(
+                which_claude(),
+                Some(usable.clone()),
+                "a non-executable claude earlier on PATH must be skipped in \
+                 favor of an executable one later on PATH — not returned, and \
+                 not treated as though PATH had no claude at all"
+            );
+        });
     }
 }
