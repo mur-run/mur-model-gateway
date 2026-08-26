@@ -386,8 +386,20 @@ impl AppState {
         if std::env::var(PROBE_KILL_SWITCH_ENV).is_ok_and(|v| v == "1") {
             return self;
         }
-        if let Some(p) = which_claude() {
-            self.auth_probe = AuthProbe::Command(p);
+        match which_claude() {
+            Some(p) => self.auth_probe = AuthProbe::Command(p),
+            // Say so. A probe that cannot be armed makes the whole delegated
+            // refresh inert — every expired-token 401 goes back to the caller
+            // exactly as it did before this feature existed — and the only
+            // other clue is `cc_version`'s unrelated warning about the same
+            // missing binary. Observed in production: a launchd service whose
+            // PATH was `/usr/bin:/bin:/usr/sbin:/sbin` could not see `claude`
+            // in `~/.local/bin`, so the feature shipped and did nothing.
+            None => tracing::warn!(
+                path = %std::env::var("PATH").unwrap_or_default(),
+                "`claude` not found on PATH — delegated refresh is disabled; \
+                 an expired Anthropic token will return its 401 unchanged"
+            ),
         }
         self
     }
