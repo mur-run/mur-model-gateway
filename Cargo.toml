@@ -13,7 +13,7 @@ futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 # git tag (not local path) so mur-model-gateway builds on deploy hosts without a mur checkout;
 # keep the tag in lockstep with the mur version you develop against.
-mur-compress = { git = "https://github.com/mur-run/mur.git", tag = "v2.68.3", package = "mur-compress" }
+mur-compress = { git = "https://github.com/mur-run/mur.git", tag = "v2.71.1", package = "mur-compress" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde_json = "1"
 thiserror = "2"
