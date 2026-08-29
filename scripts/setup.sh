@@ -184,7 +184,29 @@ fi
 # signature changes on every build, which re-triggers the password
 # prompt for the Claude Code-credentials item on each request.
 if [[ "$PLATFORM" == macos ]]; then
-  SIGN_ID="${MUR_MODEL_GATEWAY_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' 'NR==1 {print $2}')}"
+  # Prefer a "Developer ID Application" identity — the distribution cert.
+  #
+  # This used to take whatever `security find-identity` printed first, which is
+  # keychain order, not a choice. On a machine that also holds an
+  # "Apple Development" cert that is what it picked, and an Apple Development
+  # cert carries a DIFFERENT Team ID. The keychain's Always Allow grant is
+  # scoped to the team, so the gateway looked like another vendor's program on
+  # every request and the password prompt came back — the exact thing the block
+  # below was written to stop.
+  SIGN_ID="${MUR_MODEL_GATEWAY_SIGN_IDENTITY:-}"
+  if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+      | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+  fi
+  if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+      | awk -F'"' 'NR==1 {print $2}')
+    if [[ -n "$SIGN_ID" ]]; then
+      log "WARNING: no Developer ID Application cert found; falling back to: $SIGN_ID"
+      log "  a development cert has its own Team ID, so the keychain grant will"
+      log "  not survive — set MUR_MODEL_GATEWAY_SIGN_IDENTITY to override"
+    fi
+  fi
   if [[ -n "$SIGN_ID" ]]; then
     log "codesigning with: $SIGN_ID"
     codesign -f -s "$SIGN_ID" -i com.mur-model-gateway "$BUILD_OUT"
