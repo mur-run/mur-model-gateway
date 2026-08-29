@@ -449,14 +449,50 @@ impl AppState {
 /// I2: checks more than `.is_file()` — see [`is_executable_file`]. A stale
 /// or permission-stripped `claude` left on PATH would otherwise arm the
 /// probe with a binary that can never run, turning every Anthropic 401 into
-/// one guaranteed-failing spawn before the real error body. This pass does
-/// NOT add a `.cmd`/`.exe` Windows lookup (tracked separately) — on
-/// non-unix, `is_executable_file` is still exactly the old `.is_file()`.
+/// one guaranteed-failing spawn before the real error body.
 fn which_claude() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // Windows resolves a bare command name through PATHEXT; unix does not.
+    let pathext = if cfg!(windows) {
+        Some(std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string()))
+    } else {
+        None
+    };
+    let names = claude_names(pathext.as_deref());
     std::env::split_paths(&path)
-        .map(|dir| dir.join("claude"))
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|c| is_executable_file(c))
+}
+
+/// The PATHEXT Windows itself falls back to when the variable is unset.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// Candidate file names for the CLI within one PATH directory, in search
+/// order. `None` means "no extension search" (unix).
+///
+/// Without this the Windows lookup could never succeed: npm installs the CLI
+/// as `claude.cmd`, a native build is `claude.exe`, and neither matches a
+/// bare `claude` join. Delegated refresh was inert on every Windows install —
+/// visible only as the "`claude` not found on PATH" warning.
+///
+/// Takes `pathext` as a parameter rather than reading the env internally,
+/// mirroring [`anthropic_auth_error_body`]'s `is_macos`, so the Windows
+/// branch is provable by a unit test on any dev machine and not only on CI's
+/// Windows leg.
+///
+/// The extension-less name goes last: npm also drops a `claude` shell script
+/// beside the shim, which `CreateProcess` cannot run, so it must not shadow
+/// the `.cmd` in the same directory.
+fn claude_names(pathext: Option<&str>) -> Vec<String> {
+    let Some(pathext) = pathext else {
+        return vec!["claude".to_string()];
+    };
+    pathext
+        .split(';')
+        .filter(|e| e.starts_with('.'))
+        .map(|e| format!("claude{}", e.to_ascii_lowercase()))
+        .chain(std::iter::once("claude".to_string()))
+        .collect()
 }
 
 /// `.is_file()` plus, on unix, the executable bit (`mode & 0o111`). A file
@@ -1823,5 +1859,41 @@ mod tests {
                  not treated as though PATH had no claude at all"
             );
         });
+    }
+
+    /// The Windows lookup used to be impossible to satisfy: `which_claude`
+    /// joined a bare `claude`, but npm installs the CLI as `claude.cmd` and a
+    /// native build is `claude.exe`. Delegated refresh was inert on every
+    /// Windows install. Runs on every platform because `claude_names` takes
+    /// PATHEXT as an argument.
+    #[test]
+    fn claude_names_searches_pathext_on_windows_and_nothing_on_unix() {
+        assert_eq!(
+            claude_names(None),
+            ["claude"],
+            "unix resolves a bare command name with no extension search"
+        );
+
+        assert_eq!(
+            claude_names(Some(DEFAULT_PATHEXT)),
+            [
+                "claude.com",
+                "claude.exe",
+                "claude.bat",
+                "claude.cmd",
+                "claude"
+            ],
+            "PATHEXT order is the resolution order, lowercased to match the \
+             installed shim; the extension-less name goes LAST so npm's \
+             unrunnable `claude` shell script cannot shadow `claude.cmd` in \
+             the same directory"
+        );
+
+        assert_eq!(
+            claude_names(Some(".EXE;;junk;.CMD")),
+            ["claude.exe", "claude.cmd", "claude"],
+            "empty and non-dot PATHEXT entries are skipped rather than \
+             producing a `claudejunk` candidate"
+        );
     }
 }
