@@ -512,9 +512,31 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/__mur/health", axum::routing::get(health))
         .route("/", any(proxy))
         .route("/{*tail}", any(proxy))
         .with_state(state)
+}
+
+/// Loopback readiness for MUR Hub: `codexCredential` is exactly `chatgpt`,
+/// `apikey`, or `missing` — a *kind*, never an id or token. Only a
+/// `TokenSource::Codex` source is inspected; every other source is `missing`.
+async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Value> {
+    let mode = match &state.token_source_codex {
+        TokenSource::Codex(path) => match codex::read_credential(path) {
+            Some(codex::CodexCredential::OAuth { .. }) => "chatgpt",
+            Some(codex::CodexCredential::ApiKey { .. }) => "apikey",
+            None => "missing",
+        },
+        _ => "missing",
+    };
+    // ponytail: serde_json::json! instead of a derive — the crate has no `serde` dep.
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "codexHook": codex::hook_compiled(),
+        "codexCredential": mode,
+        "compression": state.compress,
+    }))
 }
 
 async fn proxy(State(state): State<AppState>, req: Request) -> Response<Body> {
