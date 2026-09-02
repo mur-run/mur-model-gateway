@@ -50,6 +50,19 @@ mod codex_impl {
 
 pub use codex_impl::*;
 
+/// Whether this binary was built with the real Codex hook (the gitignored
+/// `codex_impl.rs`). Surfaced by `/__mur/health` so MUR Hub can tell a stub
+/// build from a broken login before it routes a subscription agent here.
+#[cfg(has_codex_hook)]
+pub const fn hook_compiled() -> bool {
+    true
+}
+
+#[cfg(not(has_codex_hook))]
+pub const fn hook_compiled() -> bool {
+    false
+}
+
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
