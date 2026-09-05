@@ -1198,13 +1198,33 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String 
     } else {
         "Anthropic OAuth was revoked (the stored credential has not aged out)"
     };
+    let is_macos = cfg!(target_os = "macos");
     // I1: only read the keychain when `source` is actually `Keychain` — for
-    // `CredentialsFile`/`Codex`/etc. this would be a pointless (and on some
-    // Linux setups, dialog-prompting) read of a store the credential never
-    // came from. Cache-backed (`keychain::CACHE_TTL`): `forward()` already
-    // called `anthropic_credential_expiry` moments earlier on this same
-    // request, so this is a cache hit, not a second live keychain round trip.
-    let from_keychain = if matches!(source, TokenSource::Keychain) {
+    // `CredentialsFile`/`Codex`/etc. this would be a pointless read of a
+    // store the credential never came from.
+    //
+    // And not on macOS either, where the result is provably discarded:
+    // `describe_credential_store`'s Keychain branch short-circuits on
+    // `is_macos` and never inspects `from_keychain`. Reading anyway re-ran
+    // the item's ACL authorization on the 401 path — the worst possible
+    // moment to risk a permission dialog — and, because this function is
+    // `pub` and called directly from `tests/auth_probe_retry.rs`, made plain
+    // `cargo test` prompt the developer for their login keychain password,
+    // accreting a stale trusted-app entry on the item per rebuilt test
+    // binary.
+    //
+    // The skip is sound only while that short-circuit holds;
+    // `describe_credential_store_on_macos_ignores_the_keychain_read` locks
+    // the invariant, so widening the branch fails a test instead of silently
+    // naming the wrong store on macOS.
+    //
+    // Off macOS the read stays: there it genuinely changes the answer (a
+    // working non-macOS keychain backend must be named rather than the
+    // fallback file — see the I1 test below), and it is cache-backed
+    // (`keychain::CACHE_TTL`) — `forward()` called
+    // `anthropic_credential_expiry` moments earlier on this same request, so
+    // it is a cache hit, not a second live round trip.
+    let from_keychain = if matches!(source, TokenSource::Keychain) && !is_macos {
         keychain::read_claude_code_credential()
     } else {
         Ok(None)
@@ -1212,7 +1232,7 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String 
     format!(
         "{what} — credential: {}. \
          Fix: run `/login anthropic` in murmur, or `claude auth login`.",
-        describe_credential_store(source, cfg!(target_os = "macos"), &from_keychain)
+        describe_credential_store(source, is_macos, &from_keychain)
     )
 }
 
@@ -1508,6 +1528,26 @@ mod tests {
             d.contains("Claude Code-credentials"),
             "a resolved non-macOS keychain read must be named, not the fallback file: {d}"
         );
+    }
+
+    /// Guards the keychain-read skip in `anthropic_auth_error_body`: on macOS
+    /// that function deliberately does NOT read the keychain, because this
+    /// branch ignores `from_keychain` there. If the short-circuit is ever
+    /// widened so macOS does consult the read, this fails — and the skip has
+    /// to go in the same change, or macOS 401s start naming the wrong store.
+    #[test]
+    fn describe_credential_store_on_macos_ignores_the_keychain_read() {
+        let resolved = Ok(Some(keychain::OauthCredential {
+            access_token: "sk-ant-oat01-test".to_string(),
+            expires_at_ms: Some(1_000),
+        }));
+        let missing = Ok(None);
+        let no_backend = Err(keychain::KeychainError::Backend("no backend".into()));
+        let a = describe_credential_store(&TokenSource::Keychain, true, &resolved);
+        let b = describe_credential_store(&TokenSource::Keychain, true, &missing);
+        let c = describe_credential_store(&TokenSource::Keychain, true, &no_backend);
+        assert_eq!(a, b, "macOS answer must not depend on the keychain read");
+        assert_eq!(b, c, "macOS answer must not depend on the keychain read");
     }
 
     #[test]
