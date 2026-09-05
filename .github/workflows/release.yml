@@ -64,12 +64,23 @@ jobs:
             security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
             rm cert.p12
             security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
-            codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" $BIN
+            codesign --force --options runtime --timestamp \
+              -i com.mur-model-gateway -s "$MACOS_SIGN_IDENTITY" $BIN
           else
             echo "::warning::MACOS_CERT_P12 not set — ad-hoc signing (users will get repeated keychain prompts)"
-            codesign --force -s - $BIN
+            codesign --force -i com.mur-model-gateway -s - $BIN
           fi
           codesign -dv $BIN
+          # The identifier is half of the designated requirement the keychain
+          # grant is matched on; scripts/setup.sh signs with exactly this one.
+          # Without an explicit -i, codesign derives it from the file name
+          # ("mur-model-gateway"), which is a *different* requirement — a
+          # release-installed gateway would then be refused the grant a
+          # source-installed one holds, and prompt for the keychain password
+          # on its own. v0.1.0 and v0.2.0 both shipped that way. Assert it
+          # rather than trusting the flag stays present.
+          codesign -dvvv $BIN 2>&1 | grep -qx 'Identifier=com.mur-model-gateway' \
+            || { echo "::error::wrong signing identifier — keychain grants will not match"; exit 1; }
 
       # Bare Mach-O binaries cannot be stapled; Gatekeeper fetches the ticket
       # online on first run, which is fine for a CLI distributed as a tarball.
