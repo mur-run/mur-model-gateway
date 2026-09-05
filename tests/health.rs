@@ -30,6 +30,10 @@ async fn health_is_local_and_non_secret() {
     assert_eq!(json["codexCredential"], "missing");
     assert_eq!(json["claudeCredential"], "missing");
     assert!(json.get("compression").unwrap().is_boolean());
+    // Triage field: a tester's bug report has to carry the build it came
+    // from. Asserted against the crate version rather than a literal so a
+    // version bump can't silently desync the two.
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     assert!(!raw.contains("access_token"));
     assert!(!raw.contains("refresh_token"));
     assert!(!raw.contains("accessToken"));
