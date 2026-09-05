@@ -106,10 +106,7 @@ pub fn read_claude_code_credential() -> Result<Option<OauthCredential>, Keychain
 /// Takes `now_ms` as a parameter rather than reading the clock itself, the
 /// same way `keychain_fallback` takes `is_macos`: it is the only way to
 /// assert this arithmetic deterministically instead of against wall time.
-fn credential_ttl(
-    res: &Result<Option<OauthCredential>, KeychainError>,
-    now_ms: i64,
-) -> Duration {
+fn credential_ttl(res: &Result<Option<OauthCredential>, KeychainError>, now_ms: i64) -> Duration {
     let Ok(Some(cred)) = res else {
         return CACHE_TTL;
     };
@@ -301,7 +298,6 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-
     fn cred(expires_at_ms: Option<i64>) -> Result<Option<OauthCredential>, KeychainError> {
         Ok(Some(OauthCredential {
             access_token: "sk-ant-oat01-test".into(),
@@ -327,7 +323,10 @@ mod tests {
             "an 8h-valid credential must not be re-read every {CACHE_TTL:?}: got {ttl:?}"
         );
         // expiry - margin, capped by MAX_CACHE_TTL.
-        assert_eq!(ttl, MAX_CACHE_TTL.min(Duration::from_secs(8 * 3600) - EXPIRY_MARGIN));
+        assert_eq!(
+            ttl,
+            MAX_CACHE_TTL.min(Duration::from_secs(8 * 3600) - EXPIRY_MARGIN)
+        );
     }
 
     #[test]
@@ -437,7 +436,11 @@ mod tests {
         // Same rationale as above: String payload, independent of `CACHE`.
         let cache: Slot<Option<String>> = Mutex::new(None);
         let ttl = Duration::from_secs(60);
-        let r1 = cached(&cache, |_| ttl, || Err(KeychainError::Backend("denied".into())));
+        let r1 = cached(
+            &cache,
+            |_| ttl,
+            || Err(KeychainError::Backend("denied".into())),
+        );
         let r2 = cached(&cache, |_| ttl, || Ok(Some("never-fetched".into())));
         assert!(matches!(r1, Err(KeychainError::Backend(_))));
         assert!(matches!(r2, Err(KeychainError::Backend(_))));
