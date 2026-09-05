@@ -198,21 +198,32 @@ if [[ "$PLATFORM" == macos ]]; then
     SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
       | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
   fi
+  # Fail closed. This used to auto-fall-back to whatever cert came first and
+  # merely log a warning — but the warning scrolls past in a build log, and
+  # the damage only shows up hours later as a password prompt nobody can
+  # connect back to this build. Silently signing with the wrong team is
+  # exactly the bug the block above documents; a warning was not enough to
+  # stop it happening once already.
   if [[ -z "$SIGN_ID" ]]; then
-    SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
-      | awk -F'"' 'NR==1 {print $2}')
-    if [[ -n "$SIGN_ID" ]]; then
-      log "WARNING: no Developer ID Application cert found; falling back to: $SIGN_ID"
-      log "  a development cert has its own Team ID, so the keychain grant will"
-      log "  not survive — set MUR_MODEL_GATEWAY_SIGN_IDENTITY to override"
-    fi
+    err "no \"Developer ID Application\" codesigning identity found."
+    err ""
+    err "Refusing to fall back to another certificate: an Apple Development cert"
+    err "carries a different Team ID, and the keychain grant on the"
+    err "Claude Code-credentials item is scoped to the team. Signing with one"
+    err "makes the gateway look like a different vendor's program and brings the"
+    err "password prompt back on every token rotation."
+    err ""
+    err "Pick one:"
+    err "  - install or renew the Developer ID Application certificate"
+    err "  - MUR_MODEL_GATEWAY_SIGN_IDENTITY='Apple Development: ...' $0   # deliberate, accepts the prompts"
+    err "  - MUR_MODEL_GATEWAY_SIGN_IDENTITY='-' $0                        # ad-hoc, prompts on every rebuild"
+    exit 1
   fi
-  if [[ -n "$SIGN_ID" ]]; then
-    log "codesigning with: $SIGN_ID"
-    codesign -f -s "$SIGN_ID" -i com.mur-model-gateway "$BUILD_OUT"
-  else
-    log "no codesigning identity — skipping (keychain will re-prompt after every rebuild)"
-  fi
+  log "codesigning with: $SIGN_ID"
+  codesign -f -s "$SIGN_ID" -i com.mur-model-gateway "$BUILD_OUT"
+  # Print what the keychain grant is actually matched on, so a Team ID change
+  # is visible here rather than surfacing later as unexplained prompts.
+  codesign -dvvv "$BUILD_OUT" 2>&1 | grep -E '^(Identifier|TeamIdentifier)=' | sed 's/^/  /'
 fi
 
 # ─── install binary ────────────────────────────────────────────────
