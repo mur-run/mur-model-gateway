@@ -7,10 +7,17 @@
 //!
 //! The token's stored under generic-password service `Claude Code-credentials`
 //! with the OS account = current username. The blob is JSON; we extract
-//! `claudeAiOauth.accessToken`. Reads are cached for [`CACHE_TTL`]: on macOS
-//! every uncached read can pop a keychain permission dialog (and a rebuilt
-//! binary always does), so per-request reads turn into a dialog storm.
-//! Claude Code refreshes the token on the order of hours; 60s staleness is fine.
+//! `claudeAiOauth.accessToken`. Reads are cached until the credential's own
+//! `expiresAt` (minus [`EXPIRY_MARGIN`], capped at [`MAX_CACHE_TTL`]): on macOS
+//! every uncached read re-runs the item's ACL authorization, which pops a
+//! keychain permission dialog whenever the grant doesn't match — after an
+//! upgrade, or after Claude Code rewrites the item. A flat [`CACHE_TTL`]
+//! turned that into a dialog *every minute, forever*, because a long-lived
+//! daemon re-reads on every request: ~1440 authorizations a day for a value
+//! that rotates ~3 times a day. Keying the TTL to the expiry the blob already
+//! carries makes it one read per rotation, so one dialog per rotation at
+//! worst. A 401 still forces a fresh read via [`invalidate_cache`], so a
+//! revoked-before-expiry token is not cached past its usefulness.
 
 use serde_json::Value;
 use std::sync::Mutex;
@@ -20,9 +27,24 @@ const SERVICE: &str = "Claude Code-credentials";
 
 // pub(crate): also memoises `codex::refreshed_access_token`'s refresh cache,
 // so the two don't drift onto different staleness windows.
+//
+// This is now the *floor* — the TTL used when a read yields no usable expiry
+// (backend error, no entry, or a blob with no `expiresAt`). A credential that
+// does carry an expiry is cached until it, via `credential_ttl`.
 pub(crate) const CACHE_TTL: Duration = Duration::from_secs(60);
-type CachedRead = Option<(Instant, Result<Option<OauthCredential>, KeychainError>)>;
-static CACHE: Mutex<CachedRead> = Mutex::new(None);
+
+/// Never hold a credential longer than this, however far out its `expiresAt`
+/// claims to be. Bounds the damage if a blob carries a bogus expiry.
+const MAX_CACHE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// Re-read this long before the stored expiry, so the gateway rotates onto a
+/// fresh token slightly early rather than serving a just-expired one.
+const EXPIRY_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// A `cached` slot: when the value was stored, how long it stays good, and
+/// what was stored. The TTL rides along with the value because `cached`
+/// freezes it at fetch time (see there).
+type Slot<T> = Mutex<Option<(Instant, Duration, Result<T, KeychainError>)>>;
+static CACHE: Slot<Option<OauthCredential>> = Mutex::new(None);
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum KeychainError {
@@ -65,7 +87,39 @@ impl std::fmt::Debug for OauthCredential {
 /// `Ok(None)` — no entry exists (Claude Code never logged in).
 /// `Err(_)` — backend error (locked keychain / permission denied / parse failure).
 pub fn read_claude_code_credential() -> Result<Option<OauthCredential>, KeychainError> {
-    cached(&CACHE, CACHE_TTL, read_keychain_uncached)
+    cached(
+        &CACHE,
+        |res| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            credential_ttl(res, now_ms)
+        },
+        read_keychain_uncached,
+    )
+}
+
+/// How long a completed read may be reused. A credential carrying an
+/// `expiresAt` is held until shortly before it; everything else — a backend
+/// error, no entry, a blob with no expiry — falls back to [`CACHE_TTL`].
+///
+/// Takes `now_ms` as a parameter rather than reading the clock itself, the
+/// same way `keychain_fallback` takes `is_macos`: it is the only way to
+/// assert this arithmetic deterministically instead of against wall time.
+fn credential_ttl(res: &Result<Option<OauthCredential>, KeychainError>, now_ms: i64) -> Duration {
+    let Ok(Some(cred)) = res else {
+        return CACHE_TTL;
+    };
+    let Some(expires_at_ms) = cred.expires_at_ms else {
+        return CACHE_TTL;
+    };
+    let remaining = Duration::from_millis(expires_at_ms.saturating_sub(now_ms).max(0) as u64);
+    // Clamped low as well as high: an already-expired credential falls back to
+    // CACHE_TTL rather than 0, so a dead token still can't spin the keychain
+    // (and its dialog) on every single request.
+    remaining
+        .saturating_sub(EXPIRY_MARGIN)
+        .clamp(CACHE_TTL, MAX_CACHE_TTL)
 }
 
 fn read_keychain_uncached() -> Result<Option<OauthCredential>, KeychainError> {
@@ -82,19 +136,25 @@ fn read_keychain_uncached() -> Result<Option<OauthCredential>, KeychainError> {
 /// TTL cache. The lock is held across `fetch` on purpose: concurrent requests
 /// trigger at most one macOS keychain permission dialog instead of one each,
 /// and once it's answered the rest are served from cache.
+///
+/// The TTL is derived from the fetched value by `ttl_of` and **frozen next to
+/// it** rather than recomputed on every hit. Recomputing would be wrong for an
+/// expiry-derived TTL: `at.elapsed()` grows as the deadline shrinks, so the
+/// comparison would count the passage of time twice and evict at roughly half
+/// the intended age.
 fn cached<T: Clone>(
-    cache: &Mutex<Option<(Instant, Result<T, KeychainError>)>>,
-    ttl: Duration,
+    cache: &Slot<T>,
+    ttl_of: impl Fn(&Result<T, KeychainError>) -> Duration,
     fetch: impl FnOnce() -> Result<T, KeychainError>,
 ) -> Result<T, KeychainError> {
     let mut slot = cache.lock().unwrap();
-    if let Some((at, res)) = slot.as_ref()
-        && at.elapsed() < ttl
+    if let Some((at, ttl, res)) = slot.as_ref()
+        && at.elapsed() < *ttl
     {
         return res.clone();
     }
     let res = fetch();
-    *slot = Some((Instant::now(), res.clone()));
+    *slot = Some((Instant::now(), ttl_of(&res), res.clone()));
     res
 }
 
@@ -238,34 +298,150 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    fn cred(expires_at_ms: Option<i64>) -> Result<Option<OauthCredential>, KeychainError> {
+        Ok(Some(OauthCredential {
+            access_token: "sk-ant-oat01-test".into(),
+            expires_at_ms,
+        }))
+    }
+
+    /// THE regression test for the keychain-dialog storm.
+    ///
+    /// Claude Code's access token lives ~8h. Under the old flat 60s TTL a
+    /// long-lived gateway re-ran the macOS keychain ACL authorization ~1440
+    /// times a day for it, so whenever the ACL grant didn't match (right
+    /// after an upgrade, or after Claude Code rewrote the item) the user got
+    /// the "enter your keychain password" dialog *every minute, forever*
+    /// instead of once. Fails against a flat `CACHE_TTL`.
+    #[test]
+    fn a_live_credential_is_cached_until_its_own_expiry_not_for_one_minute() {
+        let now = 1_800_000_000_000;
+        let eight_hours = 8 * 60 * 60 * 1000;
+        let ttl = credential_ttl(&cred(Some(now + eight_hours)), now);
+        assert!(
+            ttl > CACHE_TTL * 10,
+            "an 8h-valid credential must not be re-read every {CACHE_TTL:?}: got {ttl:?}"
+        );
+        // expiry - margin, capped by MAX_CACHE_TTL.
+        assert_eq!(
+            ttl,
+            MAX_CACHE_TTL.min(Duration::from_secs(8 * 3600) - EXPIRY_MARGIN)
+        );
+    }
+
+    #[test]
+    fn credential_ttl_re_reads_early_by_the_margin() {
+        let now = 1_800_000_000_000;
+        let ttl = credential_ttl(&cred(Some(now + 60 * 60 * 1000)), now);
+        assert_eq!(ttl, Duration::from_secs(3600) - EXPIRY_MARGIN);
+    }
+
+    #[test]
+    fn credential_ttl_caps_a_bogus_far_future_expiry() {
+        let now = 1_800_000_000_000;
+        let year = 365i64 * 24 * 3600 * 1000;
+        assert_eq!(credential_ttl(&cred(Some(now + year)), now), MAX_CACHE_TTL);
+    }
+
+    /// Unknown expiry, no entry, and backend errors all keep the old floor —
+    /// nothing gets held *longer* than before on the strength of a guess.
+    #[test]
+    fn credential_ttl_falls_back_to_the_floor_without_a_usable_expiry() {
+        let now = 1_800_000_000_000;
+        assert_eq!(credential_ttl(&cred(None), now), CACHE_TTL);
+        assert_eq!(credential_ttl(&Ok(None), now), CACHE_TTL);
+        assert_eq!(
+            credential_ttl(&Err(KeychainError::Backend("denied".into())), now),
+            CACHE_TTL
+        );
+    }
+
+    /// An already-expired credential must not drop the TTL to zero: that would
+    /// put the keychain (and its dialog) back on the per-request path — the
+    /// exact failure mode this change exists to remove — for a token the 401
+    /// path already handles via `invalidate_cache`.
+    #[test]
+    fn credential_ttl_of_an_expired_credential_still_holds_the_floor() {
+        let now = 1_800_000_000_000;
+        assert_eq!(credential_ttl(&cred(Some(now - 1)), now), CACHE_TTL);
+        assert_eq!(credential_ttl(&cred(Some(0)), now), CACHE_TTL);
+    }
+
+    /// `cached` must freeze the TTL next to the value at fetch time. If it
+    /// recomputed on every hit from a shrinking deadline, `at.elapsed()`
+    /// growing while the TTL shrank would count elapsed time twice and evict
+    /// at ~half the intended age.
+    #[test]
+    fn cached_derives_and_freezes_the_ttl_from_the_fetched_value() {
+        let cache: Slot<Option<String>> = Mutex::new(None);
+        // TTL depends on the value: "long" caches, "short" does not.
+        let ttl_of = |r: &Result<Option<String>, KeychainError>| match r {
+            Ok(Some(v)) if v == "long" => Duration::from_secs(3600),
+            _ => Duration::ZERO,
+        };
+        assert_eq!(
+            cached(&cache, ttl_of, || Ok(Some("long".into())))
+                .unwrap()
+                .as_deref(),
+            Some("long")
+        );
+        assert_eq!(
+            cached(&cache, ttl_of, || Ok(Some("ignored".into())))
+                .unwrap()
+                .as_deref(),
+            Some("long"),
+            "the stored 1h TTL must serve this hit, not a recomputed one"
+        );
+
+        let short: Slot<Option<String>> = Mutex::new(None);
+        assert_eq!(
+            cached(&short, ttl_of, || Ok(Some("short".into())))
+                .unwrap()
+                .as_deref(),
+            Some("short")
+        );
+        assert_eq!(
+            cached(&short, ttl_of, || Ok(Some("refetched".into())))
+                .unwrap()
+                .as_deref(),
+            Some("refetched"),
+            "a zero TTL derived from the value must refetch"
+        );
+    }
+
     #[test]
     fn cached_serves_within_ttl_and_refetches_after_expiry() {
         // Local String-payload cache: this test is about TTL mechanics, not
-        // credential shape, so it deliberately doesn't reuse `CachedRead`
-        // (which now holds `OauthCredential`).
-        #[allow(clippy::type_complexity)]
-        let cache: Mutex<Option<(Instant, Result<Option<String>, KeychainError>)>> =
-            Mutex::new(None);
+        // credential shape, so it instantiates `Slot` over `String` rather
+        // than touching the real `CACHE`.
+        let cache: Slot<Option<String>> = Mutex::new(None);
         let ttl = Duration::from_secs(60);
-        let r1 = cached(&cache, ttl, || Ok(Some("first".into())));
-        let r2 = cached(&cache, ttl, || Ok(Some("second".into())));
+        let r1 = cached(&cache, |_| ttl, || Ok(Some("first".into())));
+        let r2 = cached(&cache, |_| ttl, || Ok(Some("second".into())));
         assert_eq!(r1.unwrap().as_deref(), Some("first"));
         assert_eq!(r2.unwrap().as_deref(), Some("first")); // served from cache
 
-        let r3 = cached(&cache, Duration::ZERO, || Ok(Some("third".into())));
-        assert_eq!(r3.unwrap().as_deref(), Some("third")); // expired → refetched
+        // The TTL is frozen at store time now, so an entry has to be *stored*
+        // with a zero TTL for the next call to refetch — passing a zero
+        // `ttl_of` at read time no longer evicts a live entry, by design.
+        let expired: Slot<Option<String>> = Mutex::new(None);
+        cached(&expired, |_| Duration::ZERO, || Ok(Some("third".into()))).unwrap();
+        let r3 = cached(&expired, |_| Duration::ZERO, || Ok(Some("fourth".into())));
+        assert_eq!(r3.unwrap().as_deref(), Some("fourth")); // expired → refetched
     }
 
     #[test]
     fn cached_caches_errors_too() {
         // A denied keychain prompt must not re-prompt on every retry.
-        // Same rationale as above: String payload, independent of `CachedRead`.
-        #[allow(clippy::type_complexity)]
-        let cache: Mutex<Option<(Instant, Result<Option<String>, KeychainError>)>> =
-            Mutex::new(None);
+        // Same rationale as above: String payload, independent of `CACHE`.
+        let cache: Slot<Option<String>> = Mutex::new(None);
         let ttl = Duration::from_secs(60);
-        let r1 = cached(&cache, ttl, || Err(KeychainError::Backend("denied".into())));
-        let r2 = cached(&cache, ttl, || Ok(Some("never-fetched".into())));
+        let r1 = cached(
+            &cache,
+            |_| ttl,
+            || Err(KeychainError::Backend("denied".into())),
+        );
+        let r2 = cached(&cache, |_| ttl, || Ok(Some("never-fetched".into())));
         assert!(matches!(r1, Err(KeychainError::Backend(_))));
         assert!(matches!(r2, Err(KeychainError::Backend(_))));
     }
