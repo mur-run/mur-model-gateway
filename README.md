@@ -58,12 +58,17 @@ mur-model-gateway uninstall
 ```
 
 From a source checkout, `./scripts/setup.sh -- --compress` does the build, the
-install and the service registration in one shot.
+install and the service registration in one shot. Without a checkout — no Rust
+toolchain and no signing certificate needed — `scripts/install-release.sh`
+fetches the signed, notarized release, verifies its checksum and registers the
+service instead.
 
 Restoring a compressed `tool_result` needs the mur MCP server attached to your
 client — that is what provides `mur_retrieve`. See
-[docs/install.md](docs/install.md) for per-platform details and
-[docs/compress-setup.md](docs/compress-setup.md) for compression.
+[docs/install.md](docs/install.md) for per-platform details,
+[docs/compress-setup.md](docs/compress-setup.md) for compression, and
+[docs/staff-testing.md](docs/staff-testing.md) for the walkthrough written for
+people who just want to run it.
 
 ## Use with MUR
 
