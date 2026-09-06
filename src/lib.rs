@@ -540,6 +540,12 @@ async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Value> 
     // ponytail: serde_json::json! instead of a derive — the crate has no `serde` dep.
     axum::Json(serde_json::json!({
         "status": "ok",
+        // Compile-time constant, so this costs nothing at runtime. It exists
+        // for triage: when a tester reports odd behaviour, "which build are
+        // you on?" has to be answerable from the same one-line curl that
+        // reports credential state, not from asking them to remember how they
+        // installed it. Non-secret by construction.
+        "version": env!("CARGO_PKG_VERSION"),
         "codexHook": codex::hook_compiled(),
         "codexCredential": codex,
         "claudeCredential": claude,
