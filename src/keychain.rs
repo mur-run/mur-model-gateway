@@ -45,11 +45,48 @@ const EXPIRY_MARGIN: Duration = Duration::from_secs(5 * 60);
 /// any healthy value — a cache hit takes microseconds — so this stays silent
 /// unless a request genuinely queued behind someone else's keychain read.
 const LOCK_WAIT_WARN: Duration = Duration::from_secs(1);
-/// A `cached` slot: when the value was stored, how long it stays good, and
-/// what was stored. The TTL rides along with the value because `cached`
-/// freezes it at fetch time (see there).
-type Slot<T> = Mutex<Option<(Instant, Duration, Result<T, KeychainError>)>>;
+/// How long a cached read stays authoritative, and how long it may still be
+/// handed to callers who arrive while someone else is refreshing it.
+///
+/// Two deadlines rather than one because they answer different questions.
+/// `refresh_after` is "should someone go get a new value?"; `usable_for` is
+/// "is the value we already hold still *correct*?". For a Claude credential
+/// they differ by exactly `EXPIRY_MARGIN` — the margin exists so the token
+/// outlives its own refresh deadline, and that gap is what makes serving a
+/// stale-but-unexpired credential sound rather than a shortcut.
+///
+/// Named fields, not a tuple: swapping two `Duration`s here would mean serving
+/// a dead token, and nothing about the types would catch it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Freshness {
+    refresh_after: Duration,
+    /// Never less than `refresh_after`.
+    usable_for: Duration,
+}
+
+impl Freshness {
+    /// No grace window: the value stops being served the moment it goes stale.
+    /// Correct whenever the caller cannot vouch for the value past its TTL —
+    /// a failed read, or a credential whose real expiry is unknown.
+    fn fixed(d: Duration) -> Self {
+        Freshness {
+            refresh_after: d,
+            usable_for: d,
+        }
+    }
+}
+
+/// A `cached` slot: when the value was stored, its two deadlines, and the
+/// value. The deadlines ride along with the value because `cached` freezes
+/// them at fetch time (see there).
+type Slot<T> = Mutex<Option<(Instant, Freshness, Result<T, KeychainError>)>>;
 static CACHE: Slot<Option<OauthCredential>> = Mutex::new(None);
+
+/// Single-flight gate. Separate from `CACHE` on purpose: `CACHE`'s lock is now
+/// only ever held for a clone, never across the keychain read, so a slow read
+/// cannot stall readers. This is what serialises the *refreshers*, so a
+/// rotation still triggers one keychain dialog rather than one per request.
+static REFRESH: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum KeychainError {
@@ -94,37 +131,54 @@ impl std::fmt::Debug for OauthCredential {
 pub fn read_claude_code_credential() -> Result<Option<OauthCredential>, KeychainError> {
     cached(
         &CACHE,
+        &REFRESH,
         |res| {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as i64);
-            credential_ttl(res, now_ms)
+            credential_freshness(res, now_ms)
         },
         read_keychain_uncached,
     )
 }
 
-/// How long a completed read may be reused. A credential carrying an
-/// `expiresAt` is held until shortly before it; everything else — a backend
-/// error, no entry, a blob with no expiry — falls back to [`CACHE_TTL`].
+/// How long a completed read may be reused, and how long it may still be
+/// served during someone else's refresh.
+///
+/// A credential carrying an `expiresAt` is refreshed shortly before it and
+/// remains servable right up to it; everything else — a backend error, no
+/// entry, a blob with no expiry — falls back to [`CACHE_TTL`] with **no grace
+/// window**. That asymmetry is deliberate: a grace window is only sound when
+/// we know the value is still valid, and in those three cases we do not.
 ///
 /// Takes `now_ms` as a parameter rather than reading the clock itself, the
 /// same way `keychain_fallback` takes `is_macos`: it is the only way to
 /// assert this arithmetic deterministically instead of against wall time.
-fn credential_ttl(res: &Result<Option<OauthCredential>, KeychainError>, now_ms: i64) -> Duration {
+fn credential_freshness(
+    res: &Result<Option<OauthCredential>, KeychainError>,
+    now_ms: i64,
+) -> Freshness {
     let Ok(Some(cred)) = res else {
-        return CACHE_TTL;
+        return Freshness::fixed(CACHE_TTL);
     };
     let Some(expires_at_ms) = cred.expires_at_ms else {
-        return CACHE_TTL;
+        return Freshness::fixed(CACHE_TTL);
     };
     let remaining = Duration::from_millis(expires_at_ms.saturating_sub(now_ms).max(0) as u64);
     // Clamped low as well as high: an already-expired credential falls back to
     // CACHE_TTL rather than 0, so a dead token still can't spin the keychain
     // (and its dialog) on every single request.
-    remaining
+    let refresh_after = remaining
         .saturating_sub(EXPIRY_MARGIN)
-        .clamp(CACHE_TTL, MAX_CACHE_TTL)
+        .clamp(CACHE_TTL, MAX_CACHE_TTL);
+    // Servable until the real expiry — never past it. `.max(refresh_after)`
+    // only matters for an already-expired credential, where `remaining` is
+    // below the floor: there the two collapse and no grace is granted.
+    let usable_for = remaining.min(MAX_CACHE_TTL).max(refresh_after);
+    Freshness {
+        refresh_after,
+        usable_for,
+    }
 }
 
 /// Wraps the real read to time it. Only reached on a cache miss — this is
@@ -169,42 +223,78 @@ fn read_keychain_now() -> Result<Option<OauthCredential>, KeychainError> {
     }
 }
 
-/// TTL cache. The lock is held across `fetch` on purpose: concurrent requests
-/// trigger at most one macOS keychain permission dialog instead of one each,
-/// and once it's answered the rest are served from cache.
+/// Stale-while-revalidate cache with single-flight refresh.
 ///
-/// The TTL is derived from the fetched value by `ttl_of` and **frozen next to
-/// it** rather than recomputed on every hit. Recomputing would be wrong for an
-/// expiry-derived TTL: `at.elapsed()` grows as the deadline shrinks, so the
-/// comparison would count the passage of time twice and evict at roughly half
-/// the intended age.
+/// The `CACHE` lock is held only long enough to clone a snapshot — never
+/// across `fetch` — and `refresh` is what serialises refreshers. That split is
+/// the whole point. Holding one lock across the read did guarantee a single
+/// keychain dialog, but it also made every concurrent request wait for the
+/// read: at a real token rotation that was measured at
+/// `elapsed_ms=72980` with requests queued `waited_ms=64103` and `53642`
+/// behind it, against an 18ms baseline.
+///
+/// So: one caller refreshes, and everyone else keeps being served the value
+/// already in hand for as long as it is still *correct* (`usable_for`), not
+/// merely fresh (`refresh_after`). For credentials those differ by
+/// `EXPIRY_MARGIN`, which is exactly the window the margin was created to
+/// provide — a 73s refresh fits inside 5 minutes with room to spare. Callers
+/// with nothing usable to fall back on still wait, because a wrong answer is
+/// worse than a slow one.
+///
+/// The deadlines are derived from the fetched value by `freshness_of` and
+/// **frozen next to it** rather than recomputed on every hit. Recomputing
+/// would be wrong for an expiry-derived deadline: `at.elapsed()` grows as the
+/// deadline shrinks, so the comparison would count elapsed time twice and
+/// evict at roughly half the intended age.
 fn cached<T: Clone>(
     cache: &Slot<T>,
-    ttl_of: impl Fn(&Result<T, KeychainError>) -> Duration,
+    refresh: &Mutex<()>,
+    freshness_of: impl Fn(&Result<T, KeychainError>) -> Freshness,
     fetch: impl FnOnce() -> Result<T, KeychainError>,
 ) -> Result<T, KeychainError> {
-    // Timed because the lock wait is what distinguishes "the keychain read was
-    // slow" from "the read was fine and something else stalled us". Only the
-    // former makes every queued request wait; measuring the fetch alone cannot
-    // tell the two apart. `Instant::now()` on a path this hot is ~20ns, and the
-    // log is threshold-gated so a healthy gateway stays silent.
-    let wait_started = Instant::now();
-    let mut slot = cache.lock().unwrap();
-    let waited = wait_started.elapsed();
-    if waited > LOCK_WAIT_WARN {
-        tracing::warn!(
-            waited_ms = waited.as_millis() as u64,
-            "request blocked waiting for the credential cache — a slow keychain \
-             read stalls every request behind it"
-        );
-    }
-    if let Some((at, ttl, res)) = slot.as_ref()
-        && at.elapsed() < *ttl
+    let snapshot = cache.lock().unwrap().clone();
+    if let Some((at, f, res)) = &snapshot
+        && at.elapsed() < f.refresh_after
     {
         return res.clone();
     }
+
+    let _guard = match refresh.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Someone is already refreshing. Serve what we have if it is still
+            // valid — this is the path that used to block for a minute.
+            if let Some((at, f, res)) = &snapshot
+                && at.elapsed() < f.usable_for
+            {
+                return res.clone();
+            }
+            // Nothing servable: no value at all, or one past its real expiry.
+            // Wait for the refresher rather than answer wrongly.
+            let started = Instant::now();
+            let g = refresh.lock().unwrap();
+            let waited = started.elapsed();
+            if waited > LOCK_WAIT_WARN {
+                tracing::warn!(
+                    waited_ms = waited.as_millis() as u64,
+                    "request blocked waiting for a credential refresh with no \
+                     usable cached value to fall back on"
+                );
+            }
+            // The refresher stored a value while we waited; prefer it over
+            // running a second, redundant read.
+            let refreshed = cache.lock().unwrap().clone();
+            if let Some((at, f, res)) = &refreshed
+                && at.elapsed() < f.refresh_after
+            {
+                return res.clone();
+            }
+            g
+        }
+    };
+
     let res = fetch();
-    *slot = Some((Instant::now(), ttl_of(&res), res.clone()));
+    *cache.lock().unwrap() = Some((Instant::now(), freshness_of(&res), res.clone()));
     res
 }
 
@@ -257,6 +347,11 @@ fn parse_oauth_blob(raw: &str) -> Result<Option<OauthCredential>, KeychainError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refresh gate for tests that never contend on it. Tests that *do*
+    /// exercise contention declare their own, so one test cannot serialise
+    /// against another.
+    static R: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_extracts_access_token() {
@@ -367,7 +462,7 @@ mod tests {
     fn a_live_credential_is_cached_until_its_own_expiry_not_for_one_minute() {
         let now = 1_800_000_000_000;
         let eight_hours = 8 * 60 * 60 * 1000;
-        let ttl = credential_ttl(&cred(Some(now + eight_hours)), now);
+        let ttl = credential_freshness(&cred(Some(now + eight_hours)), now).refresh_after;
         assert!(
             ttl > CACHE_TTL * 10,
             "an 8h-valid credential must not be re-read every {CACHE_TTL:?}: got {ttl:?}"
@@ -380,29 +475,38 @@ mod tests {
     }
 
     #[test]
-    fn credential_ttl_re_reads_early_by_the_margin() {
+    fn credential_freshness_re_reads_early_by_the_margin() {
         let now = 1_800_000_000_000;
-        let ttl = credential_ttl(&cred(Some(now + 60 * 60 * 1000)), now);
+        let ttl = credential_freshness(&cred(Some(now + 60 * 60 * 1000)), now).refresh_after;
         assert_eq!(ttl, Duration::from_secs(3600) - EXPIRY_MARGIN);
     }
 
     #[test]
-    fn credential_ttl_caps_a_bogus_far_future_expiry() {
+    fn credential_freshness_caps_a_bogus_far_future_expiry() {
         let now = 1_800_000_000_000;
         let year = 365i64 * 24 * 3600 * 1000;
-        assert_eq!(credential_ttl(&cred(Some(now + year)), now), MAX_CACHE_TTL);
+        assert_eq!(
+            credential_freshness(&cred(Some(now + year)), now).refresh_after,
+            MAX_CACHE_TTL
+        );
     }
 
     /// Unknown expiry, no entry, and backend errors all keep the old floor —
     /// nothing gets held *longer* than before on the strength of a guess.
     #[test]
-    fn credential_ttl_falls_back_to_the_floor_without_a_usable_expiry() {
+    fn credential_freshness_falls_back_to_the_floor_without_a_usable_expiry() {
         let now = 1_800_000_000_000;
-        assert_eq!(credential_ttl(&cred(None), now), CACHE_TTL);
-        assert_eq!(credential_ttl(&Ok(None), now), CACHE_TTL);
         assert_eq!(
-            credential_ttl(&Err(KeychainError::Backend("denied".into())), now),
-            CACHE_TTL
+            credential_freshness(&cred(None), now),
+            Freshness::fixed(CACHE_TTL)
+        );
+        assert_eq!(
+            credential_freshness(&Ok(None), now),
+            Freshness::fixed(CACHE_TTL)
+        );
+        assert_eq!(
+            credential_freshness(&Err(KeychainError::Backend("denied".into())), now),
+            Freshness::fixed(CACHE_TTL)
         );
     }
 
@@ -411,10 +515,16 @@ mod tests {
     /// exact failure mode this change exists to remove — for a token the 401
     /// path already handles via `invalidate_cache`.
     #[test]
-    fn credential_ttl_of_an_expired_credential_still_holds_the_floor() {
+    fn credential_freshness_of_an_expired_credential_still_holds_the_floor() {
         let now = 1_800_000_000_000;
-        assert_eq!(credential_ttl(&cred(Some(now - 1)), now), CACHE_TTL);
-        assert_eq!(credential_ttl(&cred(Some(0)), now), CACHE_TTL);
+        assert_eq!(
+            credential_freshness(&cred(Some(now - 1)), now),
+            Freshness::fixed(CACHE_TTL)
+        );
+        assert_eq!(
+            credential_freshness(&cred(Some(0)), now),
+            Freshness::fixed(CACHE_TTL)
+        );
     }
 
     /// `cached` must freeze the TTL next to the value at fetch time. If it
@@ -426,17 +536,17 @@ mod tests {
         let cache: Slot<Option<String>> = Mutex::new(None);
         // TTL depends on the value: "long" caches, "short" does not.
         let ttl_of = |r: &Result<Option<String>, KeychainError>| match r {
-            Ok(Some(v)) if v == "long" => Duration::from_secs(3600),
-            _ => Duration::ZERO,
+            Ok(Some(v)) if v == "long" => Freshness::fixed(Duration::from_secs(3600)),
+            _ => Freshness::fixed(Duration::ZERO),
         };
         assert_eq!(
-            cached(&cache, ttl_of, || Ok(Some("long".into())))
+            cached(&cache, &R, ttl_of, || Ok(Some("long".into())))
                 .unwrap()
                 .as_deref(),
             Some("long")
         );
         assert_eq!(
-            cached(&cache, ttl_of, || Ok(Some("ignored".into())))
+            cached(&cache, &R, ttl_of, || Ok(Some("ignored".into())))
                 .unwrap()
                 .as_deref(),
             Some("long"),
@@ -445,13 +555,13 @@ mod tests {
 
         let short: Slot<Option<String>> = Mutex::new(None);
         assert_eq!(
-            cached(&short, ttl_of, || Ok(Some("short".into())))
+            cached(&short, &R, ttl_of, || Ok(Some("short".into())))
                 .unwrap()
                 .as_deref(),
             Some("short")
         );
         assert_eq!(
-            cached(&short, ttl_of, || Ok(Some("refetched".into())))
+            cached(&short, &R, ttl_of, || Ok(Some("refetched".into())))
                 .unwrap()
                 .as_deref(),
             Some("refetched"),
@@ -466,8 +576,18 @@ mod tests {
         // than touching the real `CACHE`.
         let cache: Slot<Option<String>> = Mutex::new(None);
         let ttl = Duration::from_secs(60);
-        let r1 = cached(&cache, |_| ttl, || Ok(Some("first".into())));
-        let r2 = cached(&cache, |_| ttl, || Ok(Some("second".into())));
+        let r1 = cached(
+            &cache,
+            &R,
+            |_| Freshness::fixed(ttl),
+            || Ok(Some("first".into())),
+        );
+        let r2 = cached(
+            &cache,
+            &R,
+            |_| Freshness::fixed(ttl),
+            || Ok(Some("second".into())),
+        );
         assert_eq!(r1.unwrap().as_deref(), Some("first"));
         assert_eq!(r2.unwrap().as_deref(), Some("first")); // served from cache
 
@@ -475,8 +595,19 @@ mod tests {
         // with a zero TTL for the next call to refetch — passing a zero
         // `ttl_of` at read time no longer evicts a live entry, by design.
         let expired: Slot<Option<String>> = Mutex::new(None);
-        cached(&expired, |_| Duration::ZERO, || Ok(Some("third".into()))).unwrap();
-        let r3 = cached(&expired, |_| Duration::ZERO, || Ok(Some("fourth".into())));
+        cached(
+            &expired,
+            &R,
+            |_| Freshness::fixed(Duration::ZERO),
+            || Ok(Some("third".into())),
+        )
+        .unwrap();
+        let r3 = cached(
+            &expired,
+            &R,
+            |_| Freshness::fixed(Duration::ZERO),
+            || Ok(Some("fourth".into())),
+        );
         assert_eq!(r3.unwrap().as_deref(), Some("fourth")); // expired → refetched
     }
 
@@ -488,12 +619,150 @@ mod tests {
         let ttl = Duration::from_secs(60);
         let r1 = cached(
             &cache,
-            |_| ttl,
+            &R,
+            |_| Freshness::fixed(ttl),
             || Err(KeychainError::Backend("denied".into())),
         );
-        let r2 = cached(&cache, |_| ttl, || Ok(Some("never-fetched".into())));
+        let r2 = cached(
+            &cache,
+            &R,
+            |_| Freshness::fixed(ttl),
+            || Ok(Some("never-fetched".into())),
+        );
         assert!(matches!(r1, Err(KeychainError::Backend(_))));
         assert!(matches!(r2, Err(KeychainError::Backend(_))));
+    }
+
+    /// THE regression test for this change.
+    ///
+    /// At a real rotation the keychain read took 72,980ms and requests queued
+    /// 64,103ms and 53,642ms behind it, because one lock was held across the
+    /// read. A caller arriving mid-refresh must now be served the value
+    /// already in hand — it is stale but not yet expired — instead of waiting.
+    ///
+    /// Deterministic by handshake, not by timing: the fetch signals that it
+    /// has started and then blocks until released, so the second call is
+    /// guaranteed to land while the refresh is genuinely in flight.
+    ///
+    /// The `panic!` in the second call's fetch is the single-flight half of
+    /// the assertion: serving stale must not also mean running a second read.
+    #[test]
+    fn a_stale_but_unexpired_value_is_served_while_someone_else_refreshes() {
+        let cache: Slot<Option<String>> = Mutex::new(None);
+        let refresh: Mutex<()> = Mutex::new(());
+        // Already stale, still valid for a minute — the rotation shape.
+        let window = Freshness {
+            refresh_after: Duration::ZERO,
+            usable_for: Duration::from_secs(60),
+        };
+        *cache.lock().unwrap() = Some((Instant::now(), window, Ok(Some("old".to_string()))));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let (c, r) = (&cache, &refresh);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = cached(
+                    c,
+                    r,
+                    |_| window,
+                    || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(Some("new".to_string()))
+                    },
+                );
+            });
+
+            started_rx.recv().unwrap(); // the refresh is now genuinely in flight
+
+            let t = Instant::now();
+            let got = cached(
+                c,
+                r,
+                |_| window,
+                || panic!("must not start a second keychain read while one is in flight"),
+            )
+            .unwrap();
+            let took = t.elapsed();
+
+            assert_eq!(
+                got.as_deref(),
+                Some("old"),
+                "must serve the stale-but-unexpired value"
+            );
+            assert!(
+                took < Duration::from_secs(1),
+                "must not block behind the in-flight refresh; took {took:?}"
+            );
+
+            release_tx.send(()).unwrap();
+        });
+    }
+
+    /// The other half of the policy: a caller with nothing valid to fall back
+    /// on waits, because a wrong answer is worse than a slow one. It must then
+    /// reuse what the refresher stored rather than run a redundant read.
+    #[test]
+    fn a_caller_with_nothing_usable_waits_instead_of_answering_wrongly() {
+        let cache: Slot<Option<String>> = Mutex::new(None); // nothing to serve
+        let refresh: Mutex<()> = Mutex::new(());
+        let window = Freshness::fixed(Duration::from_secs(60));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let (c, r) = (&cache, &refresh);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = cached(
+                    c,
+                    r,
+                    |_| window,
+                    || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(Some("fetched-once".to_string()))
+                    },
+                );
+            });
+            started_rx.recv().unwrap();
+
+            scope.spawn(move || {
+                let got = cached(
+                    c,
+                    r,
+                    |_| window,
+                    || panic!("must reuse the refresher's value, not read again"),
+                )
+                .unwrap();
+                assert_eq!(got.as_deref(), Some("fetched-once"));
+            });
+
+            // Nudges the waiter into the blocking path. Not load-bearing: if it
+            // loses the race the refresher has already stored, and the waiter's
+            // first snapshot check returns the same value — the assertion holds
+            // either way, so this cannot flake.
+            std::thread::sleep(Duration::from_millis(50));
+            release_tx.send(()).unwrap();
+        });
+    }
+
+    /// The grace window is exactly `EXPIRY_MARGIN`, and that identity is what
+    /// makes serving a stale credential sound rather than a shortcut: the
+    /// margin was always the amount by which the token outlives its own
+    /// refresh deadline. A measured refresh took 73s; the window is 300s.
+    #[test]
+    fn a_live_credential_gets_exactly_the_margin_as_its_grace_window() {
+        let now = 1_800_000_000_000;
+        let f = credential_freshness(&cred(Some(now + 60 * 60 * 1000)), now);
+        assert_eq!(f.refresh_after, Duration::from_secs(3600) - EXPIRY_MARGIN);
+        assert_eq!(f.usable_for, Duration::from_secs(3600));
+        assert_eq!(
+            f.usable_for - f.refresh_after,
+            EXPIRY_MARGIN,
+            "grace must be exactly the margin — more would serve an expired token"
+        );
     }
 
     /// I3: `OauthCredential` holds a live access token and its `Debug` is
