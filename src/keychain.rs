@@ -40,6 +40,11 @@ const MAX_CACHE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 /// Re-read this long before the stored expiry, so the gateway rotates onto a
 /// fresh token slightly early rather than serving a just-expired one.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+/// Warn when a request waited longer than this for the cache lock. Well above
+/// any healthy value — a cache hit takes microseconds — so this stays silent
+/// unless a request genuinely queued behind someone else's keychain read.
+const LOCK_WAIT_WARN: Duration = Duration::from_secs(1);
 /// A `cached` slot: when the value was stored, how long it stays good, and
 /// what was stored. The TTL rides along with the value because `cached`
 /// freezes it at fetch time (see there).
@@ -122,7 +127,38 @@ fn credential_ttl(res: &Result<Option<OauthCredential>, KeychainError>, now_ms: 
         .clamp(CACHE_TTL, MAX_CACHE_TTL)
 }
 
+/// Wraps the real read to time it. Only reached on a cache miss — this is
+/// `cached`'s `fetch` — so at the expiry-derived TTL it fires roughly three
+/// times a day, not per request.
+///
+/// This is the only operation in the gateway that can block *every* request at
+/// once: `cached` deliberately holds its lock across this call so concurrent
+/// requests trigger one keychain dialog instead of N. When the read is slow the
+/// whole proxy stalls behind it — and until this line existed that stall was
+/// invisible from the inside. A rotation-time hang was only ever observed
+/// externally, by a health poll timing out, with nothing in 52k lines of log to
+/// corroborate it.
+///
+/// Logs a *kind*, never the credential: `outcome` is a `&'static str`, so it is
+/// structurally incapable of carrying the token, and `KeychainError`'s message
+/// is a backend string that never contains one either.
 fn read_keychain_uncached() -> Result<Option<OauthCredential>, KeychainError> {
+    let started = Instant::now();
+    let res = read_keychain_now();
+    let outcome = match &res {
+        Ok(Some(_)) => "found",
+        Ok(None) => "no-entry",
+        Err(_) => "error",
+    };
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        outcome,
+        "uncached keychain read"
+    );
+    res
+}
+
+fn read_keychain_now() -> Result<Option<OauthCredential>, KeychainError> {
     let user = whoami::username();
     let entry = keyring::Entry::new(SERVICE, &user)
         .map_err(|e| KeychainError::Backend(format!("entry::new({SERVICE}, {user}): {e}")))?;
@@ -147,7 +183,21 @@ fn cached<T: Clone>(
     ttl_of: impl Fn(&Result<T, KeychainError>) -> Duration,
     fetch: impl FnOnce() -> Result<T, KeychainError>,
 ) -> Result<T, KeychainError> {
+    // Timed because the lock wait is what distinguishes "the keychain read was
+    // slow" from "the read was fine and something else stalled us". Only the
+    // former makes every queued request wait; measuring the fetch alone cannot
+    // tell the two apart. `Instant::now()` on a path this hot is ~20ns, and the
+    // log is threshold-gated so a healthy gateway stays silent.
+    let wait_started = Instant::now();
     let mut slot = cache.lock().unwrap();
+    let waited = wait_started.elapsed();
+    if waited > LOCK_WAIT_WARN {
+        tracing::warn!(
+            waited_ms = waited.as_millis() as u64,
+            "request blocked waiting for the credential cache — a slow keychain \
+             read stalls every request behind it"
+        );
+    }
     if let Some((at, ttl, res)) = slot.as_ref()
         && at.elapsed() < *ttl
     {

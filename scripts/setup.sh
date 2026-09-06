@@ -224,6 +224,15 @@ if [[ "$PLATFORM" == macos ]]; then
   # Print what the keychain grant is actually matched on, so a Team ID change
   # is visible here rather than surfacing later as unexplained prompts.
   codesign -dvvv "$BUILD_OUT" 2>&1 | grep -E '^(Identifier|TeamIdentifier)=' | sed 's/^/  /'
+  # ...and assert it, because printing is not checking. release.yml shipped the
+  # wrong identifier in v0.1.0 and v0.2.0 with `codesign -dv` output right there
+  # in the build log the whole time; nobody reads a line that is correct 99% of
+  # the time. The identifier is half of the designated requirement the keychain
+  # grant is matched on, so getting it wrong silently costs a password prompt.
+  codesign -dvvv "$BUILD_OUT" 2>&1 | grep -qx 'Identifier=com.mur-model-gateway' || {
+    err "signed with the wrong identifier — the keychain grant will not match"
+    exit 1
+  }
 fi
 
 # ─── install binary ────────────────────────────────────────────────
