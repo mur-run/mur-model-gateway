@@ -70,7 +70,6 @@ jobs:
             echo "::warning::MACOS_CERT_P12 not set — ad-hoc signing (users will get repeated keychain prompts)"
             codesign --force -i com.mur-model-gateway -s - $BIN
           fi
-          codesign -dv $BIN
           # The identifier is half of the designated requirement the keychain
           # grant is matched on; scripts/setup.sh signs with exactly this one.
           # Without an explicit -i, codesign derives it from the file name
@@ -79,8 +78,16 @@ jobs:
           # source-installed one holds, and prompt for the keychain password
           # on its own. v0.1.0 and v0.2.0 both shipped that way. Assert it
           # rather than trusting the flag stays present.
-          codesign -dvvv $BIN 2>&1 | grep -qx 'Identifier=com.mur-model-gateway' \
-            || { echo "::error::wrong signing identifier — keychain grants will not match"; exit 1; }
+          #
+          # Captured, not piped into `grep -q`: a short-circuiting reader makes
+          # codesign die of SIGPIPE (exit 141), which any pipefail shell reports
+          # as a failed check. This job's default shell has no pipefail today,
+          # so that would be a latent trap armed by adding `shell: bash`.
+          DESC=$(codesign -dvvv $BIN 2>&1 || true)
+          IDENT=$(printf '%s\n' "$DESC" | sed -n 's/^Identifier=//p')
+          printf '%s\n' "$DESC" | grep -E '^(Identifier|TeamIdentifier)=' || true
+          [ "$IDENT" = "com.mur-model-gateway" ] \
+            || { echo "::error::wrong signing identifier ($IDENT) — keychain grants will not match"; exit 1; }
 
       # Bare Mach-O binaries cannot be stapled; Gatekeeper fetches the ticket
       # online on first run, which is fine for a CLI distributed as a tarball.

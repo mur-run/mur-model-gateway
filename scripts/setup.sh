@@ -221,16 +221,24 @@ if [[ "$PLATFORM" == macos ]]; then
   fi
   log "codesigning with: $SIGN_ID"
   codesign -f -s "$SIGN_ID" -i com.mur-model-gateway "$BUILD_OUT"
-  # Print what the keychain grant is actually matched on, so a Team ID change
-  # is visible here rather than surfacing later as unexplained prompts.
-  codesign -dvvv "$BUILD_OUT" 2>&1 | grep -E '^(Identifier|TeamIdentifier)=' | sed 's/^/  /'
-  # ...and assert it, because printing is not checking. release.yml shipped the
-  # wrong identifier in v0.1.0 and v0.2.0 with `codesign -dv` output right there
-  # in the build log the whole time; nobody reads a line that is correct 99% of
-  # the time. The identifier is half of the designated requirement the keychain
-  # grant is matched on, so getting it wrong silently costs a password prompt.
-  codesign -dvvv "$BUILD_OUT" 2>&1 | grep -qx 'Identifier=com.mur-model-gateway' || {
-    err "signed with the wrong identifier — the keychain grant will not match"
+  # Captured once, then matched in-shell. Piping `codesign -dvvv` into a
+  # short-circuiting reader (`grep -q`, `head`) makes codesign die of SIGPIPE
+  # and exit 141, which `set -o pipefail` above then reports as a failed check
+  # — a false negative that blocks the install while printing the *correct*
+  # identifier one line above the error. That shipped here once already.
+  DESC=$(codesign -dvvv "$BUILD_OUT" 2>&1 || true)
+  IDENT=$(printf '%s\n' "$DESC" | sed -n 's/^Identifier=//p')
+  TEAM=$(printf '%s\n' "$DESC" | sed -n 's/^TeamIdentifier=//p')
+  log "  Identifier=$IDENT"
+  log "  TeamIdentifier=$TEAM"
+  # Assert, don't just print: the identifier is half of the designated
+  # requirement the keychain grant is matched on, and release.yml shipped the
+  # wrong one in v0.1.0 and v0.2.0 with `codesign -dv` output sitting in the
+  # build log the whole time. Nobody reads a line that is correct 99% of the
+  # time.
+  [ "$IDENT" = "com.mur-model-gateway" ] || {
+    err "signed with the wrong identifier: '$IDENT' (expected com.mur-model-gateway)"
+    err "the keychain grant is matched on it — a wrong one costs a password prompt"
     exit 1
   }
 fi
