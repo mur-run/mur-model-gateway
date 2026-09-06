@@ -330,6 +330,11 @@ fn read_keychain_now() -> Result<Option<OauthCredential>, KeychainError> {
 /// Pure, and deliberately not `#[cfg(macos)]`: the mapping is the part worth
 /// testing, and gating it would make it provable only on a macOS runner — the
 /// same reason `keychain_fallback` takes `is_macos` as a parameter.
+///
+/// Off macOS nothing in a non-test build calls it, which `clippy -D warnings`
+/// rejects as dead code. Allowed rather than gated, because gating it would
+/// give up exactly the cross-platform testability it exists for.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn interpret_security_result(
     code: Option<i32>,
     stdout: &[u8],
