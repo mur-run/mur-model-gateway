@@ -25,6 +25,18 @@ use std::time::{Duration, Instant};
 
 const SERVICE: &str = "Claude Code-credentials";
 
+/// Absolute path on purpose. A `security` earlier in PATH — a shell function,
+/// a shim, anything — must not be able to intercept a credential read. This
+/// session lost three diagnostic queries to a shell function shadowing `log`;
+/// the same shadowing on a credential path would be a vulnerability, not an
+/// inconvenience.
+#[cfg(target_os = "macos")]
+const SECURITY_BIN: &str = "/usr/bin/security";
+
+/// Cap on the `security` child. See `wait_with_deadline`.
+#[cfg(target_os = "macos")]
+const SECURITY_TIMEOUT: Duration = Duration::from_secs(20);
+
 // pub(crate): also memoises `codex::refreshed_access_token`'s refresh cache,
 // so the two don't drift onto different staleness windows.
 //
@@ -212,6 +224,95 @@ fn read_keychain_uncached() -> Result<Option<OauthCredential>, KeychainError> {
     res
 }
 
+/// macOS reads go through `/usr/bin/security` rather than the `keyring` crate.
+///
+/// Not a stylistic preference — it is the fix for the bug this module spent
+/// four rounds chasing. Claude Code rewrites the credential at every token
+/// rotation, and that rewrite resets the item's ACL **partition list** to
+/// `apple-tool:` alone, dropping `teamid:JQ2C2UA8JV`. securityd then refuses
+/// this gateway on partition grounds and puts a password dialog on screen:
+///
+/// ```text
+/// [integrity] ACL partition mismatch: client teamid:JQ2C2UA8JV ACL ("apple-tool:")
+/// [integrity] asking user about XARA partition for 'teamid:JQ2C2UA8JV'
+/// [kcacl]     displaying keychain prompt for .../mur-model-gateway(98558)
+/// ```
+///
+/// The 72,980ms and 178,087ms "slow keychain reads" measured earlier were that
+/// dialog waiting for a human to click it, not I/O. Note what the reset list
+/// still contains: `apple-tool:` survives. `/usr/bin/security` is Apple-signed,
+/// so it falls in exactly that partition, and it is already in the item's
+/// trusted-application list. A read through it is therefore never refused on
+/// partition grounds — no login password, no change to Claude Code, no dialog.
+///
+/// The trusted-app list was never the problem, which is why counting its
+/// entries kept suggesting no prompt had happened: a partition prompt does not
+/// add one.
+///
+/// The credential arrives on the child's stdout. It is never passed in argv,
+/// which `ps` exposes to every user on the machine.
+#[cfg(target_os = "macos")]
+fn read_keychain_now() -> Result<Option<OauthCredential>, KeychainError> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let user = whoami::username();
+    let mut child = Command::new(SECURITY_BIN)
+        .args(["find-generic-password", "-w", "-s", SERVICE, "-a", &user])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Swallowed on purpose: security(1) writes its "item could not be
+        // found" text here, and that is a normal Ok(None), not a fault worth
+        // surfacing. Real failures are carried by the exit status.
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| KeychainError::Backend(format!("spawn {SECURITY_BIN}: {e}")))?;
+
+    let code = wait_with_deadline(&mut child, SECURITY_TIMEOUT)?;
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout)
+            .map_err(|e| KeychainError::Backend(format!("read stdout: {e}")))?;
+    }
+    interpret_security_result(code, &stdout)
+}
+
+/// Wait for the child, killing it past `deadline`.
+///
+/// `security` answers in milliseconds. Anything approaching the deadline means
+/// a dialog is on screen, and blocking the single-flight refresher on it is
+/// precisely what turns one stalled request into every request stalling once
+/// the cached credential ages past `usable_for`. An error degrades the gateway
+/// to passthrough and is retried on the next `CACHE_TTL`; a hang does not
+/// recover at all.
+#[cfg(target_os = "macos")]
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    deadline: Duration,
+) -> Result<Option<i32>, KeychainError> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.code()),
+            Ok(None) => {}
+            Err(e) => return Err(KeychainError::Backend(format!("wait: {e}"))),
+        }
+        if started.elapsed() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(KeychainError::Backend(format!(
+                "{SECURITY_BIN} did not answer within {deadline:?}; a keychain \
+                 prompt is probably on screen"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Every platform without a `security(1)`: the `keyring` crate, unchanged.
+/// Linux (libsecret) and Windows (Credential Manager) have no partition list
+/// and so never had this failure.
+#[cfg(not(target_os = "macos"))]
 fn read_keychain_now() -> Result<Option<OauthCredential>, KeychainError> {
     let user = whoami::username();
     let entry = keyring::Entry::new(SERVICE, &user)
@@ -220,6 +321,35 @@ fn read_keychain_now() -> Result<Option<OauthCredential>, KeychainError> {
         Ok(raw) => parse_oauth_blob(&raw),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(KeychainError::Backend(format!("get_password: {e}"))),
+    }
+}
+
+/// Map `security find-generic-password -w`'s exit status and stdout onto this
+/// module's result shape.
+///
+/// Pure, and deliberately not `#[cfg(macos)]`: the mapping is the part worth
+/// testing, and gating it would make it provable only on a macOS runner — the
+/// same reason `keychain_fallback` takes `is_macos` as a parameter.
+fn interpret_security_result(
+    code: Option<i32>,
+    stdout: &[u8],
+) -> Result<Option<OauthCredential>, KeychainError> {
+    match code {
+        Some(0) => {
+            let raw = std::str::from_utf8(stdout)
+                .map_err(|e| KeychainError::Malformed(format!("stdout not UTF-8: {e}")))?;
+            parse_oauth_blob(raw)
+        }
+        // 44 is security(1)'s exit code for errSecItemNotFound: Claude Code has
+        // never logged in here. A missing entry is Ok(None) — the caller falls
+        // back to passthrough — not an error to retry.
+        Some(44) => Ok(None),
+        Some(c) => Err(KeychainError::Backend(format!(
+            "security find-generic-password exited {c}"
+        ))),
+        None => Err(KeychainError::Backend(
+            "security find-generic-password was killed by a signal".into(),
+        )),
     }
 }
 
@@ -763,6 +893,68 @@ mod tests {
             EXPIRY_MARGIN,
             "grace must be exactly the margin — more would serve an expired token"
         );
+    }
+
+    /// The exit-status mapping for the `security(1)` read path. Pure, so it is
+    /// provable on any host — the surrounding process spawn is macOS-only and
+    /// cannot be exercised on a Linux CI runner.
+    #[test]
+    fn security_result_maps_success_to_the_parsed_credential() {
+        let blob =
+            br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","expiresAt":1787497765291}}"#;
+        let c = interpret_security_result(Some(0), blob).unwrap().unwrap();
+        assert_eq!(c.access_token, "sk-ant-oat01-test");
+        assert_eq!(c.expires_at_ms, Some(1_787_497_765_291));
+    }
+
+    /// security(1) appends a newline to `-w` output; `parse_oauth_blob` trims,
+    /// and this pins that so a future change there cannot silently break the
+    /// only path production actually uses on macOS.
+    #[test]
+    fn security_result_tolerates_the_trailing_newline() {
+        let blob = b"{\"claudeAiOauth\":{\"accessToken\":\"sk-ant-oat01-test\"}}\n";
+        assert_eq!(
+            interpret_security_result(Some(0), blob)
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "sk-ant-oat01-test"
+        );
+    }
+
+    /// 44 is errSecItemNotFound. Claude Code never logged in on this machine —
+    /// a supported state that must degrade to passthrough, NOT an error that
+    /// gets retried and logged every minute.
+    #[test]
+    fn security_result_maps_44_to_no_entry() {
+        assert!(matches!(interpret_security_result(Some(44), b""), Ok(None)));
+    }
+
+    #[test]
+    fn security_result_maps_other_failures_to_backend_errors() {
+        assert!(matches!(
+            interpret_security_result(Some(1), b""),
+            Err(KeychainError::Backend(_))
+        ));
+        // None = killed by a signal, which is what the deadline does when a
+        // keychain prompt is sitting on screen. Must be an error, never Ok(None):
+        // reporting "no credential" there would silently drop the disguise.
+        assert!(matches!(
+            interpret_security_result(None, b""),
+            Err(KeychainError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn security_result_rejects_garbage_and_non_utf8() {
+        assert!(matches!(
+            interpret_security_result(Some(0), b"not json"),
+            Err(KeychainError::Malformed(_))
+        ));
+        assert!(matches!(
+            interpret_security_result(Some(0), &[0xff, 0xfe]),
+            Err(KeychainError::Malformed(_))
+        ));
     }
 
     /// I3: `OauthCredential` holds a live access token and its `Debug` is
