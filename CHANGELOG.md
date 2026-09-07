@@ -12,8 +12,24 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+_Nothing yet._
+
+## v0.4.0 — 2026-09-07
+
 **Upgrade: yes, on macOS — this contains the fix for the repeated keychain
 password prompts, and `v0.3.0` does not.**
+
+- **Resolve `claude` outside `PATH` (#25).** launchd hands a service
+  `/usr/bin:/bin:/usr/sbin:/sbin`, which holds no user-installed binary, so
+  `claude` in `~/.local/bin` was invisible. Two features had therefore never
+  run on a service install: delegated refresh, and `cc_version` detection —
+  which meant every disguised request carried the hardcoded fallback version
+  rather than the installed one. `which_claude` now searches `PATH` first, then
+  the locations the CLI installs to.
+- **Drop the cached credential when upstream rejects it (#26).** A token
+  revoked while its stored expiry was still in the future never left the cache,
+  so `claude auth login` changed nothing until the service was restarted by
+  hand. Rate-limited to once a minute.
 
 - **Read the keychain through `/usr/bin/security` (#23).** Claude Code resets
   the credential item's ACL partition list to `apple-tool:` on every token
