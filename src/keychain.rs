@@ -433,6 +433,50 @@ fn cached<T: Clone>(
     res
 }
 
+/// At most one 401-triggered invalidation per window. A genuinely revoked
+/// credential that nobody re-logs in would otherwise cost one keychain read
+/// per rejected request, and a client retry loop makes that a burst.
+const REJECTION_COOLDOWN: Duration = Duration::from_secs(60);
+
+static LAST_REJECTION: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Drop the memoised credential after **upstream** rejected it, rate-limited.
+///
+/// [`invalidate_cache`] is unconditional and belongs to the delegated-refresh
+/// path, which only runs once `anthropic_retry_eligible` agrees the credential
+/// has aged out. This exists for the case that check deliberately excludes: a
+/// token upstream rejects while its stored `expiresAt` is still in the future
+/// — revoked, or replaced by a `claude auth login` in another terminal.
+///
+/// Excluding it from *refresh* is right (no refresh repairs a revoked token),
+/// but it also left the cache untouched, so the gateway kept serving the dead
+/// credential until its TTL elapsed — and that TTL was computed from the dead
+/// token's own expiry, so it could be hours. Observed in production: a
+/// successful re-login on a second machine changed nothing until the service
+/// was restarted by hand, with nothing in the log to explain why.
+///
+/// Returns whether it actually invalidated, so the caller can say so.
+pub fn invalidate_after_rejection() -> bool {
+    if !claim_rejection_slot(&LAST_REJECTION, REJECTION_COOLDOWN) {
+        return false;
+    }
+    invalidate_cache();
+    true
+}
+
+/// The rate-limit gate, with its state passed in so it is testable without a
+/// process-global and without waiting out a real cooldown.
+fn claim_rejection_slot(last: &Mutex<Option<Instant>>, cooldown: Duration) -> bool {
+    let mut slot = last.lock().unwrap();
+    if let Some(at) = *slot
+        && at.elapsed() < cooldown
+    {
+        return false;
+    }
+    *slot = Some(Instant::now());
+    true
+}
+
 /// Drop the memoised read so the next call hits the store. Used after an
 /// external process is believed to have rewritten the credential — a cached
 /// read would otherwise return the token we already know is dead for up to
@@ -960,6 +1004,26 @@ mod tests {
             interpret_security_result(Some(0), &[0xff, 0xfe]),
             Err(KeychainError::Malformed(_))
         ));
+    }
+
+    /// A revoked-but-unexpired credential is invisible to the refresh path, so
+    /// the cache used to hold it until a TTL derived from the dead token's own
+    /// expiry — hours. This gate is what lets a 401 drop it, while stopping a
+    /// client retry loop from turning every rejection into a keychain read.
+    #[test]
+    fn rejection_slot_is_claimed_once_per_cooldown() {
+        let last: Mutex<Option<Instant>> = Mutex::new(None);
+        let cooldown = Duration::from_secs(60);
+        assert!(
+            claim_rejection_slot(&last, cooldown),
+            "the first rejection must invalidate"
+        );
+        assert!(
+            !claim_rejection_slot(&last, cooldown),
+            "a retry burst must not invalidate again"
+        );
+        // A zero cooldown is the "window elapsed" case without waiting one out.
+        assert!(claim_rejection_slot(&last, Duration::ZERO));
     }
 
     /// I3: `OauthCredential` holds a live access token and its `Debug` is

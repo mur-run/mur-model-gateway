@@ -959,6 +959,26 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         && claude_owned
         && upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
     {
+        // Drop the memoised credential *before* reading the expiry below, so
+        // both that read and any retry see whatever is in the store now.
+        //
+        // The eligibility check further down only fires for a credential that
+        // has aged out, which is correct for deciding whether a *refresh*
+        // could help — nothing repairs a revoked token. But it also meant a
+        // token upstream rejects while its stored expiry is still in the
+        // future never left the cache, and that cache entry's TTL was derived
+        // from the dead token's own expiry, so the gateway kept presenting it
+        // for hours. A `claude auth login` in another terminal changed nothing
+        // until the service was restarted by hand.
+        //
+        // Rate-limited inside, so a client retry loop against a credential
+        // nobody re-logs in does not buy a keychain read per attempt.
+        if keychain::invalidate_after_rejection() {
+            tracing::warn!(
+                "upstream rejected the credential this gateway attached; \
+                 dropped the cached copy so the next request re-reads it"
+            );
+        }
         Some(anthropic_credential_expiry(anthropic_source))
     } else {
         None
