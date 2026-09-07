@@ -76,6 +76,10 @@ Logs are designed not to contain tokens — every type holding a credential has 
 
 Re-run the install command. It fetches the latest release and restarts the service.
 
+[CHANGELOG.md](../CHANGELOG.md) says what each release changed and, on an
+**Upgrade** line, who actually needs it — not every release is worth
+interrupting a working install for.
+
 ## Uninstall
 
 ```bash
