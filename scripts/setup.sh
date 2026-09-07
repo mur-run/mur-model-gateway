@@ -179,48 +179,51 @@ else
 fi
 
 # ─── codesign (macOS) ───────────────────────────────────────────────
-# Re-sign with a real identity + stable identifier so the keychain
-# "Always Allow" grant survives rebuilds. The default linker ad-hoc
-# signature changes on every build, which re-triggers the password
-# prompt for the Claude Code-credentials item on each request.
+# Sign with a stable identity and the `com.mur-model-gateway` identifier.
+#
+# This block used to be load-bearing for credential access: the keychain's
+# grant on Claude Code-credentials is scoped to the signing team, so signing
+# with the wrong one brought the password prompt back on every token rotation.
+# That is no longer true. Since the gateway reads through /usr/bin/security
+# (see src/keychain.rs), securityd sees an Apple-signed client and this
+# binary's own signature does not participate in the read at all — verified
+# with an ad-hoc-signed build that read the credential in 30ms.
+#
+# So signing is now about distribution — Gatekeeper and notarization, which
+# matter in release.yml — not about whether the gateway works. A locally built
+# binary carries no quarantine attribute, so an unsigned one runs fine here.
+# Hence: prefer the best identity available, report what was used, and do not
+# block an install over it.
 if [[ "$PLATFORM" == macos ]]; then
-  # Prefer a "Developer ID Application" identity — the distribution cert.
-  #
-  # This used to take whatever `security find-identity` printed first, which is
-  # keychain order, not a choice. On a machine that also holds an
-  # "Apple Development" cert that is what it picked, and an Apple Development
-  # cert carries a DIFFERENT Team ID. The keychain's Always Allow grant is
-  # scoped to the team, so the gateway looked like another vendor's program on
-  # every request and the password prompt came back — the exact thing the block
-  # below was written to stop.
+  # Prefer "Developer ID Application" — the distribution cert — and never take
+  # whatever `find-identity` prints first, which is keychain order rather than
+  # a choice. That accident is how a shipped binary once ended up signed with
+  # an Apple Development cert.
   SIGN_ID="${MUR_MODEL_GATEWAY_SIGN_IDENTITY:-}"
   if [[ -z "$SIGN_ID" ]]; then
     SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
       | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
   fi
-  # Fail closed. This used to auto-fall-back to whatever cert came first and
-  # merely log a warning — but the warning scrolls past in a build log, and
-  # the damage only shows up hours later as a password prompt nobody can
-  # connect back to this build. Silently signing with the wrong team is
-  # exactly the bug the block above documents; a warning was not enough to
-  # stop it happening once already.
   if [[ -z "$SIGN_ID" ]]; then
-    err "no \"Developer ID Application\" codesigning identity found."
-    err ""
-    err "Refusing to fall back to another certificate: an Apple Development cert"
-    err "carries a different Team ID, and the keychain grant on the"
-    err "Claude Code-credentials item is scoped to the team. Signing with one"
-    err "makes the gateway look like a different vendor's program and brings the"
-    err "password prompt back on every token rotation."
-    err ""
-    err "Pick one:"
-    err "  - install or renew the Developer ID Application certificate"
-    err "  - MUR_MODEL_GATEWAY_SIGN_IDENTITY='Apple Development: ...' $0   # deliberate, accepts the prompts"
-    err "  - MUR_MODEL_GATEWAY_SIGN_IDENTITY='-' $0                        # ad-hoc, prompts on every rebuild"
-    exit 1
+    # Any valid identity is fine for a local install; prefer a real one over
+    # ad-hoc only because it stays stable across rebuilds.
+    SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+      | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    if [[ -n "$SIGN_ID" ]]; then
+      log "no Developer ID Application cert; using: $SIGN_ID"
+      log "  fine for a local install — the keychain read goes through"
+      log "  /usr/bin/security and does not depend on this signature."
+      log "  Set MUR_MODEL_GATEWAY_SIGN_IDENTITY to choose a different one."
+    fi
   fi
+  if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID="-"
+    log "no codesigning identity at all; signing ad-hoc"
+  fi
+
   log "codesigning with: $SIGN_ID"
   codesign -f -s "$SIGN_ID" -i com.mur-model-gateway "$BUILD_OUT"
+
   # Captured once, then matched in-shell. Piping `codesign -dvvv` into a
   # short-circuiting reader (`grep -q`, `head`) makes codesign die of SIGPIPE
   # and exit 141, which `set -o pipefail` above then reports as a failed check
@@ -230,15 +233,14 @@ if [[ "$PLATFORM" == macos ]]; then
   IDENT=$(printf '%s\n' "$DESC" | sed -n 's/^Identifier=//p')
   TEAM=$(printf '%s\n' "$DESC" | sed -n 's/^TeamIdentifier=//p')
   log "  Identifier=$IDENT"
-  log "  TeamIdentifier=$TEAM"
-  # Assert, don't just print: the identifier is half of the designated
-  # requirement the keychain grant is matched on, and release.yml shipped the
-  # wrong one in v0.1.0 and v0.2.0 with `codesign -dv` output sitting in the
-  # build log the whole time. Nobody reads a line that is correct 99% of the
-  # time.
+  log "  TeamIdentifier=${TEAM:-<none, ad-hoc>}"
+  # Still asserted, because `codesign` derives the identifier from the file
+  # name when `-i` is missing and release.yml shipped exactly that in v0.1.0
+  # and v0.2.0 with the evidence sitting in the build log the whole time.
+  # A wrong identifier no longer costs a password prompt, but it does mean the
+  # binary is not the artifact this project claims to produce.
   [ "$IDENT" = "com.mur-model-gateway" ] || {
     err "signed with the wrong identifier: '$IDENT' (expected com.mur-model-gateway)"
-    err "the keychain grant is matched on it — a wrong one costs a password prompt"
     exit 1
   }
 fi
