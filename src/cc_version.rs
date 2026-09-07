@@ -81,7 +81,13 @@ impl VersionCache {
 /// Spawn `claude --version` and parse the leading semver-ish token.
 /// Format observed: `2.1.126 (Claude Code)\n`.
 pub fn detect_cc_version() -> Option<String> {
-    let output = std::process::Command::new("claude")
+    // Resolved, not a bare name. `Command::new("claude")` resolves through the
+    // *process's* PATH, and under launchd that is `/usr/bin:/bin:/usr/sbin:
+    // /sbin` — no user-installed binary is on it, so detection failed on every
+    // service install and this module quietly served FALLBACK_VERSION instead.
+    // `which_claude` searches PATH and then the real install locations.
+    let bin = crate::which_claude()?;
+    let output = std::process::Command::new(bin)
         .arg("--version")
         .output()
         .ok()?;
