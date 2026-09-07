@@ -65,7 +65,8 @@ service instead.
 
 Restoring a compressed `tool_result` needs the mur MCP server attached to your
 client — that is what provides `mur_retrieve`. See
-[docs/install.md](docs/install.md) for per-platform details,
+[CHANGELOG.md](CHANGELOG.md) for what each release changed and whether you need
+it, [docs/install.md](docs/install.md) for per-platform details,
 [docs/compress-setup.md](docs/compress-setup.md) for compression, and
 [docs/staff-testing.md](docs/staff-testing.md) for the walkthrough written for
 people who just want to run it.

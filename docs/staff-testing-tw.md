@@ -76,6 +76,9 @@ tail -50 ~/Library/Logs/mur-model-gateway/proxy.log
 
 重跑安裝指令即可,它會抓最新版並重啟服務。
 
+哪些版本值得升級,見 [CHANGELOG.md](../CHANGELOG.md) —— 每個版本的 **Upgrade**
+那行會直接說「誰需要這一版」。不是每次發佈都值得打斷正在運作的安裝。
+
 ## 移除
 
 ```bash
