@@ -450,8 +450,51 @@ impl AppState {
 /// or permission-stripped `claude` left on PATH would otherwise arm the
 /// probe with a binary that can never run, turning every Anthropic 401 into
 /// one guaranteed-failing spawn before the real error body.
-fn which_claude() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
+pub(crate) fn which_claude() -> Option<std::path::PathBuf> {
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    which_claude_in(
+        std::env::var_os("PATH"),
+        &claude_fallback_dirs(home.as_deref()),
+    )
+}
+
+/// Where to look after PATH: the user-level locations the Claude Code CLI
+/// actually installs to.
+///
+/// A launchd LaunchAgent does not inherit the login shell's PATH — it is
+/// handed `/usr/bin:/bin:/usr/sbin:/sbin`, which contains no user-installed
+/// binary, so `claude` in `~/.local/bin` is invisible to a PATH-only lookup.
+/// A systemd user unit has the same shape. Both consumers of this — the
+/// delegated-refresh probe and `cc_version` detection — degraded silently in
+/// production for exactly that reason, and `with_default_auth_probe`'s warning
+/// has been describing the cause in the past tense while it was still
+/// happening on this very machine.
+///
+/// Takes `home` as a parameter rather than reading it internally, the same
+/// reason `claude_names` takes `pathext`: it is what makes the list assertable
+/// without depending on whoever runs the tests.
+fn claude_fallback_dirs(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(h) = home {
+        dirs.push(h.join(".local/bin"));
+        // Claude Code's own local-install location (`claude migrate-installer`).
+        dirs.push(h.join(".claude/local"));
+    }
+    dirs.push(std::path::PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(std::path::PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+/// PATH first, then `fallbacks`. Split out so both halves are testable without
+/// touching the machine's real PATH or home directory.
+///
+/// PATH keeps priority: an operator who put a specific `claude` on the
+/// service's PATH means that one, and a fallback silently overriding it would
+/// be worse than the bug this fixes.
+fn which_claude_in(
+    path: Option<std::ffi::OsString>,
+    fallbacks: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
     // Windows resolves a bare command name through PATHEXT; unix does not.
     let pathext = if cfg!(windows) {
         Some(std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string()))
@@ -459,7 +502,13 @@ fn which_claude() -> Option<std::path::PathBuf> {
         None
     };
     let names = claude_names(pathext.as_deref());
-    std::env::split_paths(&path)
+    let path_dirs: Vec<std::path::PathBuf> = match &path {
+        Some(p) => std::env::split_paths(p).collect(),
+        None => Vec::new(),
+    };
+    path_dirs
+        .into_iter()
+        .chain(fallbacks.iter().cloned())
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|c| is_executable_file(c))
 }
@@ -1935,6 +1984,86 @@ mod tests {
                  not treated as though PATH had no claude at all"
             );
         });
+    }
+
+    /// The production bug: launchd hands a service
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`, so a `claude` in `~/.local/bin` is
+    /// invisible to a PATH-only lookup. Delegated refresh and cc_version
+    /// detection were both inert on every service install because of it.
+    #[cfg(unix)]
+    #[test]
+    fn which_claude_finds_a_binary_that_is_not_on_path_at_all() {
+        use std::os::unix::fs::PermissionsExt;
+        let fallback = tempfile::tempdir().unwrap();
+        let bin = fallback.path().join("claude");
+        std::fs::write(&bin, "").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A PATH with no claude on it — the launchd shape.
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([empty.path()]).unwrap();
+
+        assert_eq!(
+            which_claude_in(Some(path), &[fallback.path().to_path_buf()]),
+            Some(bin),
+            "a claude outside PATH must still be found — this is the whole bug"
+        );
+    }
+
+    /// PATH keeps priority. An operator who put a specific `claude` on the
+    /// service's PATH means that one; a fallback silently overriding it would
+    /// be a worse bug than the one being fixed.
+    #[cfg(unix)]
+    #[test]
+    fn which_claude_prefers_path_over_the_fallback_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let on_path = tempfile::tempdir().unwrap();
+        let wanted = on_path.path().join("claude");
+        std::fs::write(&wanted, "").unwrap();
+        std::fs::set_permissions(&wanted, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fallback = tempfile::tempdir().unwrap();
+        let other = fallback.path().join("claude");
+        std::fs::write(&other, "").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = std::env::join_paths([on_path.path()]).unwrap();
+        assert_eq!(
+            which_claude_in(Some(path), &[fallback.path().to_path_buf()]),
+            Some(wanted)
+        );
+    }
+
+    /// An unset PATH must not abort the search. The old code started with
+    /// `std::env::var_os("PATH")?`, so a service with no PATH at all found
+    /// nothing even when claude sat in a standard location.
+    #[cfg(unix)]
+    #[test]
+    fn which_claude_still_searches_fallbacks_when_path_is_unset() {
+        use std::os::unix::fs::PermissionsExt;
+        let fallback = tempfile::tempdir().unwrap();
+        let bin = fallback.path().join("claude");
+        std::fs::write(&bin, "").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            which_claude_in(None, &[fallback.path().to_path_buf()]),
+            Some(bin)
+        );
+    }
+
+    #[test]
+    fn claude_fallback_dirs_covers_the_real_install_locations() {
+        let home = std::path::Path::new("/home/u");
+        let dirs = claude_fallback_dirs(Some(home));
+        assert!(dirs.contains(&home.join(".local/bin")), "{dirs:?}");
+        assert!(dirs.contains(&home.join(".claude/local")), "{dirs:?}");
+        assert!(
+            dirs.contains(&std::path::PathBuf::from("/opt/homebrew/bin")),
+            "{dirs:?}"
+        );
+        // Must not panic or produce home-relative junk when there is no home.
+        assert!(!claude_fallback_dirs(None).is_empty());
     }
 
     /// The Windows lookup used to be impossible to satisfy: `which_claude`
