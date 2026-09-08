@@ -983,14 +983,36 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     } else {
         None
     };
-    if let Some(expiry) = anthropic_expiry
-        && anthropic_retry_eligible(
+    // Computed once so the *declined* case can be logged. It was the silent
+    // path: a 401 on a credential this gateway attached, judged not worth a
+    // refresh because its stored expiry is still in the future, produces no
+    // record at all — and that is exactly what happened during a six-minute
+    // outage whose logs showed the credential being re-read after every
+    // rejection and nothing about why no refresh was attempted.
+    //
+    // Worth logging the expiry gap, because that is where the judgement came
+    // from: on the observed incident upstream stopped accepting the token
+    // more than an hour before the `expiresAt` this check trusted.
+    let retry_eligible = anthropic_expiry.is_some_and(|expiry| {
+        anthropic_retry_eligible(
             provider,
             upstream_resp.status(),
             anthropic_source,
             expiry,
             now_ms,
         )
+    });
+    if let Some(expiry) = anthropic_expiry
+        && !retry_eligible
+    {
+        tracing::warn!(
+            expires_in_ms = expiry.map(|e| e - now_ms),
+            "upstream rejected a credential that has not aged out; treating it \
+             as revoked and not asking the owner CLI to refresh"
+        );
+    }
+    if let Some(expiry) = anthropic_expiry
+        && retry_eligible
         && auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, expiry).await
             == auth_probe::ProbeOutcome::Refreshed
         && let Ok(Some(fresh)) = anthropic_source.resolve()
