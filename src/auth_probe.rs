@@ -122,6 +122,34 @@ pub(crate) async fn refresh_via_owner_with(
     before_ms: Option<i64>,
     read_after: impl Fn() -> Option<i64>,
 ) -> ProbeOutcome {
+    let started = Instant::now();
+    let outcome = refresh_via_owner_body(probe, before_ms, read_after).await;
+    // The whole point of this mechanism is to shorten an outage the user is
+    // sitting through, and until now it reported nothing at all on success —
+    // only two warnings, for a probe that could not start or timed out.
+    //
+    // That gap cost a real diagnosis. During a 6-minute window of upstream
+    // 401s the logs showed the credential being re-read after every rejection
+    // and could not answer the one question that mattered: did the probe run
+    // and fail to help, or never run? `NoChange` and `Refreshed` look
+    // identical from outside, and the child's output goes to /dev/null.
+    //
+    // `armed` separates the two ways to get `Skipped`: no `claude` binary
+    // (armed = false) versus inside the cooldown (armed = true, elapsed ~0).
+    tracing::info!(
+        outcome = ?outcome,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        armed = matches!(probe, AuthProbe::Command(_)),
+        "delegated refresh probe"
+    );
+    outcome
+}
+
+async fn refresh_via_owner_body(
+    probe: &AuthProbe,
+    before_ms: Option<i64>,
+    read_after: impl Fn() -> Option<i64>,
+) -> ProbeOutcome {
     let AuthProbe::Command(bin) = probe else {
         return ProbeOutcome::Skipped;
     };
