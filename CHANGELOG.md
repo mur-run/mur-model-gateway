@@ -12,7 +12,32 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
-_Nothing yet._
+### Changed
+
+- An Anthropic 401 on a credential the gateway attached is now retried when —
+  and only when — the credential store has since come to hold a *different*
+  token. Previously the retry was gated on a delegated-refresh probe that
+  spawned `claude auth status` and compared `expiresAt` before and after.
+  `claude auth status` does not rewrite the credential (verified against the
+  keychain item's modification date) and `claude auth` has no refresh
+  subcommand, so the probe could only ever report no change, arm a 15-minute
+  cooldown, and suppress the retry. Comparing the token directly also fixes
+  the opposite gap: a credential the user had just re-authenticated was
+  previously read as "revoked, not aged out" and never retried.
+- The 401 body says what the request actually did. It used to claim "an
+  automatic refresh did not resolve it" in every case, including the ones
+  where nothing was attempted.
+
+### Removed
+
+- `MUR_MODEL_GATEWAY_NO_AUTH_PROBE`, and the probe it opted out of. Nothing is
+  spawned on a 401 any more, so there is nothing to disable. Setting the
+  variable is now inert rather than an error.
+
+**Upgrade:** worth it if you have ever seen `auth refused (401)` from a client
+and re-authenticated a credential that turned out to be fine. Otherwise
+routine — the retry that actually worked is unchanged in effect, only in what
+gates it.
 
 ## v0.4.0 — 2026-09-07
 
