@@ -185,7 +185,7 @@ pub fn install(opts: InstallOpts) -> Result<()> {
                 .and_then(|spec| spec.strip_prefix("env:"))
             {
                 println!(
-                    "token: append `{var}=<your sk-ant-oat01-… token>` to {} yourself \
+                    "token: append `{var}=<your sk-ant-oat… token>` to {} yourself \
                      (never echo it through a shared shell history)",
                     env_file.display()
                 );
