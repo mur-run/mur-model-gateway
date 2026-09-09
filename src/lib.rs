@@ -11,7 +11,6 @@
 //! `MUR_MODEL_GATEWAY_COMPRESS=1`) applies to tool_result blocks for the other three
 //! providers.
 
-pub mod auth_probe;
 pub mod cc_version;
 pub mod codex;
 pub mod compress;
@@ -172,9 +171,9 @@ impl std::fmt::Debug for TokenSource {
 impl TokenSource {
     /// Resolve this source's underlying OAuth credential — access token plus
     /// its expiry, when the source can supply one. The single shared
-    /// fallback path: `resolve()` below, `anthropic_credential_expiry`, and
-    /// `auth_probe::refresh_via_owner` all go through this rather than each
-    /// re-deriving the Keychain→credentials-file fallback in its own way.
+    /// fallback path: `resolve()` below and `anthropic_credential_expiry`
+    /// both go through this rather than each re-deriving the
+    /// Keychain→credentials-file fallback in its own way.
     ///
     /// Fix round 1, CRITICAL 1: before this method existed, that fallback
     /// was implemented once here (inline in `resolve()`) and independently
@@ -257,33 +256,6 @@ fn keychain_fallback(
     }
 }
 
-/// Opt-out for the delegated-refresh probe. Set to `1` to stop the gateway
-/// from arming the probe at startup, so an Anthropic 401 never spawns
-/// `claude auth status` and is never retried.
-///
-/// This does NOT change what the client receives on that 401: the
-/// actionable error body (naming the credential store and how to fix it) is
-/// swapped in either way, because that swap depends only on the request
-/// being Anthropic + 401 + claude-owned — never on `auth_probe`. With the
-/// kill switch set, the client still gets the actionable body, just without
-/// a retry ever having been attempted first.
-pub const PROBE_KILL_SWITCH_ENV: &str = "MUR_MODEL_GATEWAY_NO_AUTH_PROBE";
-
-/// How the gateway asks the credential's owner to refresh it.
-///
-/// `Disabled` by default in every constructor — same discipline as
-/// `AppState::token_source_codex`. Enabling spawns a real binary that can
-/// rewrite the user's Claude Code credential, so a test-side `AppState` must
-/// be structurally unable to reach it rather than merely unlikely to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthProbe {
-    Disabled,
-    /// Absolute path to the `claude` binary, resolved once at startup. Stored
-    /// resolved (not looked up per call) so a later PATH change cannot swap
-    /// which binary a long-running gateway executes.
-    Command(std::path::PathBuf),
-}
-
 #[derive(Clone)]
 pub struct AppState {
     pub upstream_anthropic: String,
@@ -313,9 +285,6 @@ pub struct AppState {
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
     /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
-    /// See [`AuthProbe`]. `Disabled` by default in every constructor; only
-    /// `with_default_auth_probe` (called from `main.rs`) can arm it.
-    pub auth_probe: AuthProbe,
 }
 
 impl AppState {
@@ -357,9 +326,6 @@ impl AppState {
             token_source_codex: TokenSource::Disabled,
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
-            // Structurally safe by default — see the AuthProbe doc and
-            // with_default_auth_probe (the only enabling path, main.rs-only).
-            auth_probe: AuthProbe::Disabled,
         })
     }
 
@@ -375,32 +341,6 @@ impl AppState {
             Some(p) => TokenSource::Codex(p),
             None => TokenSource::Disabled,
         };
-        self
-    }
-
-    /// Point the auth probe at the `claude` binary on PATH. Call from
-    /// `main.rs` only — see the `AuthProbe` doc. A no-op when the kill switch
-    /// is set or `claude` is not installed (a transplanted credential is a
-    /// supported setup: a working token with no owner CLI).
-    pub fn with_default_auth_probe(mut self) -> Self {
-        if std::env::var(PROBE_KILL_SWITCH_ENV).is_ok_and(|v| v == "1") {
-            return self;
-        }
-        match which_claude() {
-            Some(p) => self.auth_probe = AuthProbe::Command(p),
-            // Say so. A probe that cannot be armed makes the whole delegated
-            // refresh inert — every expired-token 401 goes back to the caller
-            // exactly as it did before this feature existed — and the only
-            // other clue is `cc_version`'s unrelated warning about the same
-            // missing binary. Observed in production: a launchd service whose
-            // PATH was `/usr/bin:/bin:/usr/sbin:/sbin` could not see `claude`
-            // in `~/.local/bin`, so the feature shipped and did nothing.
-            None => tracing::warn!(
-                path = %std::env::var("PATH").unwrap_or_default(),
-                "`claude` not found on PATH — delegated refresh is disabled; \
-                 an expired Anthropic token will return its 401 unchanged"
-            ),
-        }
         self
     }
 
@@ -464,11 +404,9 @@ pub(crate) fn which_claude() -> Option<std::path::PathBuf> {
 /// A launchd LaunchAgent does not inherit the login shell's PATH — it is
 /// handed `/usr/bin:/bin:/usr/sbin:/sbin`, which contains no user-installed
 /// binary, so `claude` in `~/.local/bin` is invisible to a PATH-only lookup.
-/// A systemd user unit has the same shape. Both consumers of this — the
-/// delegated-refresh probe and `cc_version` detection — degraded silently in
-/// production for exactly that reason, and `with_default_auth_probe`'s warning
-/// has been describing the cause in the past tense while it was still
-/// happening on this very machine.
+/// A systemd user unit has the same shape. `cc_version` detection degraded
+/// silently in production for exactly that reason: the disguise shipped with
+/// a fallback version string and nothing said why.
 ///
 /// Takes `home` as a parameter rather than reading it internally, the same
 /// reason `claude_names` takes `pathext`: it is what makes the list assertable
@@ -983,40 +921,36 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     } else {
         None
     };
-    // Computed once so the *declined* case can be logged. It was the silent
-    // path: a 401 on a credential this gateway attached, judged not worth a
-    // refresh because its stored expiry is still in the future, produces no
-    // record at all — and that is exactly what happened during a six-minute
-    // outage whose logs showed the credential being re-read after every
-    // rejection and nothing about why no refresh was attempted.
+    // What the store holds *now*, after the invalidation above. A 401 on a
+    // credential this gateway attached is worth one retry exactly when the
+    // store no longer holds the credential that was just rejected: an
+    // ordinary `claude` session refreshing it in another terminal is what
+    // produces that, and in practice it is the only thing that ever
+    // repaired one of these outages.
     //
-    // Worth logging the expiry gap, because that is where the judgement came
-    // from: on the observed incident upstream stopped accepting the token
-    // more than an hour before the `expiresAt` this check trusted.
-    let retry_eligible = anthropic_expiry.is_some_and(|expiry| {
-        anthropic_retry_eligible(
-            provider,
-            upstream_resp.status(),
-            anthropic_source,
-            expiry,
-            now_ms,
-        )
-    });
-    if let Some(expiry) = anthropic_expiry
-        && !retry_eligible
-    {
-        tracing::warn!(
-            expires_in_ms = expiry.map(|e| e - now_ms),
-            "upstream rejected a credential that has not aged out; treating it \
-             as revoked and not asking the owner CLI to refresh"
-        );
-    }
-    if let Some(expiry) = anthropic_expiry
-        && retry_eligible
-        && auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, expiry).await
-            == auth_probe::ProbeOutcome::Refreshed
-        && let Ok(Some(fresh)) = anthropic_source.resolve()
-    {
+    // Comparing the token rather than its `expiresAt` is the point of this
+    // arm. The expiry was a proxy for "would a retry send something
+    // different", and a lossy one in both directions: it declined to retry a
+    // credential the user had just re-authenticated (a fresh token has not
+    // aged out, so the old code read it as revoked and gave up), and it
+    // green-lit a retry that would resend the identical dead token whenever
+    // the clock said expired. The direct question has neither gap and needs
+    // no clock at all.
+    //
+    // What used to sit here was a delegated-refresh probe: spawn
+    // `claude auth status` and see whether the stored expiry moved. It never
+    // moved. `claude auth status` does not rewrite the credential — verified
+    // against the keychain item's modification date — and `claude auth` has
+    // no refresh subcommand to switch to, so the probe could only ever
+    // report NoChange, arm a 15-minute cooldown, and make the client-facing
+    // 401 claim a refresh had been tried. The retry itself was the half that
+    // worked; it was gated behind the half that could not.
+    let refreshed: Option<String> = match (anthropic_expiry, anthropic_source.resolve()) {
+        (Some(_), Ok(Some(stored))) if Some(&stored) != override_token.as_ref() => Some(stored),
+        _ => None,
+    };
+    if let Some(fresh) = refreshed.as_deref() {
+        tracing::info!("the credential store changed under a rejected request; retrying once");
         let has_anthropic_version = parts.headers.contains_key("anthropic-version");
         let retry_body: Vec<u8> = if let Some(ver) = cc_version.as_deref() {
             disguise::inject_billing_prefix(&body_bytes, ver)?
@@ -1024,14 +958,12 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             body_bytes.to_vec()
         };
         let mut retry = state.client.request(parts.method.clone(), &target_url);
-        // Mirrors the Codex retry arm immediately above: forward the same
-        // client headers as the first attempt, minus hop-by-hop/host/
-        // content-length and the auth headers we're about to replace.
-        // `anthropic-beta` is skipped too, same reason it was
-        // captured-and-skipped on the first attempt: `apply_disguise_headers`
-        // below re-adds the merged value, and forwarding the client's raw
-        // header as well would send the upstream two `anthropic-beta`
-        // headers instead of one.
+        // Mirrors the Codex retry arm above: forward the same client headers
+        // as the first attempt, minus hop-by-hop/host/content-length and the
+        // auth headers we are about to replace. `anthropic-beta` is skipped
+        // for the same reason it was captured-and-skipped on the first
+        // attempt: `apply_disguise_headers` re-adds the merged value, and
+        // forwarding the client's raw header too would send upstream two.
         for (name, value) in parts.headers.iter() {
             if is_hop_by_hop(name)
                 || name == "host"
@@ -1045,7 +977,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             retry = retry.header(name, value);
         }
         retry =
-            disguise::apply_disguise_headers(retry, &fresh, &client_betas, has_anthropic_version)?;
+            disguise::apply_disguise_headers(retry, fresh, &client_betas, has_anthropic_version)?;
         upstream_resp = retry
             .body(retry_body)
             .send()
@@ -1085,7 +1017,21 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         && status == StatusCode::UNAUTHORIZED
     {
         let expired = expiry.is_none_or(|exp| exp <= now_ms);
-        return Ok(anthropic_auth_error_response(anthropic_source, expired));
+        let retried = refreshed.is_some();
+        // This return is taken before the `proxied` debug line below, so
+        // until now a 401 produced here left no record of its own status at
+        // all: `grep status=401` over a log covering two real outages matched
+        // nothing.
+        tracing::warn!(
+            expired,
+            retried,
+            "returning 401: the credential this gateway attached was rejected"
+        );
+        return Ok(anthropic_auth_error_response(
+            anthropic_source,
+            expired,
+            retried,
+        ));
     }
 
     if translating && client_wants_stream {
@@ -1238,31 +1184,6 @@ fn codex_retry_eligible(
     }
 }
 
-/// Whether an Anthropic 401 is worth a delegated refresh.
-///
-/// A 401 with the stored expiry still in the future means the credential was
-/// revoked upstream, not that it aged out — a refresh cannot fix that, so the
-/// gateway must not spawn a probe for it. A blob with no expiry is allowed
-/// through once; the probe's own cooldown bounds the cost if it is fruitless.
-pub fn anthropic_retry_eligible(
-    provider: Provider,
-    status: reqwest::StatusCode,
-    source: &TokenSource,
-    expires_at_ms: Option<i64>,
-    now_ms: i64,
-) -> bool {
-    // Only a store Claude Code owns can be repaired by asking Claude Code to
-    // refresh. A raw key from the environment is rejected on its own merits.
-    let claude_owned = matches!(
-        source,
-        TokenSource::Keychain | TokenSource::CredentialsFile(_)
-    );
-    provider == Provider::Anthropic
-        && status == reqwest::StatusCode::UNAUTHORIZED
-        && claude_owned
-        && expires_at_ms.is_none_or(|exp| exp <= now_ms)
-}
-
 /// The stored expiry for Anthropic, read from **the same source the token came
 /// from**, via [`TokenSource::resolve_credential`] — the single shared
 /// fallback path (fix round 1, CRITICAL 1; see that method's doc for why a
@@ -1289,9 +1210,19 @@ fn anthropic_credential_expiry(source: &TokenSource) -> Option<i64> {
 /// the reader to a place that does not exist. This is the same mistake the
 /// expiry read made in three separate places earlier in this plan; do not
 /// reintroduce it here.
-pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String {
-    let what = if expired {
-        "Anthropic OAuth expired and an automatic refresh did not resolve it"
+pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool, retried: bool) -> String {
+    // `retried` outranks `expired`: if the store had moved on and the newer
+    // credential was rejected too, the age of the one that started this is no
+    // longer the interesting fact, and blaming expiry would send the reader
+    // to re-authenticate something they just re-authenticated.
+    //
+    // The old wording said "an automatic refresh did not resolve it" for
+    // every one of these, including the ones where nothing was attempted.
+    // Each sentence here is now something the request actually did.
+    let what = if retried {
+        "Anthropic OAuth was rejected, and a newer stored credential was tried and rejected too"
+    } else if expired {
+        "Anthropic OAuth expired and the credential store still holds the same token"
     } else {
         "Anthropic OAuth was revoked (the stored credential has not aged out)"
     };
@@ -1305,7 +1236,7 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String 
     // `is_macos` and never inspects `from_keychain`. Reading anyway re-ran
     // the item's ACL authorization on the 401 path — the worst possible
     // moment to risk a permission dialog — and, because this function is
-    // `pub` and called directly from `tests/auth_probe_retry.rs`, made plain
+    // `pub` and called directly from `tests/anthropic_auth_401.rs`, made plain
     // `cargo test` prompt the developer for their login keychain password,
     // accreting a stale trusted-app entry on the item per rebuilt test
     // binary.
@@ -1384,11 +1315,17 @@ fn describe_credential_store(
 /// [`openai_error_response`] below: the message is plain text, not
 /// upstream's original content-type, and nothing else about the upstream
 /// response is worth preserving (its body doesn't survive either).
-fn anthropic_auth_error_response(source: &TokenSource, expired: bool) -> Response<Body> {
+fn anthropic_auth_error_response(
+    source: &TokenSource,
+    expired: bool,
+    retried: bool,
+) -> Response<Body> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::from(anthropic_auth_error_body(source, expired)))
+        .body(Body::from(anthropic_auth_error_body(
+            source, expired, retried,
+        )))
         .expect("static error response builds")
 }
 
@@ -1531,9 +1468,7 @@ mod tests {
         assert_eq!(format!("{:?}", TokenSource::Disabled), "Disabled");
     }
 
-    /// Fix round 1, CRITICAL 1 (pure half — see
-    /// `auth_probe::tests::keychain_default_falls_back_to_credentials_file_on_non_macos`
-    /// for the `ProbeOutcome`-level regression this backs): pins
+    /// Fix round 1, CRITICAL 1 (pure half): pins
     /// `keychain_fallback`'s contract in isolation. On a non-macOS host, a
     /// keychain miss — `Ok(None)` (no entry) or `Err` (no backend at all)
     /// alike — falls back to the credentials-file path when one exists
@@ -1897,111 +1832,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auth_probe_is_disabled_in_every_constructor() {
-        // Mirrors token_source_codex: a test-side AppState must be unable to
-        // spawn the real `claude`, not merely unlikely to. Both constructors
-        // are checked — the safety property is that NO path out of this impl
-        // block leaves the probe armed, so testing only `new` would let
-        // `with_version` regress silently.
-        let by_new = AppState::new(
-            "https://a.test",
-            "https://o.test",
-            "https://g.test",
-            TokenSource::Disabled,
-        )
-        .unwrap();
-        assert_eq!(by_new.auth_probe, AuthProbe::Disabled, "AppState::new");
-
-        let by_version = AppState::with_version(
-            "https://a.test",
-            "https://o.test",
-            "https://g.test",
-            TokenSource::Disabled,
-            Arc::new(cc_version::VersionCache::detect_or_fallback()),
-        )
-        .unwrap();
-        assert_eq!(
-            by_version.auth_probe,
-            AuthProbe::Disabled,
-            "AppState::with_version"
-        );
-    }
-
-    #[test]
-    fn kill_switch_keeps_the_probe_disabled() {
-        // with_default_auth_probe is the only enabling path, and it must
-        // honour the opt-out even when `claude` genuinely resolves on PATH —
-        // not just when this machine happens to lack a `claude` install
-        // (which would make the assertion vacuous: which_claude() returns
-        // None either way, kill switch or not). Fixture: a file named
-        // `claude` in a temp dir, prepended onto PATH via
-        // std::env::join_paths. Chmod +x on unix (I2: which_claude now checks
-        // the executable bit there, not just is_file()) — without it this
-        // fixture stops resolving at all and the control below would fail
-        // for the wrong reason.
-        let dir = tempfile::tempdir().unwrap();
-        let fake_claude = dir.path().join("claude");
-        std::fs::write(&fake_claude, "").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let ambient_path = std::env::var_os("PATH").unwrap_or_default();
-        let path_with_fake = std::env::join_paths(
-            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&ambient_path)),
-        )
-        .unwrap();
-
-        temp_env::with_var("PATH", Some(path_with_fake), || {
-            temp_env::with_var(PROBE_KILL_SWITCH_ENV, Some("1"), || {
-                let s = AppState::new(
-                    "https://a.test",
-                    "https://o.test",
-                    "https://g.test",
-                    TokenSource::Disabled,
-                )
-                .unwrap()
-                .with_default_auth_probe();
-                assert_eq!(
-                    s.auth_probe,
-                    AuthProbe::Disabled,
-                    "kill switch: expected Disabled even with a resolvable `claude` on PATH"
-                );
-            });
-
-            // Negative control: same PATH, kill switch unset. This is what
-            // proves the fixture above actually works — if this assertion
-            // fails, the fixture never put a resolvable `claude` on PATH and
-            // the Disabled assertion above proved nothing.
-            temp_env::with_var_unset(PROBE_KILL_SWITCH_ENV, || {
-                let s = AppState::new(
-                    "https://a.test",
-                    "https://o.test",
-                    "https://g.test",
-                    TokenSource::Disabled,
-                )
-                .unwrap()
-                .with_default_auth_probe();
-                assert_eq!(
-                    s.auth_probe,
-                    AuthProbe::Command(fake_claude.clone()),
-                    "control: fake `claude` on PATH did not arm the probe — PATH fixture is broken, so the Disabled assertion above proved nothing"
-                );
-            });
-        });
-    }
-
-    /// I2: `which_claude` used to accept any `is_file()` match regardless of
-    /// permissions — a stale or permission-stripped `claude` left earlier on
-    /// PATH would shadow a perfectly good one later on PATH, silently arming
-    /// the probe with a binary that fails every spawn. Two PATH entries, in
-    /// order: a non-executable `claude` first, an executable one second —
-    /// proving this is a skip-and-continue past the bad entry, not merely
-    /// "reject a lone bad file" (which a stricter-but-still-wrong early
-    /// return could also satisfy).
-    #[cfg(unix)]
     #[test]
     fn which_claude_skips_a_non_executable_file_in_favor_of_an_executable_one() {
         use std::os::unix::fs::PermissionsExt;
