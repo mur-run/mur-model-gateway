@@ -109,7 +109,7 @@ systemctl --user enable --now mur-model-gateway.service
 ```bash
 sudo mur-model-gateway install --system --token-source env:MUR_MODEL_GATEWAY_OAUTH_TOKEN
 # 然後自己把 token 補進 env 檔（不要經過 shell history / 工具輸出）：
-#   sudoedit /etc/mur-model-gateway.env   → 加一行 MUR_MODEL_GATEWAY_OAUTH_TOKEN=sk-ant-oat01-…
+#   sudoedit /etc/mur-model-gateway.env   → 加一行 MUR_MODEL_GATEWAY_OAUTH_TOKEN=sk-ant-oat…
 sudo systemctl daemon-reload
 sudo systemctl enable --now mur-model-gateway.service
 journalctl -u mur-model-gateway.service -f

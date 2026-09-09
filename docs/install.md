@@ -112,7 +112,7 @@ systemctl --user enable --now mur-model-gateway.service
 ```bash
 sudo mur-model-gateway install --system --token-source env:MUR_MODEL_GATEWAY_OAUTH_TOKEN
 # then add the token to the env file yourself (keep it out of shell history and tool output):
-#   sudoedit /etc/mur-model-gateway.env   → add a line MUR_MODEL_GATEWAY_OAUTH_TOKEN=sk-ant-oat01-…
+#   sudoedit /etc/mur-model-gateway.env   → add a line MUR_MODEL_GATEWAY_OAUTH_TOKEN=sk-ant-oat…
 sudo systemctl daemon-reload
 sudo systemctl enable --now mur-model-gateway.service
 journalctl -u mur-model-gateway.service -f
