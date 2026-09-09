@@ -1011,10 +1011,21 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
              as revoked and not asking the owner CLI to refresh"
         );
     }
-    if let Some(expiry) = anthropic_expiry
+    // Captured rather than compared inline, because the client-facing 401
+    // further down has to say which of the three outcomes actually happened.
+    // Collapsing them into one "a refresh did not resolve it" sentence is what
+    // sent a user to `claude auth login` during a two-minute outage in which
+    // no refresh was ever attempted: of the four probe events that morning,
+    // one was `NoChange` and three were `Skipped` on the 15-minute cooldown.
+    // The message asserted a refresh had been tried and failed in all four.
+    let probe_outcome: Option<auth_probe::ProbeOutcome> = if let Some(expiry) = anthropic_expiry
         && retry_eligible
-        && auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, expiry).await
-            == auth_probe::ProbeOutcome::Refreshed
+    {
+        Some(auth_probe::refresh_via_owner(&state.auth_probe, anthropic_source, expiry).await)
+    } else {
+        None
+    };
+    if probe_outcome == Some(auth_probe::ProbeOutcome::Refreshed)
         && let Ok(Some(fresh)) = anthropic_source.resolve()
     {
         let has_anthropic_version = parts.headers.contains_key("anthropic-version");
@@ -1085,7 +1096,22 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         && status == StatusCode::UNAUTHORIZED
     {
         let expired = expiry.is_none_or(|exp| exp <= now_ms);
-        return Ok(anthropic_auth_error_response(anthropic_source, expired));
+        // This return is taken before the `proxied` debug line below, so until
+        // now a 401 produced here left no record of its own status at all:
+        // `grep status=401` over a log covering two real outages matched
+        // nothing. The probe outcome rides along because it is what decides
+        // the wording, and a wrong wording is the bug this pair of lines
+        // exists to make diagnosable.
+        tracing::warn!(
+            probe = ?probe_outcome,
+            expired,
+            "returning 401: the credential this gateway attached was rejected"
+        );
+        return Ok(anthropic_auth_error_response(
+            anthropic_source,
+            expired,
+            probe_outcome,
+        ));
     }
 
     if translating && client_wants_stream {
@@ -1289,11 +1315,31 @@ fn anthropic_credential_expiry(source: &TokenSource) -> Option<i64> {
 /// the reader to a place that does not exist. This is the same mistake the
 /// expiry read made in three separate places earlier in this plan; do not
 /// reintroduce it here.
-pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool) -> String {
-    let what = if expired {
-        "Anthropic OAuth expired and an automatic refresh did not resolve it"
-    } else {
+pub fn anthropic_auth_error_body(
+    source: &TokenSource,
+    expired: bool,
+    probe: Option<auth_probe::ProbeOutcome>,
+) -> String {
+    let what = if !expired {
+        // No probe runs for a revoked credential, so `probe` is `None` here and
+        // there is nothing about a refresh to report.
         "Anthropic OAuth was revoked (the stored credential has not aged out)"
+    } else {
+        match probe {
+            Some(auth_probe::ProbeOutcome::Refreshed) => {
+                "Anthropic OAuth expired, was refreshed, and the retried request was still rejected"
+            }
+            Some(auth_probe::ProbeOutcome::NoChange) => {
+                "Anthropic OAuth expired and the owner CLI, asked to refresh it, did not"
+            }
+            // `Skipped` is the cooldown or a disarmed probe: nothing was asked
+            // of anyone. Saying otherwise sends the reader to re-authenticate a
+            // credential that may be perfectly repairable by the next probe.
+            Some(auth_probe::ProbeOutcome::Skipped) | None => {
+                "Anthropic OAuth expired and no refresh was attempted \
+                 (the probe is disarmed, or inside its cooldown window)"
+            }
+        }
     };
     let is_macos = cfg!(target_os = "macos");
     // I1: only read the keychain when `source` is actually `Keychain` — for
@@ -1384,11 +1430,17 @@ fn describe_credential_store(
 /// [`openai_error_response`] below: the message is plain text, not
 /// upstream's original content-type, and nothing else about the upstream
 /// response is worth preserving (its body doesn't survive either).
-fn anthropic_auth_error_response(source: &TokenSource, expired: bool) -> Response<Body> {
+fn anthropic_auth_error_response(
+    source: &TokenSource,
+    expired: bool,
+    probe: Option<auth_probe::ProbeOutcome>,
+) -> Response<Body> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::from(anthropic_auth_error_body(source, expired)))
+        .body(Body::from(anthropic_auth_error_body(
+            source, expired, probe,
+        )))
         .expect("static error response builds")
 }
 
