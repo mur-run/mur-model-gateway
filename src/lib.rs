@@ -1832,6 +1832,15 @@ mod tests {
         );
     }
 
+    /// I2: `which_claude` used to accept any `is_file()` match regardless of
+    /// permissions — a stale or permission-stripped `claude` left earlier on
+    /// PATH would shadow a perfectly good one later on PATH, so `cc_version`
+    /// would fall back to a stub version string on every request. Two PATH
+    /// entries, in order: a non-executable `claude` first, an executable one
+    /// second — proving this is a skip-and-continue past the bad entry, not
+    /// merely "reject a lone bad file" (which a stricter-but-still-wrong
+    /// early return could also satisfy).
+    #[cfg(unix)]
     #[test]
     fn which_claude_skips_a_non_executable_file_in_favor_of_an_executable_one() {
         use std::os::unix::fs::PermissionsExt;
