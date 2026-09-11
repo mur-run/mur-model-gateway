@@ -17,6 +17,40 @@ pub enum TranslateError {
 }
 
 /// Translate a Chat Completions request into a Responses request.
+/// Chat `content` is a string or, for vision, an array of `{type:"text"}` /
+/// `{type:"image_url"}` parts. Returns the joined text (what the non-user
+/// roles carry) and the Responses-shaped input items for a user turn.
+/// Reading the array with `as_str` used to make the whole turn empty.
+fn content_items(content: Option<&Value>) -> (String, Vec<Value>) {
+    match content {
+        Some(Value::String(s)) => (s.clone(), vec![json!({"type": "input_text", "text": s})]),
+        Some(Value::Array(parts)) => {
+            let mut text = Vec::new();
+            let mut items = Vec::new();
+            for p in parts {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let t = p.get("text").and_then(Value::as_str).unwrap_or("");
+                        text.push(t.to_string());
+                        items.push(json!({"type": "input_text", "text": t}));
+                    }
+                    Some("image_url") => {
+                        let url = p
+                            .get("image_url")
+                            .map(|u| u.get("url").unwrap_or(u))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        items.push(json!({"type": "input_image", "image_url": url}));
+                    }
+                    _ => {}
+                }
+            }
+            (text.join("\n"), items)
+        }
+        _ => (String::new(), Vec::new()),
+    }
+}
+
 pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
     let chat = chat.as_object().ok_or(TranslateError::NotAnObject)?;
 
@@ -76,7 +110,8 @@ pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
         .unwrap_or(&empty)
     {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-        let text = msg.get("content").and_then(Value::as_str).unwrap_or("");
+        let (text, items) = content_items(msg.get("content"));
+        let text = text.as_str();
         match role {
             "system" | "developer" => instructions.push(text.to_string()),
             "tool" => input.push(json!({
@@ -111,7 +146,11 @@ pub fn chat_to_responses(chat: &Value) -> Result<Value, TranslateError> {
             _ => input.push(json!({
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": text}],
+                "content": if items.is_empty() {
+                    vec![json!({"type": "input_text", "text": text})]
+                } else {
+                    items
+                },
             })),
         }
     }
@@ -479,6 +518,30 @@ mod tests {
         assert_eq!(input[0]["content"][0]["text"], json!("hi"));
         assert_eq!(input[1]["role"], json!("assistant"));
         assert_eq!(input[1]["content"][0]["type"], json!("output_text"));
+    }
+
+    /// Vision requests carry `content` as an array of parts. `as_str` on it
+    /// made the whole user turn empty — text and image both gone — and the
+    /// model answered a blank message (seen 2026-09-11 on the concierge).
+    #[test]
+    fn array_content_keeps_the_text_and_maps_the_image() {
+        let out = chat_to_responses(&json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "be terse"}]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "text", "text": "what colour?"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(out["instructions"], json!("be terse"));
+        let c = &out["input"][0]["content"];
+        assert_eq!(c[0]["type"], json!("input_image"));
+        assert_eq!(c[0]["image_url"], json!("data:image/png;base64,AAAA"));
+        assert_eq!(c[1]["type"], json!("input_text"));
+        assert_eq!(c[1]["text"], json!("what colour?"));
     }
 
     #[test]
