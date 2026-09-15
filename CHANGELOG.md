@@ -12,6 +12,18 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+### Fixed
+
+- Requests larger than 10 MiB no longer fail with `502 read incoming body`. A
+  conversation carrying a few screenshots crosses that line easily, and the
+  gateway — not the upstream, which takes 32 MB — was the one refusing it. The
+  buffer the gateway needs to disguise, compress, or translate a body is now
+  capped at 32 MiB, above the upstream's own ceiling, so the upstream decides.
+  **Upgrade:** yes, if you paste images or share long sessions — the failure
+  looked transient and the client retried it ten times, all in vain.
+- `proxy error` log lines now carry the whole error chain
+  (`read incoming body: length limit exceeded`), not just the outermost step.
+
 ### Changed
 
 - An Anthropic 401 on a credential the gateway attached is now retried when —
