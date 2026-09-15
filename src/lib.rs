@@ -540,6 +540,7 @@ async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Value> 
         // installed it. Non-secret by construction.
         "version": env!("CARGO_PKG_VERSION"),
         "codexHook": codex::hook_compiled(),
+        "claudeHook": disguise::hook_compiled(),
         "codexCredential": codex,
         "claudeCredential": claude,
         "compression": state.compress,
