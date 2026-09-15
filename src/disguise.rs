@@ -38,6 +38,20 @@ mod disguise_impl {
 
 pub use disguise_impl::*;
 
+/// Whether this binary was built with the real disguise hook (the gitignored
+/// `disguise_impl.rs`). Surfaced by `/__mur/health` so MUR Hub can tell a stub
+/// build from a broken login before it routes a subscription agent here.
+/// Mirrors `codex::hook_compiled()` — same contract, other hook.
+#[cfg(has_beta_hook)]
+pub const fn hook_compiled() -> bool {
+    true
+}
+
+#[cfg(not(has_beta_hook))]
+pub const fn hook_compiled() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

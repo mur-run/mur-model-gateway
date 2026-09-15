@@ -27,6 +27,7 @@ async fn health_is_local_and_non_secret() {
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(json["status"], "ok");
     assert!(json.get("codexHook").unwrap().is_boolean());
+    assert!(json.get("claudeHook").unwrap().is_boolean());
     assert_eq!(json["codexCredential"], "missing");
     assert_eq!(json["claudeCredential"], "missing");
     assert!(json.get("compression").unwrap().is_boolean());
