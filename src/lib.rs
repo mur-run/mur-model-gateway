@@ -44,7 +44,13 @@ pub const DEFAULT_UPSTREAM_CODEX_APIKEY: &str = "https://api.openai.com";
 /// Backward-compatible alias — points to Anthropic.
 pub const DEFAULT_UPSTREAM: &str = DEFAULT_UPSTREAM_ANTHROPIC;
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
-pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+/// Cap on the request body the gateway buffers before disguising,
+/// compressing, or translating it. Sized off the upstream's own ceiling —
+/// the Messages API takes 32 MB — so the gateway is never the component
+/// that rejects a request the upstream would have accepted. At 10 MiB it
+/// was: a conversation carrying a few screenshots sailed past that, and
+/// the refusal surfaced as a 502 the client retried ten times in vain.
+pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Which LLM API provider a request targets, derived from its path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -544,7 +550,11 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response<Body> {
     match forward(state, req).await {
         Ok(resp) => resp,
         Err(err) => {
-            tracing::warn!(error = %err, "proxy error");
+            // `{err:#}` — anyhow's whole chain on one line. Plain Display
+            // prints only the outermost context ("read incoming body"),
+            // which names the step but never the cause.
+            let chain = format!("{err:#}");
+            tracing::warn!(error = %chain, "proxy error");
             (StatusCode::BAD_GATEWAY, format!("mur-model-gateway: {err}")).into_response()
         }
     }

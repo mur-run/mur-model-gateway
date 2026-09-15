@@ -219,3 +219,38 @@ async fn routes_to_correct_upstream_per_provider() {
     assert_eq!(resp.status(), 200);
     gemini_hit.assert_async().await;
 }
+
+/// A conversation carrying a handful of screenshots crosses 10 MiB long
+/// before it reaches anything the upstream would refuse (the Messages API
+/// takes 32 MB). The gateway must not be the component that says no: it
+/// buffers the body to disguise/compress/translate it, and that buffer's
+/// cap used to sit at 10 MiB, turning an ordinary image-heavy turn into
+/// `502 read incoming body` — which the client reads as a transient
+/// server fault and retries ten times, all failing identically.
+#[tokio::test]
+async fn body_larger_than_ten_mib_reaches_upstream() {
+    let upstream = MockServer::start_async().await;
+    let hit = upstream
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(200).body(r#"{"id":"msg_big"}"#);
+        })
+        .await;
+
+    let addr = spawn_proxy(upstream.base_url()).await;
+    let body = format!(
+        r#"{{"model":"x","max_tokens":1,"messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "a".repeat(12 * 1024 * 1024)
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(resp.status(), 200, "12 MiB body must not be rejected");
+    hit.assert_async().await;
+}
