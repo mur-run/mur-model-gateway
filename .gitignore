@@ -1,4 +1,5 @@
 /target
+/.worktrees
 Cargo.lock
 *.log
 *.swp
