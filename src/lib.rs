@@ -1270,7 +1270,10 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool, retried: b
     };
     format!(
         "{what} — credential: {}. \
-         Fix: run `/login anthropic` in murmur, or `claude auth login`.",
+         Fix: run `/login anthropic` in murmur, or `claude auth logout` \
+         then `claude auth login` — on a CLI that still thinks it is signed \
+         in, `login` alone reports \"already authenticated\" and leaves the \
+         stale credential in place.",
         describe_credential_store(source, is_macos, &from_keychain)
     )
 }

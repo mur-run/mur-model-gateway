@@ -90,3 +90,29 @@ fn error_body_never_contains_the_token() {
         "token leaked into an error body: {b}"
     );
 }
+
+/// The fix line must survive the case it was written for: a user who IS
+/// logged in. `claude auth login` on an already-authenticated CLI reports
+/// "already authenticated" and exits without touching the credential, so a
+/// body that names only `login` sends the reader to a no-op and leaves the
+/// 401 exactly where it was. The logout has to be named first, in order.
+#[test]
+fn the_fix_tells_an_already_logged_in_user_to_log_out_first() {
+    for (expired, retried) in [(true, false), (false, false), (true, true)] {
+        let b = mur_model_gateway::anthropic_auth_error_body(
+            &TokenSource::Keychain,
+            expired,
+            retried,
+        );
+        let out = b
+            .find("claude auth logout")
+            .unwrap_or_else(|| panic!("names the logout: {b}"));
+        let login = b
+            .find("claude auth login")
+            .unwrap_or_else(|| panic!("names the login: {b}"));
+        assert!(
+            out < login,
+            "logout must come before login or the login is a no-op: {b}"
+        );
+    }
+}
