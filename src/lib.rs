@@ -30,6 +30,7 @@ use axum::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8088";
 pub const DEFAULT_UPSTREAM_ANTHROPIC: &str = "https://api.anthropic.com";
@@ -60,6 +61,37 @@ pub enum Provider {
     OpenAI,
     Gemini,
     Codex,
+}
+
+/// One semaphore per provider, each sized to the same cap. Per-provider
+/// (not one shared semaphore) so a burst against Anthropic can't starve a
+/// concurrent Codex call of its own headroom — the whole point of the cap
+/// is per-provider fairness, not a single global gate.
+struct ProviderSemaphores {
+    anthropic: Semaphore,
+    openai: Semaphore,
+    gemini: Semaphore,
+    codex: Semaphore,
+}
+
+impl ProviderSemaphores {
+    fn new(max_concurrency: usize) -> Self {
+        Self {
+            anthropic: Semaphore::new(max_concurrency),
+            openai: Semaphore::new(max_concurrency),
+            gemini: Semaphore::new(max_concurrency),
+            codex: Semaphore::new(max_concurrency),
+        }
+    }
+
+    fn for_provider(&self, provider: Provider) -> &Semaphore {
+        match provider {
+            Provider::Anthropic => &self.anthropic,
+            Provider::OpenAI => &self.openai,
+            Provider::Gemini => &self.gemini,
+            Provider::Codex => &self.codex,
+        }
+    }
 }
 
 /// Map a request path to its provider. Falls back to Anthropic for unrecognised paths.
@@ -291,6 +323,12 @@ pub struct AppState {
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
     /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
+    /// Cross-process upstream concurrency cap (see module docs on
+    /// `ProviderSemaphores`). `None` (the default) is unlimited — today's
+    /// behaviour for every deployment that never calls
+    /// `with_max_concurrency`. `Arc` because `AppState` is `Clone` (one
+    /// instance per request) but the semaphore state must be shared.
+    concurrency: Option<Arc<ProviderSemaphores>>,
 }
 
 impl AppState {
@@ -332,6 +370,7 @@ impl AppState {
             token_source_codex: TokenSource::Disabled,
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
+            concurrency: None,
         })
     }
 
@@ -366,6 +405,16 @@ impl AppState {
     /// Override the Codex token source. Used by tests.
     pub fn with_token_source_codex(mut self, ts: TokenSource) -> Self {
         self.token_source_codex = ts;
+        self
+    }
+
+    /// Cap simultaneous upstream calls per provider at `max_concurrency`,
+    /// process-wide, across every caller sharing this `AppState`/router.
+    /// See module docs on `ProviderSemaphores` for why this is per-provider
+    /// rather than one shared gate, and why it lives here rather than in
+    /// mur-core's per-process rate limiter.
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.concurrency = Some(Arc::new(ProviderSemaphores::new(max_concurrency)));
         self
     }
 
@@ -570,6 +619,20 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .unwrap_or("/");
     let path_only = parts.uri.path();
     let provider = detect_provider(path_only);
+
+    // Acquire before anything else so every exit path — success, error
+    // returns via `?`, and the retry branches further down — happens while
+    // still holding it. Dropped automatically at function end (all return
+    // paths), which is what releases the slot for the next waiter.
+    let _permit = match &state.concurrency {
+        Some(sem) => Some(
+            sem.for_provider(provider)
+                .acquire()
+                .await
+                .context("provider concurrency semaphore closed")?,
+        ),
+        None => None,
+    };
 
     let translating = codex::should_translate(path_only);
 
