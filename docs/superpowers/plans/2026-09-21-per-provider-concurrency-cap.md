@@ -457,7 +457,7 @@ fn concurrency_cap_response(provider: Provider, cap: usize, waited: Duration) ->
 
 ### Step 2.1 — failing unit tests
 
-- [ ] Append to the bottom of `src/main.rs`:
+- [x] Append to the bottom of `src/main.rs`:
 
 ```rust
 #[cfg(test)]
@@ -504,15 +504,15 @@ mod concurrency_env_tests {
 }
 ```
 
-- [ ] `cargo test --bin mur-model-gateway concurrency_env 2>&1 | tail -8` —
+- [x] `cargo test --bin mur-model-gateway concurrency_env 2>&1 | tail -8` —
   expected: compile error `cannot find function `parse_max_concurrency``.
 
 ### Step 2.2 — minimal code
 
-- [ ] In `src/main.rs` imports: extend the `use mur_model_gateway::{...}` list
+- [x] In `src/main.rs` imports: extend the `use mur_model_gateway::{...}` list
   with `DEFAULT_QUEUE_TIMEOUT`, and add `use std::time::Duration;`.
 
-- [ ] Add before `fn init_tracing()`:
+- [x] Add before `fn init_tracing()`:
 
 ```rust
 /// `MUR_MODEL_GATEWAY_MAX_CONCURRENCY` → per-provider cap. `None` means
@@ -554,7 +554,7 @@ fn parse_queue_timeout(raw: Option<&str>) -> Duration {
 }
 ```
 
-- [ ] In `serve()`, after the `MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX` block and
+- [x] In `serve()`, after the `MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX` block and
   before `let app = build_router(state);`, add:
 
 ```rust
@@ -568,7 +568,7 @@ fn parse_queue_timeout(raw: Option<&str>) -> Duration {
     }
 ```
 
-- [ ] In the `tracing::info!(... "mur-model-gateway listening")` call, add two
+- [x] In the `tracing::info!(... "mur-model-gateway listening")` call, add two
   fields before the message string:
 
 ```rust
@@ -576,13 +576,13 @@ fn parse_queue_timeout(raw: Option<&str>) -> Duration {
         queue_timeout_secs = queue_timeout.as_secs(),
 ```
 
-- [ ] `cargo test --bin mur-model-gateway concurrency_env 2>&1 | tail -5` —
+- [x] `cargo test --bin mur-model-gateway concurrency_env 2>&1 | tail -5` —
   expected `test result: ok. 7 passed`.
-- [ ] `cargo clippy --all-targets -- -D warnings 2>&1 | tail -3` — clean.
+- [x] `cargo clippy --all-targets -- -D warnings 2>&1 | tail -3` — clean.
 
 ### Step 2.3 — commit
 
-- [ ] ```
+- [x] ```
   feat(concurrency): wire MUR_MODEL_GATEWAY_MAX_CONCURRENCY and _QUEUE_TIMEOUT_SECS
 
   Unset cap = unlimited, unchanged. 0 or garbage in either variable is

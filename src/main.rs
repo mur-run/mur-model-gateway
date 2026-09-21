@@ -1,10 +1,12 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use mur_model_gateway::{
-    AppState, DEFAULT_BIND, DEFAULT_UPSTREAM_ANTHROPIC, DEFAULT_UPSTREAM_CODEX,
-    DEFAULT_UPSTREAM_GEMINI, DEFAULT_UPSTREAM_OPENAI, TokenSource, build_router, install,
+    AppState, DEFAULT_BIND, DEFAULT_QUEUE_TIMEOUT, DEFAULT_UPSTREAM_ANTHROPIC,
+    DEFAULT_UPSTREAM_CODEX, DEFAULT_UPSTREAM_GEMINI, DEFAULT_UPSTREAM_OPENAI, TokenSource,
+    build_router, install,
 };
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -101,6 +103,44 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// `MUR_MODEL_GATEWAY_MAX_CONCURRENCY` → per-provider cap. `None` means
+/// unlimited (today's behaviour). `0` and unparsable values also mean
+/// unlimited — never "some default cap" — but say so, because a silently
+/// ignored knob is how the 2026-09-09 fleet pile-up went unexplained.
+fn parse_max_concurrency(raw: Option<&str>) -> Option<usize> {
+    let raw = raw?;
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            tracing::warn!(
+                value = raw,
+                "MUR_MODEL_GATEWAY_MAX_CONCURRENCY must be a positive integer; leaving the cap unlimited"
+            );
+            None
+        }
+    }
+}
+
+/// `MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS` → bounded permit wait. Unset,
+/// `0`, or unparsable → `DEFAULT_QUEUE_TIMEOUT` (30s), with a warning for
+/// the latter two.
+fn parse_queue_timeout(raw: Option<&str>) -> Duration {
+    let Some(raw) = raw else {
+        return DEFAULT_QUEUE_TIMEOUT;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => {
+            tracing::warn!(
+                value = raw,
+                default_secs = DEFAULT_QUEUE_TIMEOUT.as_secs(),
+                "MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS must be a positive integer; using the default"
+            );
+            DEFAULT_QUEUE_TIMEOUT
+        }
+    }
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -148,6 +188,14 @@ async fn serve() -> anyhow::Result<()> {
         state.token_source_codex = parse_token_source_codex(&spec)
             .context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX")?;
     }
+    let max_concurrency_raw = std::env::var("MUR_MODEL_GATEWAY_MAX_CONCURRENCY").ok();
+    let queue_timeout_raw = std::env::var("MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS").ok();
+    let max_concurrency = parse_max_concurrency(max_concurrency_raw.as_deref());
+    let queue_timeout = parse_queue_timeout(queue_timeout_raw.as_deref());
+    state = state.with_queue_timeout(queue_timeout);
+    if let Some(n) = max_concurrency {
+        state = state.with_max_concurrency(n);
+    }
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -159,6 +207,8 @@ async fn serve() -> anyhow::Result<()> {
         upstream_openai = %upstream_openai,
         upstream_gemini = %upstream_gemini,
         upstream_codex = %upstream_codex,
+        max_concurrency = ?max_concurrency,
+        queue_timeout_secs = queue_timeout.as_secs(),
         "mur-model-gateway listening"
     );
 
@@ -306,5 +356,48 @@ mod tests {
             TokenSource::EnvVar(v) => assert_eq!(v, "MY_TOKEN"),
             _ => panic!("expected EnvVar"),
         }
+    }
+}
+
+#[cfg(test)]
+mod concurrency_env_tests {
+    use super::*;
+
+    #[test]
+    fn max_concurrency_unset_is_none() {
+        assert_eq!(parse_max_concurrency(None), None);
+    }
+
+    #[test]
+    fn max_concurrency_positive_parses() {
+        assert_eq!(parse_max_concurrency(Some("3")), Some(3));
+    }
+
+    #[test]
+    fn max_concurrency_zero_is_none() {
+        assert_eq!(parse_max_concurrency(Some("0")), None);
+    }
+
+    #[test]
+    fn max_concurrency_garbage_is_none() {
+        assert_eq!(parse_max_concurrency(Some("lots")), None);
+        assert_eq!(parse_max_concurrency(Some("")), None);
+        assert_eq!(parse_max_concurrency(Some("-2")), None);
+    }
+
+    #[test]
+    fn queue_timeout_unset_is_default() {
+        assert_eq!(parse_queue_timeout(None), DEFAULT_QUEUE_TIMEOUT);
+    }
+
+    #[test]
+    fn queue_timeout_positive_parses() {
+        assert_eq!(parse_queue_timeout(Some("7")), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn queue_timeout_zero_and_garbage_fall_back() {
+        assert_eq!(parse_queue_timeout(Some("0")), DEFAULT_QUEUE_TIMEOUT);
+        assert_eq!(parse_queue_timeout(Some("soon")), DEFAULT_QUEUE_TIMEOUT);
     }
 }
