@@ -106,6 +106,92 @@ async fn spawn_gateway_multi(
     addr.to_string()
 }
 
+/// Like `spawn_gateway`, but also sets the queue timeout — needed to make
+/// the overflow path fire inside a test's patience.
+async fn spawn_gateway_with_queue(
+    upstream: &str,
+    max_concurrency: Option<usize>,
+    queue_timeout: Duration,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut state = AppState::new(
+        upstream,
+        "https://o.invalid",
+        "https://g.invalid",
+        TokenSource::Disabled,
+    )
+    .unwrap()
+    .with_queue_timeout(queue_timeout);
+    if let Some(n) = max_concurrency {
+        state = state.with_max_concurrency(n);
+    }
+    let app = build_router(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    addr.to_string()
+}
+
+/// Upstream that answers headers immediately and then streams the body
+/// slowly. `current`/`peak` count *open bodies*, decremented when the
+/// stream is fully drained — which is what a provider's concurrency limit
+/// actually measures. A permit released at header time would let `peak`
+/// exceed the cap here even though
+/// `caps_concurrent_upstream_calls_across_many_callers` passes.
+async fn slow_stream_handler(State(up): State<SlowUpstream>) -> impl IntoResponse {
+    use futures_util::stream;
+    let now = up.current.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut observed = up.peak.load(Ordering::SeqCst);
+    while now > observed {
+        match up
+            .peak
+            .compare_exchange(observed, now, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => break,
+            Err(v) => observed = v,
+        }
+    }
+    let per_chunk = up.hold / 5;
+    let current = up.current.clone();
+    let body = stream::unfold(0u8, move |i| {
+        let current = current.clone();
+        async move {
+            if i == 5 {
+                current.fetch_sub(1, Ordering::SeqCst);
+                return None;
+            }
+            tokio::time::sleep(per_chunk).await;
+            Some((
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: {}\n\n")),
+                i + 1,
+            ))
+        }
+    });
+    (
+        StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        axum::body::Body::from_stream(body),
+    )
+}
+
+/// `spawn_upstream`, but the route streams its body instead of answering
+/// in one shot.
+async fn spawn_stream_upstream(hold: Duration) -> (String, Arc<AtomicUsize>) {
+    let up = SlowUpstream {
+        current: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+        hold,
+    };
+    let peak = up.peak.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new()
+        .route("/v1/messages", post(slow_stream_handler))
+        .with_state(up);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), peak)
+}
+
 fn body() -> &'static str {
     r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#
 }
@@ -131,6 +217,11 @@ async fn fire_path(gw: &str, path: &str, n: usize) {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), 200);
+            // Drain the body. Dropping the response here would close the
+            // stream early and release a stream-carried permit at once,
+            // making `permit_is_held_until_the_stream_is_drained` unable
+            // to fail.
+            resp.bytes().await.unwrap();
         }));
     }
     for h in handles {
@@ -206,5 +297,94 @@ async fn provider_caps_are_independent() {
         openai_peak.load(Ordering::SeqCst) >= 2,
         "openai's 2 calls should have run concurrently, undisturbed by anthropic's overflow; only saw {} in flight at once",
         openai_peak.load(Ordering::SeqCst)
+    );
+}
+
+/// Like `fire_path`, but returns every response's status, `retry-after`
+/// header (if any) and body, so a test can assert on the overflow shape
+/// rather than just counting peak concurrency.
+async fn fire_collect(gw: &str, n: usize) -> Vec<(reqwest::StatusCode, Option<String>, String)> {
+    let client = reqwest::Client::new();
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let client = client.clone();
+        let url = format!("http://{gw}/v1/messages");
+        handles.push(tokio::spawn(async move {
+            let resp = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(body())
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let text = resp.text().await.unwrap();
+            (status, retry_after, text)
+        }));
+    }
+    let mut out = Vec::with_capacity(n);
+    for h in handles {
+        out.push(h.await.unwrap());
+    }
+    out
+}
+
+/// Spec §1 + §3: with cap 1 and a queue timeout shorter than the upstream
+/// hold, the second caller must get a gateway-made 429 — not hang, not a
+/// 502 — carrying `retry-after: 5` and a body that names the cap.
+#[tokio::test]
+async fn overflow_is_a_local_429_with_retry_after() {
+    let (upstream, _peak) = spawn_upstream(Duration::from_millis(1500)).await;
+    let gw = spawn_gateway_with_queue(&upstream, Some(1), Duration::from_millis(200)).await;
+
+    let results = fire_collect(&gw, 2).await;
+
+    let overflow: Vec<_> = results
+        .iter()
+        .filter(|(s, _, _)| *s == reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .collect();
+    assert_eq!(
+        overflow.len(),
+        1,
+        "exactly one caller should overflow: {results:?}"
+    );
+    let (_, retry_after, text) = overflow[0];
+    assert_eq!(retry_after.as_deref(), Some("5"));
+    let json: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(json["error"]["type"], "gateway_concurrency_cap");
+    assert_eq!(json["error"]["provider"], "anthropic");
+    assert_eq!(json["error"]["cap"], 1);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not an upstream"),
+        "message must disclaim the upstream: {text}"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|(s, _, _)| *s != reqwest::StatusCode::BAD_GATEWAY),
+        "overflow must never surface as 502: {results:?}"
+    );
+}
+
+/// Spec §1: a streaming response still owns its permit while the body is
+/// in flight. Releasing at header time would let peak concurrency exceed
+/// the cap for exactly the calls that matter most (long agentic streams).
+#[tokio::test]
+async fn permit_is_held_until_the_stream_is_drained() {
+    let (upstream, peak) = spawn_stream_upstream(Duration::from_millis(200)).await;
+    let gw = spawn_gateway(&upstream, Some(2)).await;
+    fire(&gw, 6).await; // `fire` reads each body to the end
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        2,
+        "streaming responses must hold the permit until the body ends, not until headers are sent"
     );
 }

@@ -54,11 +54,11 @@ documents the knobs.
 
 ## Task 0 — Branch and carry the draft
 
-- [ ] `cd ~/Projects/mur-model-gateway && git checkout -b feat/per-provider-concurrency-cap`
+- [x] `cd ~/Projects/mur-model-gateway && git checkout -b feat/per-provider-concurrency-cap`
   (uncommitted `src/lib.rs` edits and untracked `tests/max_concurrency.rs`
   follow the checkout automatically).
-- [ ] `git add src/lib.rs tests/max_concurrency.rs docs/superpowers/specs/2026-09-21-per-provider-concurrency-cap-design.md docs/superpowers/plans/2026-09-21-per-provider-concurrency-cap.md`
-- [ ] Commit:
+- [x] `git add src/lib.rs tests/max_concurrency.rs docs/superpowers/specs/2026-09-21-per-provider-concurrency-cap-design.md docs/superpowers/plans/2026-09-21-per-provider-concurrency-cap.md`
+- [x] Commit:
   ```
   feat(concurrency): per-provider upstream semaphore behind with_max_concurrency
 
@@ -66,7 +66,7 @@ documents the knobs.
   of forward(). Default None keeps today's unlimited behaviour; nothing
   in main.rs calls the builder yet. Spec and plan alongside.
   ```
-- [ ] `git branch --show-current` prints `feat/per-provider-concurrency-cap`; `git status --short` is empty.
+- [x] `git branch --show-current` prints `feat/per-provider-concurrency-cap`; `git status --short` is empty.
 
 Note: the draft's `ProviderSemaphores` holds bare `Semaphore`s and `forward()`
 takes a borrowed permit. That is fine to commit as-is; Task 1 converts it to
@@ -81,7 +81,7 @@ function (see the streaming test in Step 1.1).
 
 ### Step 1.1 — failing integration test
 
-- [ ] Append to `tests/max_concurrency.rs` (after `fire_path`):
+- [x] Append to `tests/max_concurrency.rs` (after `fire_path`):
 
 ```rust
 /// Like `fire_path`, but returns every response's status, `retry-after`
@@ -150,7 +150,7 @@ async fn overflow_is_a_local_429_with_retry_after() {
 }
 ```
 
-- [ ] Add the helper next to `spawn_gateway_multi`:
+- [x] Add the helper next to `spawn_gateway_multi`:
 
 ```rust
 /// Like `spawn_gateway`, but also sets the queue timeout — needed to make
@@ -180,10 +180,10 @@ async fn spawn_gateway_with_queue(
 }
 ```
 
-- [ ] Run `cargo test --test max_concurrency overflow_is_a_local_429 2>&1 | tail -20`.
+- [x] Run `cargo test --test max_concurrency overflow_is_a_local_429 2>&1 | tail -20`.
   Expected: compile error `no method named `with_queue_timeout``. That is the red.
 
-- [ ] Also append a streaming-hold test. The upstream sends headers at once,
+- [x] Also append a streaming-hold test. The upstream sends headers at once,
   then trickles chunks for `hold`; the gateway must not release the permit
   when headers arrive.
 
@@ -245,12 +245,12 @@ async fn permit_is_held_until_the_stream_is_drained() {
   drains its body. (`futures_util` is a regular dependency, so the
   integration test can use it.)
 
-- [ ] Run `cargo test --test max_concurrency permit_is_held_until_the_stream_is_drained 2>&1 | tail -20`.
+- [x] Run `cargo test --test max_concurrency permit_is_held_until_the_stream_is_drained 2>&1 | tail -20`.
   Expected: `assertion failed` with `peak` > 2 (the draft releases at header time). That is the second red.
 
 ### Step 1.2 — minimal code
 
-- [ ] In `src/lib.rs`, directly after `pub const DEFAULT_BIND`, add:
+- [x] In `src/lib.rs`, directly after `pub const DEFAULT_BIND`, add:
 
 ```rust
 /// How long `forward()` waits for a provider permit before answering with a
@@ -264,7 +264,7 @@ pub const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONCURRENCY_RETRY_AFTER_SECS: u64 = 5;
 ```
 
-- [ ] Add to `impl Provider` (create the impl block after the enum if none exists):
+- [x] Add to `impl Provider` (create the impl block after the enum if none exists):
 
 ```rust
 impl Provider {
@@ -280,7 +280,7 @@ impl Provider {
 }
 ```
 
-- [ ] In `ProviderSemaphores`, add a field and store it:
+- [x] In `ProviderSemaphores`, add a field and store it:
 
 ```rust
 struct ProviderSemaphores {
@@ -293,7 +293,7 @@ struct ProviderSemaphores {
 ```
   and in `new`: `Self { cap: max_concurrency, anthropic: ..., ... }`.
 
-- [ ] In `pub struct AppState`, after `concurrency`, add:
+- [x] In `pub struct AppState`, after `concurrency`, add:
 
 ```rust
     /// Bounded wait for a permit before the local 429 (spec §1).
@@ -302,7 +302,7 @@ struct ProviderSemaphores {
 ```
   and in `AppState::new`'s struct literal: `queue_timeout: DEFAULT_QUEUE_TIMEOUT,`.
 
-- [ ] After `with_max_concurrency`, add:
+- [x] After `with_max_concurrency`, add:
 
 ```rust
     /// Override the bounded wait for a provider permit. Ignored while the
@@ -314,11 +314,11 @@ struct ProviderSemaphores {
     }
 ```
 
-- [ ] Change `ProviderSemaphores` to hold `Arc<Semaphore>` per provider
+- [x] Change `ProviderSemaphores` to hold `Arc<Semaphore>` per provider
   (`Arc::new(Semaphore::new(max_concurrency))` in `new`, `for_provider`
   returns `Arc<Semaphore>` by clone). Owned permits need an `Arc` to hang off.
 
-- [ ] Replace the `let _permit = match &state.concurrency { ... };` block in `forward()` with:
+- [x] Replace the `let _permit = match &state.concurrency { ... };` block in `forward()` with:
 
 ```rust
     // Acquire before anything else so every exit path — success, error
@@ -361,7 +361,7 @@ struct ProviderSemaphores {
 
   with `use tokio::sync::OwnedSemaphorePermit;` at the top.
 
-- [ ] Add a helper next to `concurrency_cap_response`:
+- [x] Add a helper next to `concurrency_cap_response`:
 
 ```rust
 /// Tie a provider permit to a response stream so the slot frees when the
@@ -382,20 +382,20 @@ where
   (The closure owns `permit`; it is dropped with the closure when the
   stream is dropped. `map` is the cheapest adaptor that owns state.)
 
-- [ ] Codex translation path (`src/lib.rs` around `:1175`): change
+- [x] Codex translation path (`src/lib.rs` around `:1175`): change
   `.body(Body::from_stream(stream))` to
   `.body(Body::from_stream(hold_permit_through(stream, permit)))`.
 
-- [ ] Raw proxy streaming path (around `:1219`): change
+- [x] Raw proxy streaming path (around `:1219`): change
   `let body = Body::from_stream(stream);` to
   `let body = Body::from_stream(hold_permit_through(stream, permit));`.
 
-- [ ] Every non-streaming return path leaves `permit` unmoved; it drops at
+- [x] Every non-streaming return path leaves `permit` unmoved; it drops at
   function end as before. If the compiler reports `permit` used after move
   on some branch, that branch reached a streaming return and must not also
   fall through — fix the control flow, do not `clone` a permit.
 
-- [ ] Add a free function right after `forward()`:
+- [x] Add a free function right after `forward()`:
 
 ```rust
 /// The gateway-made overflow response (spec §3). Distinguishable from an
@@ -427,13 +427,13 @@ fn concurrency_cap_response(provider: Provider, cap: usize, waited: Duration) ->
 }
 ```
 
-- [ ] `cargo test --test max_concurrency 2>&1 | tail -20` — expected last line
+- [x] `cargo test --test max_concurrency 2>&1 | tail -20` — expected last line
   `test result: ok. 5 passed; 0 failed`.
-- [ ] `cargo clippy --all-targets -- -D warnings 2>&1 | tail -5` — expected no output before `Finished`.
+- [x] `cargo clippy --all-targets -- -D warnings 2>&1 | tail -5` — expected no output before `Finished`.
 
 ### Step 1.3 — commit
 
-- [ ] ```
+- [x] ```
   feat(concurrency): bound the permit wait and answer overflow with a local 429
 
   forward() now waits at most AppState.queue_timeout (default 30s) for a
