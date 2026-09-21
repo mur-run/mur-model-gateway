@@ -108,6 +108,8 @@ Codex CLI itself).
 | `MUR_MODEL_GATEWAY_UPSTREAM_GEMINI` | `https://generativelanguage.googleapis.com` | Gemini upstream |
 | `MUR_MODEL_GATEWAY_UPSTREAM_CODEX` | `https://chatgpt.com/backend-api/codex` | Codex OAuth (ChatGPT) upstream |
 | `MUR_MODEL_GATEWAY_COMPRESS` | off | `1` enables tool_result compression |
+| `MUR_MODEL_GATEWAY_MAX_CONCURRENCY` | unlimited | Per-provider cap on simultaneous upstream calls; `0`/garbage = unlimited (logged) |
+| `MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS` | `30` | How long a call waits for a free slot before a local `429` with `retry-after: 5` |
 
 When `~/.codex/auth.json` is in `auth_mode = "apikey"`, the gateway sends
 requests to `https://api.openai.com` instead; that host is deliberately not

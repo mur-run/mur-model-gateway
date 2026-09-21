@@ -3,6 +3,8 @@
 `mur-model-gateway install` 會寫出平台對應的 service 描述檔，並把設定烘進環境變數。
 Runtime 只讀環境變數（`MUR_MODEL_GATEWAY_TOKEN_SOURCE*` / `MUR_MODEL_GATEWAY_BIND` / `MUR_MODEL_GATEWAY_UPSTREAM*` /
 `MUR_MODEL_GATEWAY_COMPRESS`），沒有 config 檔。
+多個 MUR worker 共用一台 gateway 時，建議設 `MUR_MODEL_GATEWAY_MAX_CONCURRENCY`
+（例如 `3`）；超量的行為見 README 的表格。
 
 ## 快速開始
 

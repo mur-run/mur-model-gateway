@@ -647,14 +647,14 @@ async fn queue_timeout_is_configurable() {
 
 ## Task 4 — Docs
 
-- [ ] `README.md`: after the `MUR_MODEL_GATEWAY_COMPRESS` row, add:
+- [x] `README.md`: after the `MUR_MODEL_GATEWAY_COMPRESS` row, add:
 
 ```
 | `MUR_MODEL_GATEWAY_MAX_CONCURRENCY` | unlimited | Per-provider cap on simultaneous upstream calls; `0`/garbage = unlimited (logged) |
 | `MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS` | `30` | How long a call waits for a free slot before a local `429` with `retry-after: 5` |
 ```
 
-- [ ] `docs/install.md`: after line 6's sentence ending `— there is no config file.`, add on a new line:
+- [x] `docs/install.md`: after line 6's sentence ending `— there is no config file.`, add on a new line:
 
 ```
 A fleet of MUR workers sharing one gateway should set
@@ -662,7 +662,7 @@ A fleet of MUR workers sharing one gateway should set
 overflow behaviour.
 ```
 
-- [ ] Commit:
+- [x] Commit:
   ```
   docs(concurrency): document the cap and queue-timeout variables
   ```
