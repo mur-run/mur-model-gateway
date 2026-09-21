@@ -99,11 +99,8 @@ fn error_body_never_contains_the_token() {
 #[test]
 fn the_fix_tells_an_already_logged_in_user_to_log_out_first() {
     for (expired, retried) in [(true, false), (false, false), (true, true)] {
-        let b = mur_model_gateway::anthropic_auth_error_body(
-            &TokenSource::Keychain,
-            expired,
-            retried,
-        );
+        let b =
+            mur_model_gateway::anthropic_auth_error_body(&TokenSource::Keychain, expired, retried);
         let out = b
             .find("claude auth logout")
             .unwrap_or_else(|| panic!("names the logout: {b}"));

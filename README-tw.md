@@ -95,6 +95,8 @@ Completions 的 OpenAI client 也能用到 ChatGPT 訂閱：把 model registry �
 | `MUR_MODEL_GATEWAY_UPSTREAM_GEMINI` | `https://generativelanguage.googleapis.com` | Gemini 上游 |
 | `MUR_MODEL_GATEWAY_UPSTREAM_CODEX` | `https://chatgpt.com/backend-api/codex` | Codex 上游 |
 | `MUR_MODEL_GATEWAY_COMPRESS` | 關 | `1` 啟用 tool_result 壓縮 |
+| `MUR_MODEL_GATEWAY_MAX_CONCURRENCY` | 不限 | 每家供應商同時對上游的呼叫上限；`0` 或亂填＝不限（會記 log） |
+| `MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS` | `30` | 等空位多久才回本地 `429`（帶 `retry-after: 5`） |
 
 ## 資源用量與規模
 

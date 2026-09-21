@@ -4,6 +4,9 @@
 configuration into environment variables. The runtime reads environment variables only
 (`MUR_MODEL_GATEWAY_TOKEN_SOURCE*` / `MUR_MODEL_GATEWAY_BIND` / `MUR_MODEL_GATEWAY_UPSTREAM*` /
 `MUR_MODEL_GATEWAY_COMPRESS`) — there is no config file.
+A fleet of MUR workers sharing one gateway should set
+`MUR_MODEL_GATEWAY_MAX_CONCURRENCY` (e.g. `3`); see the README table for the
+overflow behaviour.
 
 ## Quick start
 

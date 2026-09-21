@@ -30,8 +30,19 @@ use axum::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8088";
+
+/// How long `forward()` waits for a provider permit before answering with a
+/// local 429 (spec §2). Matches mur-core's retry `max_delay`; anything longer
+/// and the fleet step has already timed out somewhere else.
+pub const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `retry-after` value on the local 429. Fixed, not measured: a permit
+/// usually frees within seconds and mur's full-jitter backoff spreads the
+/// retries on its own (spec §2).
+const CONCURRENCY_RETRY_AFTER_SECS: u64 = 5;
 pub const DEFAULT_UPSTREAM_ANTHROPIC: &str = "https://api.anthropic.com";
 pub const DEFAULT_UPSTREAM_OPENAI: &str = "https://api.openai.com";
 pub const DEFAULT_UPSTREAM_GEMINI: &str = "https://generativelanguage.googleapis.com";
@@ -60,6 +71,53 @@ pub enum Provider {
     OpenAI,
     Gemini,
     Codex,
+}
+
+impl Provider {
+    /// Lower-case wire name, used in the local 429 body and logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAI => "openai",
+            Provider::Gemini => "gemini",
+            Provider::Codex => "codex",
+        }
+    }
+}
+
+/// One semaphore per provider, each sized to the same cap. Per-provider
+/// (not one shared semaphore) so a burst against Anthropic can't starve a
+/// concurrent Codex call of its own headroom — the whole point of the cap
+/// is per-provider fairness, not a single global gate.
+struct ProviderSemaphores {
+    cap: usize,
+    anthropic: Arc<Semaphore>,
+    openai: Arc<Semaphore>,
+    gemini: Arc<Semaphore>,
+    codex: Arc<Semaphore>,
+}
+
+impl ProviderSemaphores {
+    fn new(max_concurrency: usize) -> Self {
+        Self {
+            cap: max_concurrency,
+            anthropic: Arc::new(Semaphore::new(max_concurrency)),
+            openai: Arc::new(Semaphore::new(max_concurrency)),
+            gemini: Arc::new(Semaphore::new(max_concurrency)),
+            codex: Arc::new(Semaphore::new(max_concurrency)),
+        }
+    }
+
+    /// Cloned `Arc`, not a borrow: permits are acquired owned so they can be
+    /// moved into a response stream and outlive `forward()`.
+    fn for_provider(&self, provider: Provider) -> Arc<Semaphore> {
+        match provider {
+            Provider::Anthropic => Arc::clone(&self.anthropic),
+            Provider::OpenAI => Arc::clone(&self.openai),
+            Provider::Gemini => Arc::clone(&self.gemini),
+            Provider::Codex => Arc::clone(&self.codex),
+        }
+    }
 }
 
 /// Map a request path to its provider. Falls back to Anthropic for unrecognised paths.
@@ -291,6 +349,16 @@ pub struct AppState {
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
     /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
+    /// Cross-process upstream concurrency cap (see module docs on
+    /// `ProviderSemaphores`). `None` (the default) is unlimited — today's
+    /// behaviour for every deployment that never calls
+    /// `with_max_concurrency`. `Arc` because `AppState` is `Clone` (one
+    /// instance per request) but the semaphore state must be shared.
+    concurrency: Option<Arc<ProviderSemaphores>>,
+
+    /// Bounded wait for a permit before the local 429 (spec §1).
+    /// Only consulted when `concurrency` is `Some`.
+    queue_timeout: Duration,
 }
 
 impl AppState {
@@ -332,6 +400,8 @@ impl AppState {
             token_source_codex: TokenSource::Disabled,
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
+            concurrency: None,
+            queue_timeout: DEFAULT_QUEUE_TIMEOUT,
         })
     }
 
@@ -366,6 +436,24 @@ impl AppState {
     /// Override the Codex token source. Used by tests.
     pub fn with_token_source_codex(mut self, ts: TokenSource) -> Self {
         self.token_source_codex = ts;
+        self
+    }
+
+    /// Cap simultaneous upstream calls per provider at `max_concurrency`,
+    /// process-wide, across every caller sharing this `AppState`/router.
+    /// See module docs on `ProviderSemaphores` for why this is per-provider
+    /// rather than one shared gate, and why it lives here rather than in
+    /// mur-core's per-process rate limiter.
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.concurrency = Some(Arc::new(ProviderSemaphores::new(max_concurrency)));
+        self
+    }
+
+    /// Override the bounded wait for a provider permit. Ignored while the
+    /// cap is unset. Production reads this from
+    /// `MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS`; tests set it directly.
+    pub fn with_queue_timeout(mut self, queue_timeout: Duration) -> Self {
+        self.queue_timeout = queue_timeout;
         self
     }
 
@@ -570,6 +658,49 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .unwrap_or("/");
     let path_only = parts.uri.path();
     let provider = detect_provider(path_only);
+
+    // Acquire before anything else so every exit path — success, error
+    // returns via `?`, and the retry branches further down — happens while
+    // still holding it.
+    //
+    // Owned, not borrowed: on streaming paths the permit is moved into the
+    // response body below and released when the stream ends, not when this
+    // function returns. Headers arrive long before the last token, and the
+    // upstream connection is open for all of it — that is the thing the
+    // cap is counting.
+    //
+    // The wait is bounded: past `queue_timeout` we answer with a local 429
+    // rather than leave the caller hanging until *its* timeout. The runtime
+    // parses our `retry-after` into `LlmError::RateLimit(Some(delay))`, clamps
+    // it at 120s (`llm::RETRY_AFTER_MAX`), and sleeps exactly that before
+    // retrying, up to `MAX_RATE_LIMIT_RETRIES` (3) attempts — so the existing
+    // caller chain handles this without changes.
+    //
+    // True as of mur-agent-runtime 2.88.0. Before that the header was dropped
+    // on the floor and the runtime used its own exponential backoff, so the
+    // arithmetic below does not hold against an older runtime.
+    let permit: Option<OwnedSemaphorePermit> = match &state.concurrency {
+        Some(sems) => {
+            let sem = sems.for_provider(provider);
+            match tokio::time::timeout(state.queue_timeout, sem.acquire_owned()).await {
+                Ok(permit) => Some(permit.context("provider concurrency semaphore closed")?),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        provider = provider.name(),
+                        cap = sems.cap,
+                        waited_secs = state.queue_timeout.as_secs(),
+                        "concurrency cap: permit not free in time, answering 429"
+                    );
+                    return Ok(concurrency_cap_response(
+                        provider,
+                        sems.cap,
+                        state.queue_timeout,
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
 
     let translating = codex::should_translate(path_only);
 
@@ -1109,7 +1240,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             builder = builder.header(name, value);
         }
         return builder
-            .body(Body::from_stream(stream))
+            .body(Body::from_stream(hold_permit_through(stream, permit)))
             .context("build translated stream");
     }
 
@@ -1153,13 +1284,58 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     );
 
     let stream = upstream_resp.bytes_stream();
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(hold_permit_through(stream, permit));
 
     let mut builder = Response::builder().status(status.as_u16());
     if let Some(h) = builder.headers_mut() {
         *h = response_headers;
     }
     builder.body(body).context("build response")
+}
+
+/// Tie a provider permit to a response stream so the slot frees when the
+/// body finishes (EOF, error, or client drop), not when headers go out.
+/// `None` (cap disabled) is a no-op wrapper.
+fn hold_permit_through<S>(
+    stream: S,
+    permit: Option<OwnedSemaphorePermit>,
+) -> impl futures_util::Stream<Item = S::Item>
+where
+    S: futures_util::Stream,
+{
+    use futures_util::StreamExt;
+    stream.map(move |item| {
+        let _held = &permit;
+        item
+    })
+}
+
+/// The gateway-made overflow response (spec §3). Distinguishable from an
+/// upstream 429 by `error.type`, and self-describing in the message so a
+/// human reading a fleet log does not go looking at the provider's quota.
+fn concurrency_cap_response(provider: Provider, cap: usize, waited: Duration) -> Response<Body> {
+    let waited_secs = waited.as_secs();
+    let body = serde_json::json!({
+        "error": {
+            "type": "gateway_concurrency_cap",
+            "message": format!(
+                "mur-model-gateway: {} concurrency cap ({cap}) held for {waited_secs}s; not an upstream rate limit",
+                provider.name()
+            ),
+            "provider": provider.name(),
+            "cap": cap,
+            "waited_secs": waited_secs,
+        }
+    });
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            ("retry-after", CONCURRENCY_RETRY_AFTER_SECS.to_string()),
+            ("content-type", "application/json".to_string()),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// Whether the Codex 401 fallback is allowed to attempt a refresh at all.
