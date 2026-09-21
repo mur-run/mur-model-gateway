@@ -600,7 +600,7 @@ fn parse_queue_timeout(raw: Option<&str>) -> Duration {
 
 ### Step 3.1 — failing test
 
-- [ ] Append:
+- [x] Append:
 
 ```rust
 /// Spec §2: the wait is the configured timeout, not a hard-coded one. With
@@ -625,17 +625,17 @@ async fn queue_timeout_is_configurable() {
 }
 ```
 
-- [ ] `cargo test --test max_concurrency queue_timeout_is_configurable 2>&1 | tail -5`.
+- [x] `cargo test --test max_concurrency queue_timeout_is_configurable 2>&1 | tail -5`.
   Expected: passes immediately (Task 1 already honours the field). Record
   that in the commit body — this test guards against a future hard-coded
   timeout, which is why it exists even though it is green on arrival.
-- [ ] Temporarily change `state.queue_timeout` in `forward()`'s `timeout(...)`
+- [x] Temporarily change `state.queue_timeout` in `forward()`'s `timeout(...)`
   call to `Duration::from_millis(100)`, rerun: expected 1 failed. Revert.
   Rerun: expected `6 passed`.
 
 ### Step 3.2 — commit
 
-- [ ] ```
+- [x] ```
   test(concurrency): pin the queue timeout to the configured value
 
   Green on arrival; proven meaningful by hard-coding 100ms in forward()

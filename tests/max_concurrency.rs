@@ -388,3 +388,26 @@ async fn permit_is_held_until_the_stream_is_drained() {
         "streaming responses must hold the permit until the body ends, not until headers are sent"
     );
 }
+
+/// Spec §2: the wait is the configured timeout, not a hard-coded one. With
+/// a 1s upstream hold, cap 1, and a 2s queue timeout, the second caller
+/// must wait its turn and succeed — no 429 at all.
+#[tokio::test]
+async fn queue_timeout_is_configurable() {
+    let (upstream, peak) = spawn_upstream(Duration::from_millis(1000)).await;
+    let gw = spawn_gateway_with_queue(&upstream, Some(1), Duration::from_secs(2)).await;
+
+    let results = fire_collect(&gw, 2).await;
+
+    assert!(
+        results
+            .iter()
+            .all(|(s, _, _)| *s != reqwest::StatusCode::TOO_MANY_REQUESTS),
+        "a 2s queue must outlast a 1s hold: {results:?}"
+    );
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "cap 1 must still serialise the two calls"
+    );
+}
