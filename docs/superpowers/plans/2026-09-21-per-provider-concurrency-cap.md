@@ -671,13 +671,13 @@ overflow behaviour.
 
 ## Task 5 — Full verification and PR
 
-- [ ] `cargo fmt --check` — no output.
-- [ ] `cargo clippy --all-targets -- -D warnings 2>&1 | tail -3` — clean.
-- [ ] `cargo test 2>&1 | grep -E 'test result|FAILED|panicked'` — every line
+- [x] `cargo fmt --check` — no output.
+- [x] `cargo clippy --all-targets -- -D warnings 2>&1 | tail -3` — clean.
+- [x] `cargo test 2>&1 | grep -E 'test result|FAILED|panicked'` — every line
   `test result: ok.`; total across all binaries includes the 5
   `max_concurrency` tests and 7 `concurrency_env` tests.
-- [ ] `git push -u origin feat/per-provider-concurrency-cap`
-- [ ] `gh pr create --base main --title "feat(concurrency): per-provider upstream cap with bounded queue and local 429"`
+- [x] `git push -u origin feat/per-provider-concurrency-cap`
+- [x] `gh pr create --base main --title "feat(concurrency): per-provider upstream cap with bounded queue and local 429"`
   with a body summarising spec §1–§3 and ending in its own line
   `Generated with [MUR](https://app.mur.run/products/mur)`.
 
