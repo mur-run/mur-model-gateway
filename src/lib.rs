@@ -670,9 +670,15 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // cap is counting.
     //
     // The wait is bounded: past `queue_timeout` we answer with a local 429
-    // rather than leave the caller hanging until *its* timeout. mur-core
-    // classifies 429 as retry-then-advance and reads `retry-after`, so the
-    // existing caller chain handles this without changes.
+    // rather than leave the caller hanging until *its* timeout. The runtime
+    // parses our `retry-after` into `LlmError::RateLimit(Some(delay))`, clamps
+    // it at 120s (`llm::RETRY_AFTER_MAX`), and sleeps exactly that before
+    // retrying, up to `MAX_RATE_LIMIT_RETRIES` (3) attempts — so the existing
+    // caller chain handles this without changes.
+    //
+    // True as of mur-agent-runtime 2.88.0. Before that the header was dropped
+    // on the floor and the runtime used its own exponential backoff, so the
+    // arithmetic below does not hold against an older runtime.
     let permit: Option<OwnedSemaphorePermit> = match &state.concurrency {
         Some(sems) => {
             let sem = sems.for_provider(provider);
