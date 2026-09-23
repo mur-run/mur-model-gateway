@@ -108,6 +108,7 @@ Codex CLI itself).
 | `MUR_MODEL_GATEWAY_UPSTREAM_GEMINI` | `https://generativelanguage.googleapis.com` | Gemini upstream |
 | `MUR_MODEL_GATEWAY_UPSTREAM_CODEX` | `https://chatgpt.com/backend-api/codex` | Codex OAuth (ChatGPT) upstream |
 | `MUR_MODEL_GATEWAY_COMPRESS` | off | `1` enables tool_result compression |
+| `MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE` | off | `1` runs one `claude -p` when the stored Claude Code OAuth token is about to expire, so agents keep working with no Claude Code session open (checked every 5 min; one small haiku request per 8h) |
 | `MUR_MODEL_GATEWAY_MAX_CONCURRENCY` | unlimited | Per-provider cap on simultaneous upstream calls; `0`/garbage = unlimited (logged) |
 | `MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS` | `30` | How long a call waits for a free slot before a local `429` with `retry-after: 5` |
 
