@@ -171,6 +171,7 @@ async fn serve() -> anyhow::Result<()> {
         &std::env::var("MUR_MODEL_GATEWAY_TOKEN_SOURCE").unwrap_or_else(|_| "keychain".to_string()),
     )
     .context("invalid MUR_MODEL_GATEWAY_TOKEN_SOURCE")?;
+    mur_model_gateway::oauth_keepalive::spawn_if_enabled(token_source.clone());
 
     let mut state = AppState::new(
         &upstream_anthropic,

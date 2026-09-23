@@ -113,3 +113,24 @@ fn the_fix_tells_an_already_logged_in_user_to_log_out_first() {
         );
     }
 }
+
+/// A plain expiry is the routine 8-hour one: the cheap fix is to let Claude
+/// Code refresh it, not to log out. Only that case should say so — a revoked
+/// or already-retried credential will not be fixed by a refresh.
+#[test]
+fn an_expired_credential_names_the_refresh_before_the_relogin() {
+    let b = mur_model_gateway::anthropic_auth_error_body(&TokenSource::Keychain, true, false);
+    let refresh = b
+        .find("MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=1")
+        .unwrap_or_else(|| panic!("names the keepalive: {b}"));
+    let relogin = b.find("claude auth logout").expect("relogin still named");
+    assert!(refresh < relogin, "cheap fix first: {b}");
+    for (expired, retried) in [(false, false), (true, true)] {
+        let b =
+            mur_model_gateway::anthropic_auth_error_body(&TokenSource::Keychain, expired, retried);
+        assert!(
+            !b.contains("KEEPALIVE"),
+            "refresh cannot fix this case: {b}"
+        );
+    }
+}

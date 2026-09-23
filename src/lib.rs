@@ -17,6 +17,7 @@ pub mod compress;
 pub mod disguise;
 pub mod install;
 pub mod keychain;
+pub mod oauth_keepalive;
 pub mod translate;
 
 use anyhow::Context;
@@ -1444,9 +1445,22 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool, retried: b
     } else {
         Ok(None)
     };
+    // A plain expiry is the routine 8-hour one, and any Claude Code request
+    // refreshes it — cheaper than a relogin. Not said for the other two
+    // cases: a refresh cannot rescue a revoked or already-retried credential.
+    let refresh_hint = if expired && !retried {
+        format!(
+            "This is the routine expiry: run any `claude` request once and \
+             Claude Code renews the token (set {}=1 on the gateway to do \
+             this automatically). If that does not help: ",
+            oauth_keepalive::ENV_VAR
+        )
+    } else {
+        String::new()
+    };
     format!(
         "{what} — credential: {}. \
-         Fix: run `/login anthropic` in murmur, or `claude auth logout` \
+         {refresh_hint}Fix: run `/login anthropic` in murmur, or `claude auth logout` \
          then `claude auth login` — on a CLI that still thinks it is signed \
          in, `login` alone reports \"already authenticated\" and leaves the \
          stale credential in place.",
