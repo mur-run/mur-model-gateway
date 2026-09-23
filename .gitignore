@@ -11,3 +11,4 @@ secrets/
 .tokensave
 src/disguise/disguise_impl.rs
 src/codex/codex_impl.rs
+install-impl.sh
