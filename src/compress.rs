@@ -473,6 +473,41 @@ pub fn has_retrieve_marker(text: &str) -> bool {
 /// iff at least one block was replaced; `None` means "forward the original".
 /// Sibling fields (`tool_use_id`, `is_error`, `cache_control`) survive
 /// because mutation is in place — only text payloads are swapped.
+/// Whether a tool call's output must reach the model verbatim: a file read,
+/// or a retrieval of already-archived text. Compressing a retrieval archives
+/// the original again under a new hash, so it can never be read back. Mirrors
+/// `is_own_compress_tool` in mur's Claude Code hook.
+fn is_verbatim_tool(name: &str, input: Option<&Value>) -> bool {
+    if name == "Read" || name.ends_with("mur_retrieve") {
+        return true;
+    }
+    let Some(command) = input
+        .and_then(|i| i.get("command"))
+        .and_then(|c| c.as_str())
+    else {
+        return false;
+    };
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words
+        .windows(2)
+        .any(|w| (w[0] == "mur" || w[0].ends_with("/mur")) && w[1] == "retrieve")
+}
+
+/// `tool_use` ids whose results [`is_verbatim_tool`] exempts.
+fn exempt_tool_use_ids_anthropic(messages: &[Value]) -> std::collections::HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .filter(|b| {
+            let name = b.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+            is_verbatim_tool(name, b.get("input"))
+        })
+        .filter_map(|b| b.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect()
+}
+
 fn rewrite_tool_results_anthropic(
     engine: &CompressEngine,
     min_tokens: usize,
@@ -483,12 +518,20 @@ fn rewrite_tool_results_anthropic(
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
     };
+    let exempt = exempt_tool_use_ids_anthropic(messages);
     for msg in messages.iter_mut() {
         let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
             continue;
         };
         for block in content.iter_mut() {
             if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            if block
+                .get("tool_use_id")
+                .and_then(|t| t.as_str())
+                .is_some_and(|id| exempt.contains(id))
+            {
                 continue;
             }
             let Some(inner) = block.get_mut("content") else {
@@ -757,6 +800,49 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    fn body_with_named_tool_result(name: &str, input: Value, content: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": name, "input": input}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}
+                ]}
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// A file read and a retrieval are the model asking to SEE the bytes.
+    /// Compressing them hands back a stub; compressing a retrieval re-archives
+    /// the original under a new hash, so every retrieval loops forever.
+    #[test]
+    fn never_compresses_reads_or_retrievals() {
+        let (_dir, engine) = test_engine();
+        for (name, input) in [
+            ("Read", json!({"file_path": "/x.log"})),
+            ("mcp__mur__mur_retrieve", json!({"hash": "abc"})),
+            ("Bash", json!({"command": "mur retrieve abc"})),
+            (
+                "Bash",
+                json!({"command": "/Users/x/.local/bin/mur retrieve abc | cat"}),
+            ),
+        ] {
+            let body = body_with_named_tool_result(name, input.clone(), json!(fat_log()));
+            assert!(
+                rewrite_tool_results_anthropic(&engine, 800, &body).is_none(),
+                "{name} {input} must pass through"
+            );
+        }
+        // Negative control: an ordinary Bash output still compresses.
+        let body =
+            body_with_named_tool_result("Bash", json!({"command": "cat x.log"}), json!(fat_log()));
+        assert!(rewrite_tool_results_anthropic(&engine, 800, &body).is_some());
     }
 
     #[test]
