@@ -121,7 +121,7 @@ fn the_fix_tells_an_already_logged_in_user_to_log_out_first() {
 fn an_expired_credential_names_the_refresh_before_the_relogin() {
     let b = mur_model_gateway::anthropic_auth_error_body(&TokenSource::Keychain, true, false);
     let refresh = b
-        .find("MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=1")
+        .find("MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=0")
         .unwrap_or_else(|| panic!("names the keepalive: {b}"));
     let relogin = b.find("claude auth logout").expect("relogin still named");
     assert!(refresh < relogin, "cheap fix first: {b}");

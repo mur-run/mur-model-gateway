@@ -1,4 +1,4 @@
-//! Opt-in background refresh of the Claude Code OAuth credential.
+//! Background refresh of the Claude Code OAuth credential.
 //!
 //! The gateway never redeems the refresh token itself — only Claude Code
 //! does, and only when it makes a request. With no Claude Code session for
@@ -7,8 +7,9 @@
 //! that gap: it watches the stored expiry and, once it has (nearly) passed,
 //! runs one minimal `claude -p` so Claude Code rewrites the credential.
 //!
-//! Off unless `MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=1`: each refresh spends one
-//! small model request. Bounded: at most one spawn per [`TICK`], and a spawn
+//! On by default; `MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=0` turns it off. Each
+//! refresh spends one small model request (about three haiku calls a day) —
+//! cheap next to every agent request 401ing each morning. Bounded: at most one spawn per [`TICK`], and a spawn
 //! that did not move the expiry backs off for [`FAILURE_BACKOFF`].
 
 use std::time::Duration;
@@ -27,8 +28,22 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
 /// The cheapest request that makes Claude Code check its credential.
 const CLAUDE_ARGS: [&str; 4] = ["-p", "ok", "--model", "haiku"];
 
+/// On unless the variable is explicitly `0` (or `false`/`off`/`no`).
 pub fn enabled() -> bool {
-    std::env::var(ENV_VAR).is_ok_and(|v| v == "1")
+    enabled_from(std::env::var(ENV_VAR).ok().as_deref())
+}
+
+/// Whether the install-time env explicitly opted out — the only value worth
+/// persisting into the service definition, since on is the default.
+pub fn opted_out() -> bool {
+    !enabled()
+}
+
+fn enabled_from(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
 }
 
 /// Whether a credential expiring at `expires_at_ms` should be refreshed now.
@@ -130,5 +145,16 @@ mod tests {
         assert!(!refresh_due(Some(now + lead + 1), now));
         assert!(refresh_due(Some(now + lead), now));
         assert!(refresh_due(Some(now - 1), now), "already expired is due");
+    }
+
+    #[test]
+    fn on_by_default_and_only_an_explicit_off_disables() {
+        assert!(enabled_from(None), "unset means on");
+        for on in ["1", "", "yes", "true"] {
+            assert!(enabled_from(Some(on)), "{on:?} means on");
+        }
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!enabled_from(Some(off)), "{off:?} means off");
+        }
     }
 }

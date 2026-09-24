@@ -128,9 +128,10 @@ pub fn env_pairs(opts: &InstallOpts, compress: bool) -> Result<Vec<(String, Stri
             pairs.push((key.to_string(), v.clone()));
         }
     }
-    // Captured from the install-time env, like COMPRESS (default off).
-    if crate::oauth_keepalive::enabled() {
-        pairs.push((crate::oauth_keepalive::ENV_VAR.to_string(), "1".to_string()));
+    // Keepalive is on by default, so only an install-time opt-out is worth
+    // persisting — otherwise the service would silently turn it back on.
+    if crate::oauth_keepalive::opted_out() {
+        pairs.push((crate::oauth_keepalive::ENV_VAR.to_string(), "0".to_string()));
     }
     Ok(pairs)
 }
