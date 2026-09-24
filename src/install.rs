@@ -100,7 +100,18 @@ impl InstallPaths {
 
 /// The env lines a descriptor carries: RUST_LOG plus every opted-in var.
 /// Single source of truth for all three render formats.
-pub fn env_pairs(opts: &InstallOpts, compress: bool) -> Result<Vec<(String, String)>> {
+///
+/// `keepalive_opted_out` is resolved by the caller (from
+/// [`crate::oauth_keepalive::opted_out`]) rather than read from process env
+/// in here, the same way `compress` already is — a pure function of its
+/// arguments is what lets `env_pairs_persists_an_explicit_keepalive_opt_out`
+/// below assert on it directly instead of mutating shared process env, which
+/// every other test in this module also avoids.
+pub fn env_pairs(
+    opts: &InstallOpts,
+    compress: bool,
+    keepalive_opted_out: bool,
+) -> Result<Vec<(String, String)>> {
     let mut pairs = vec![(
         "RUST_LOG".to_string(),
         "info,mur_model_gateway=debug".to_string(),
@@ -130,7 +141,7 @@ pub fn env_pairs(opts: &InstallOpts, compress: bool) -> Result<Vec<(String, Stri
     }
     // Keepalive is on by default, so only an install-time opt-out is worth
     // persisting — otherwise the service would silently turn it back on.
-    if crate::oauth_keepalive::opted_out() {
+    if keepalive_opted_out {
         pairs.push((crate::oauth_keepalive::ENV_VAR.to_string(), "0".to_string()));
     }
     Ok(pairs)
@@ -161,7 +172,7 @@ pub fn install(opts: InstallOpts) -> Result<()> {
         }
         env_on
     });
-    let env = env_pairs(&opts, compress)?;
+    let env = env_pairs(&opts, compress, crate::oauth_keepalive::opted_out())?;
 
     if cfg!(target_os = "macos") {
         let plist = render_macos_plist(&paths.binary, &log_file, &env);
@@ -469,7 +480,7 @@ mod tests {
             upstream: Some("https://api.example.com".into()),
             ..Default::default()
         };
-        let env = env_pairs(&opts, true).unwrap();
+        let env = env_pairs(&opts, true, false).unwrap();
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -490,8 +501,36 @@ mod tests {
                 bind: Some(bad.into()),
                 ..Default::default()
             };
-            assert!(env_pairs(&opts, false).is_err(), "should reject {bad:?}");
+            assert!(
+                env_pairs(&opts, false, false).is_err(),
+                "should reject {bad:?}"
+            );
         }
+    }
+
+    /// The one thing worth persisting for the keepalive: an install-time
+    /// opt-out must survive into the descriptor, since on is the default and
+    /// a service that forgot the opt-out would silently turn itself back on.
+    /// Not opting out must NOT write the var at all — an absent var and
+    /// `enabled_from(None)` both mean on, so writing `...KEEPALIVE=1` here
+    /// would just be a no-op line for every reader to wonder about.
+    #[test]
+    fn env_pairs_persists_an_explicit_keepalive_opt_out() {
+        let opts = InstallOpts::default();
+
+        let opted_out = env_pairs(&opts, false, true).unwrap();
+        assert!(
+            opted_out.contains(&(crate::oauth_keepalive::ENV_VAR.to_string(), "0".to_string())),
+            "explicit opt-out must be baked in: {opted_out:?}"
+        );
+
+        let default_on = env_pairs(&opts, false, false).unwrap();
+        assert!(
+            !default_on
+                .iter()
+                .any(|(k, _)| k == crate::oauth_keepalive::ENV_VAR),
+            "on is the default; nothing should be written for it: {default_on:?}"
+        );
     }
 
     #[test]
@@ -516,7 +555,7 @@ mod tests {
     #[test]
     fn compress_env_passes_through_when_opted_in() {
         let opts = InstallOpts::default();
-        let env = env_pairs(&opts, true).unwrap();
+        let env = env_pairs(&opts, true, false).unwrap();
 
         let p = render_macos_plist(
             &PathBuf::from("/usr/local/bin/mur-model-gateway"),
@@ -545,7 +584,7 @@ mod tests {
             token_source_codex: Some("codex".to_string()),
             ..Default::default()
         };
-        let env = env_pairs(&opts, false).unwrap();
+        let env = env_pairs(&opts, false, false).unwrap();
         assert!(
             env.iter()
                 .any(|(k, v)| k == "MUR_MODEL_GATEWAY_TOKEN_SOURCE_CODEX" && v == "codex")

@@ -9,8 +9,9 @@
 //!
 //! On by default; `MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=0` turns it off. Each
 //! refresh spends one small model request (about three haiku calls a day) —
-//! cheap next to every agent request 401ing each morning. Bounded: at most one spawn per [`TICK`], and a spawn
-//! that did not move the expiry backs off for [`FAILURE_BACKOFF`].
+//! cheap next to every agent request 401ing each morning. Bounded: at most
+//! one spawn per [`TICK`], and a spawn that did not move the expiry backs
+//! off for [`FAILURE_BACKOFF`].
 
 use std::time::Duration;
 

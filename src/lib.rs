@@ -1448,6 +1448,16 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool, retried: b
     // A plain expiry is the routine 8-hour one, and any Claude Code request
     // refreshes it — cheaper than a relogin. Not said for the other two
     // cases: a refresh cannot rescue a revoked or already-retried credential.
+    //
+    // "the gateway does this by itself" is accurate for every `source` that
+    // reaches this function, not just some of them: the only caller
+    // (`anthropic_auth_error_response`, via `forward()`) fires exclusively
+    // when `claude_owned` held — `Keychain` or `CredentialsFile` — which is
+    // the exact same set `oauth_keepalive::spawn_if_enabled` acts on. A
+    // `Codex`/`EnvVar`/`Static`/`Disabled` source never has a stored expiry
+    // to begin with, so `expired` can't be true for one and this branch
+    // can't be reached for one either. If that conjunct in `forward()` ever
+    // widens, this claim needs re-checking against the new set.
     let refresh_hint = if expired && !retried {
         format!(
             "This is the routine expiry: run any `claude` request once and \
