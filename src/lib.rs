@@ -1451,8 +1451,8 @@ pub fn anthropic_auth_error_body(source: &TokenSource, expired: bool, retried: b
     let refresh_hint = if expired && !retried {
         format!(
             "This is the routine expiry: run any `claude` request once and \
-             Claude Code renews the token (set {}=1 on the gateway to do \
-             this automatically). If that does not help: ",
+             Claude Code renews the token (the gateway does this by itself \
+             unless {}=0 is set on it). If that does not help: ",
             oauth_keepalive::ENV_VAR
         )
     } else {

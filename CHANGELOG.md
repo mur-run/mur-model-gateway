@@ -26,6 +26,13 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ### Changed
 
+- The OAuth keepalive is now **on by default**. With no Claude Code session
+  open for 8 hours the stored token aged out and every agent request 401'd
+  until someone next ran `claude`; the gateway now runs one small haiku
+  `claude -p` just before expiry (about three a day) so Claude Code renews it.
+  `MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=0` turns it off, and an install run with
+  that set keeps it off in the service definition.
+  **Upgrade:** yes, if your agents greet you with a 401 each morning.
 - An Anthropic 401 on a credential the gateway attached is now retried when —
   and only when — the credential store has since come to hold a *different*
   token. Previously the retry was gated on a delegated-refresh probe that
