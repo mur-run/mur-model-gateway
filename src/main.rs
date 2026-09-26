@@ -276,9 +276,31 @@ fn resolve_upstream(provider_var: &str, default: &str) -> String {
         .unwrap_or_else(|_| default.to_string())
 }
 
+/// Resolves on Ctrl-C or, on Unix, SIGTERM — the signal launchd
+/// (`kickstart -k`, `bootout`) and systemd send to stop the service. Without
+/// the SIGTERM arm the default action killed the process mid-request.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal");
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+                "SIGTERM"
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; Ctrl-C only");
+                std::future::pending().await
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<&str>();
+
+    let which = tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        s = term => s,
+    };
+    tracing::info!(signal = which, "shutdown signal");
 }
 
 #[cfg(test)]

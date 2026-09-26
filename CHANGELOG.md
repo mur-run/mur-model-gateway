@@ -14,6 +14,13 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ### Fixed
 
+- Stopping or restarting the service no longer cuts requests in flight. launchd
+  (`launchctl kickstart -k`, `bootout`, a `setup.sh` reinstall) and systemd stop
+  the gateway with SIGTERM, which it used to ignore, so the process died on
+  the spot. SIGTERM now goes through the same graceful shutdown as Ctrl-C:
+  requests already in flight finish, and the log shows
+  `shutdown signal signal="SIGTERM"` before the process exits.
+
 - Requests larger than 10 MiB no longer fail with `502 read incoming body`. A
   conversation carrying a few screenshots crosses that line easily, and the
   gateway — not the upstream, which takes 32 MB — was the one refusing it. The

@@ -645,10 +645,10 @@ async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Value> 
 /// headers. It does not cover a client leaving mid-stream: by then
 /// `proxied` has already been logged.
 ///
-/// Ctrl-C goes through graceful shutdown (`main.rs`), which lets in-flight
-/// requests finish, so it does not trip this. SIGTERM (a launchd stop) and
-/// SIGKILL end the process without running destructors, so they leave no
-/// line either — a restart shows up as a fresh `listening` instead.
+/// Ctrl-C and SIGTERM (a launchd/systemd stop) go through graceful shutdown
+/// (`main.rs`), which lets in-flight requests finish, so they do not trip
+/// this. SIGKILL ends the process without running destructors, so it leaves
+/// no line either — a restart shows up as a fresh `listening` instead.
 struct InFlight {
     method: axum::http::Method,
     /// Path only: a query string can carry a key.
