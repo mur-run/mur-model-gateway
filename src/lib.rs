@@ -636,8 +636,54 @@ async fn health(State(state): State<AppState>) -> axum::Json<serde_json::Value> 
     }))
 }
 
+/// Logs one line if the handler future is dropped before `forward` returns.
+///
+/// hyper drops the future when the client hangs up, so without this an
+/// abandoned request leaves nothing — no `proxied`, no `proxy error` — and
+/// "the client left" can only be reached by ruling out everything else.
+/// Covers the permit queue, credential lookup and the wait for upstream
+/// headers. It does not cover a client leaving mid-stream: by then
+/// `proxied` has already been logged.
+///
+/// Ctrl-C goes through graceful shutdown (`main.rs`), which lets in-flight
+/// requests finish, so it does not trip this. SIGTERM (a launchd stop) and
+/// SIGKILL end the process without running destructors, so they leave no
+/// line either — a restart shows up as a fresh `listening` instead.
+struct InFlight {
+    method: axum::http::Method,
+    /// Path only: a query string can carry a key.
+    path: String,
+    provider: Provider,
+    started: std::time::Instant,
+    answered: bool,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        tracing::warn!(
+            method = %self.method,
+            path = %self.path,
+            provider = %self.provider.name(),
+            waited_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "client went away before a response"
+        );
+    }
+}
+
 async fn proxy(State(state): State<AppState>, req: Request) -> Response<Body> {
-    match forward(state, req).await {
+    let mut in_flight = InFlight {
+        method: req.method().clone(),
+        path: req.uri().path().to_owned(),
+        provider: detect_provider(req.uri().path()),
+        started: std::time::Instant::now(),
+        answered: false,
+    };
+    let result = forward(state, req).await;
+    in_flight.answered = true;
+    match result {
         Ok(resp) => resp,
         Err(err) => {
             // `{err:#}` — anyhow's whole chain on one line. Plain Display

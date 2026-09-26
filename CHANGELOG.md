@@ -23,6 +23,14 @@ release is worth interrupting a working install for; the ones that are say so.
   looked transient and the client retried it ten times, all in vain.
 - `proxy error` log lines now carry the whole error chain
   (`read incoming body: length limit exceeded`), not just the outermost step.
+- A client that hangs up before the response starts now leaves one WARN line,
+  `client went away before a response`, with `method`, `path` (without the
+  query string), `provider` and `waited_ms`. Until now such a request left no
+  line at all, and "the client left" could only be reached by ruling out
+  everything else. It does not fire for a client that leaves mid-stream (that
+  request already logged `proxied`), or for a process stopped by SIGTERM or
+  SIGKILL.
+  **Upgrade:** optional — only changes what the log says.
 - The install scripts no longer report a healthy service as failed. Both
   checked the port in `MUR_MODEL_GATEWAY_BIND_PORT` (default 8088), a variable
   the gateway never reads, so `setup.sh -- --bind 127.0.0.1:9099` — the bind
