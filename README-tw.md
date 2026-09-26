@@ -55,6 +55,8 @@ mur-model-gateway uninstall
 
 從原始碼安裝的話，`./scripts/setup.sh -- --compress` 會一次做完 build、安裝與
 服務註冊。
+Apple Silicon 上用 `./scripts/install-with-omlx.sh`，會連同本機的 oMLX embedding
+一起裝好（缺 Rust / uv 會自動補；`--check` 只做前置檢查）。
 
 要還原被壓縮的 `tool_result`，client 端必須掛上 mur MCP server — `mur_retrieve`
 是它提供的。各平台細節見 [docs/install-tw.md](docs/install-tw.md)，

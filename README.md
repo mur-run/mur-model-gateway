@@ -62,6 +62,9 @@ install and the service registration in one shot. Without a checkout — no Rust
 toolchain and no signing certificate needed — `scripts/install-release.sh`
 fetches the signed, notarized release, verifies its checksum and registers the
 service instead.
+On Apple Silicon, `./scripts/install-with-omlx.sh` does the source install
+plus a local oMLX embedding server in one go (it fetches Rust / uv if missing;
+`--check` only runs the preflight).
 
 Restoring a compressed `tool_result` needs the mur MCP server attached to your
 client — that is what provides `mur_retrieve`. See

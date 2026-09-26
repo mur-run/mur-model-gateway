@@ -13,3 +13,4 @@ secrets/
 src/disguise/disguise_impl.rs
 src/codex/codex_impl.rs
 .serena/project.yml
+install-impl.sh
