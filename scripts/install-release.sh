@@ -44,8 +44,8 @@ fi
 
 # ─── platform ───────────────────────────────────────────────────────
 case "$(uname -s)" in
-  Darwin) PLATFORM=macos;  ASSET_SUFFIX=macos-universal; SHACHECK="shasum -a 256 -c" ;;
-  Linux)  PLATFORM=linux;  SHACHECK="sha256sum -c"
+  Darwin) PLATFORM=macos;  ASSET_SUFFIX=macos-universal; SHACHECK=(shasum -a 256 -c) ;;
+  Linux)  PLATFORM=linux;  SHACHECK=(sha256sum -c)
           [ "$(uname -m)" = x86_64 ] || { err "unsupported Linux arch: $(uname -m) (releases ship x86_64 only)"; exit 1; }
           ASSET_SUFFIX=linux-x86_64 ;;
   *) err "unsupported platform: $(uname -s). On Windows, download the .zip from the releases page."; exit 1 ;;
@@ -70,7 +70,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL -o "$TMP/$NAME" "$BASE/$NAME" || { err "download failed: $BASE/$NAME"; exit 1; }
 curl -fsSL -o "$TMP/$NAME.sha256" "$BASE/$NAME.sha256" || { err "checksum download failed"; exit 1; }
-( cd "$TMP" && $SHACHECK "$NAME.sha256" >/dev/null ) || { err "CHECKSUM MISMATCH — discarding $NAME, do not run it"; exit 1; }
+( cd "$TMP" && "${SHACHECK[@]}" "$NAME.sha256" >/dev/null ) || { err "CHECKSUM MISMATCH — discarding $NAME, do not run it"; exit 1; }
 ok "checksum verified"
 
 tar -xzf "$TMP/$NAME" -C "$TMP"
@@ -130,12 +130,19 @@ case "$BODY" in
     ;;
 esac
 
+case "$PLATFORM" in
+  macos) LOGS_CMD='tail -f ~/Library/Logs/mur-model-gateway/proxy.log'
+         REMOVE_CMD="launchctl bootout gui/\$(id -u)/$SERVICE_LABEL" ;;
+  linux) LOGS_CMD='journalctl --user -u mur-model-gateway.service -f'
+         REMOVE_CMD='systemctl --user disable --now mur-model-gateway.service' ;;
+esac
+
 cat <<EOF
 
 Point your client at the gateway:
   export ANTHROPIC_BASE_URL="http://$BIND_ADDR"
 
 Health : curl -s $HEALTH
-Logs   : $( [ "$PLATFORM" = macos ] && echo 'tail -f ~/Library/Logs/mur-model-gateway/proxy.log' || echo 'journalctl --user -u mur-model-gateway.service -f' )
-Remove : $( [ "$PLATFORM" = macos ] && echo "launchctl bootout gui/\$(id -u)/$SERVICE_LABEL" || echo 'systemctl --user disable --now mur-model-gateway.service' )
+Logs   : $LOGS_CMD
+Remove : $REMOVE_CMD
 EOF

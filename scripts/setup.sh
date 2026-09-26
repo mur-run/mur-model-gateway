@@ -217,6 +217,8 @@ resolve_bind
 # ─── build ──────────────────────────────────────────────────────────
 
 # ponytail: source cargo env so script works when invoked outside a login shell
+# (rustup's file, not ours — nothing for shellcheck to follow into)
+# shellcheck source=/dev/null
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 cd "$REPO_ROOT"
 if [[ "$MUSL" == 1 ]]; then

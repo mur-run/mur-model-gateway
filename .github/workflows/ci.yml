@@ -23,3 +23,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # The install scripts are what staff actually run (install-release.sh is
+  # fetched straight from main), and nothing above ever reads them.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shellcheck if the runner image lacks it
+        run: command -v shellcheck || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+      - run: shellcheck --version
+      - run: shellcheck scripts/*.sh
