@@ -20,6 +20,13 @@ release is worth interrupting a working install for; the ones that are say so.
   the spot. SIGTERM now goes through the same graceful shutdown as Ctrl-C:
   requests already in flight finish, and the log shows
   `shutdown signal signal="SIGTERM"` before the process exits.
+- The service manager now waits up to 300 s for that drain before it
+  force-kills the gateway (`ExitTimeOut` in the launchd plist,
+  `TimeoutStopSec` in both systemd units). The defaults — 20 s on launchd,
+  90 s on systemd — cut long streaming responses mid-generation. An idle
+  gateway still exits immediately; the limit only matters while requests are
+  in flight. **Upgrade:** takes effect on the next `setup.sh` / `install`,
+  which rewrites the service file.
 
 - Requests larger than 10 MiB no longer fail with `502 read incoming body`. A
   conversation carrying a few screenshots crosses that line easily, and the

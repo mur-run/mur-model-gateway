@@ -21,6 +21,11 @@ pub const SERVICE_LABEL: &str = "run.mur-model-gateway";
 pub const LINUX_SYSTEM_UNIT: &str = "/etc/systemd/system/mur-model-gateway.service";
 pub const LINUX_SYSTEM_ENV_FILE: &str = "/etc/mur-model-gateway.env";
 
+/// How long the service manager waits after SIGTERM before SIGKILL. The
+/// gateway drains in-flight requests (including long streams) on SIGTERM;
+/// launchd's default 20s and systemd's 90s would cut long generations.
+pub const SHUTDOWN_GRACE_SECS: u32 = 300;
+
 /// Install-time configuration collected from CLI flags.
 #[derive(Default)]
 pub struct InstallOpts {
@@ -365,6 +370,8 @@ pub fn render_macos_plist(binary: &Path, log_file: &Path, env: &[(String, String
     <true/>
     <key>ProcessType</key>
     <string>Background</string>
+    <key>ExitTimeOut</key>
+    <integer>{SHUTDOWN_GRACE_SECS}</integer>
     <key>StandardOutPath</key>
     <string>{log}</string>
     <key>StandardErrorPath</key>
@@ -394,6 +401,7 @@ Wants=network-online.target
 ExecStart={bin}
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec={SHUTDOWN_GRACE_SECS}
 {env_lines}StandardOutput=journal
 StandardError=journal
 
@@ -418,6 +426,7 @@ Wants=network-online.target
 ExecStart={bin}
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec={SHUTDOWN_GRACE_SECS}
 User={user}
 EnvironmentFile={envf}
 StandardOutput=journal
@@ -550,6 +559,31 @@ mod tests {
         assert!(p.contains("<key>MUR_MODEL_GATEWAY_TOKEN_SOURCE</key>"));
         assert!(p.contains("<string>file</string>"));
         assert!(!p.contains("MUR_MODEL_GATEWAY_COMPRESS"));
+    }
+
+    #[test]
+    fn service_descriptors_give_shutdown_drain_time() {
+        let secs = SHUTDOWN_GRACE_SECS;
+        assert!(secs > 90, "must outlast systemd's default stop timeout");
+        let p = render_macos_plist(
+            &PathBuf::from("/usr/local/bin/mur-model-gateway"),
+            &PathBuf::from("/tmp/proxy.log"),
+            &base_env(),
+        );
+        assert!(
+            p.contains(&format!(
+                "<key>ExitTimeOut</key>\n    <integer>{secs}</integer>"
+            )),
+            "plist lacks ExitTimeOut: {p}"
+        );
+        let u = render_linux_unit(&PathBuf::from("/x"), &base_env());
+        assert!(u.contains(&format!("TimeoutStopSec={secs}\n")), "{u}");
+        let su = render_linux_system_unit(
+            &PathBuf::from("/x"),
+            "u",
+            &PathBuf::from(LINUX_SYSTEM_ENV_FILE),
+        );
+        assert!(su.contains(&format!("TimeoutStopSec={secs}\n")), "{su}");
     }
 
     #[test]
