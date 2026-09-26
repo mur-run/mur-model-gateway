@@ -135,7 +135,7 @@ is_listening() {
   elif command -v ss >/dev/null 2>&1; then
     # ss reports /proc/comm, which the kernel caps at 15 chars. The space
     # after the port keeps :80 from matching :8088.
-    ss -tlnp 2>/dev/null | grep -q ":$BIND_PORT[[:space:]].*mur-model-gatew"
+    ss -tlnp 2>/dev/null | grep -q ":${BIND_PORT}[[:space:]].*mur-model-gatew"
   else
     (echo >"/dev/tcp/$CHECK_HOST/$BIND_PORT") 2>/dev/null
   fi
