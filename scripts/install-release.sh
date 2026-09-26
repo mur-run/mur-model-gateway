@@ -16,7 +16,12 @@ REPO=mur-run/mur-model-gateway
 BIN=mur-model-gateway
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 SERVICE_LABEL=run.mur-model-gateway
-BIND_PORT="${MUR_MODEL_GATEWAY_BIND_PORT:-8088}"
+# Where the service listens. This script runs `install` without --bind, so no
+# MUR_MODEL_GATEWAY_BIND is baked into the service and the gateway falls back
+# to its own default (DEFAULT_BIND in src/lib.rs). The health check used to
+# read MUR_MODEL_GATEWAY_BIND_PORT instead — a variable the gateway never
+# reads — so setting it only aimed the check at a port nothing listened on.
+BIND_ADDR=127.0.0.1:8088
 
 VERSION=""
 WITH_SERVICE=1
@@ -32,6 +37,10 @@ done
 log() { printf '\033[36m[install]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[32m✓\033[0m %s\n' "$*"; }
 err() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
+
+if [ -n "${MUR_MODEL_GATEWAY_BIND_PORT:-}" ] && [ "$MUR_MODEL_GATEWAY_BIND_PORT" != "${BIND_ADDR##*:}" ]; then
+  log "ignoring MUR_MODEL_GATEWAY_BIND_PORT=$MUR_MODEL_GATEWAY_BIND_PORT: a release install listens on $BIND_ADDR"
+fi
 
 # ─── platform ───────────────────────────────────────────────────────
 case "$(uname -s)" in
@@ -89,14 +98,14 @@ case "$PLATFORM" in
 esac
 
 # ─── verify ─────────────────────────────────────────────────────────
-HEALTH="http://127.0.0.1:$BIND_PORT/__mur/health"
+HEALTH="http://$BIND_ADDR/__mur/health"
 for _ in 1 2 3 4 5; do
   BODY=$(curl -fsS --max-time 5 "$HEALTH" 2>/dev/null) && break
   sleep 1
 done
 
 if [ -z "${BODY:-}" ]; then
-  err "the service did not answer on 127.0.0.1:$BIND_PORT"
+  err "the service did not answer on $BIND_ADDR"
   case "$PLATFORM" in
     macos) err "check: tail ~/Library/Logs/mur-model-gateway/proxy.log" ;;
     linux) err "check: journalctl --user -u mur-model-gateway.service" ;;
@@ -104,7 +113,7 @@ if [ -z "${BODY:-}" ]; then
   exit 1
 fi
 
-ok "listening on 127.0.0.1:$BIND_PORT"
+ok "listening on $BIND_ADDR"
 echo "  $BODY"
 echo
 case "$BODY" in
@@ -124,7 +133,7 @@ esac
 cat <<EOF
 
 Point your client at the gateway:
-  export ANTHROPIC_BASE_URL="http://127.0.0.1:$BIND_PORT"
+  export ANTHROPIC_BASE_URL="http://$BIND_ADDR"
 
 Health : curl -s $HEALTH
 Logs   : $( [ "$PLATFORM" = macos ] && echo 'tail -f ~/Library/Logs/mur-model-gateway/proxy.log' || echo 'journalctl --user -u mur-model-gateway.service -f' )

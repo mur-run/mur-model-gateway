@@ -23,6 +23,18 @@ release is worth interrupting a working install for; the ones that are say so.
   looked transient and the client retried it ten times, all in vain.
 - `proxy error` log lines now carry the whole error chain
   (`read incoming body: length limit exceeded`), not just the outermost step.
+- The install scripts no longer report a healthy service as failed. Both
+  checked the port in `MUR_MODEL_GATEWAY_BIND_PORT` (default 8088), a variable
+  the gateway never reads, so `setup.sh -- --bind 127.0.0.1:9099` — the bind
+  from the script's own usage example — started the service on 9099, waited
+  on 8088, and gave up. `setup.sh` now takes the port from `--bind`, rejecting
+  a malformed one before it builds; `install-release.sh`, which never passes
+  `--bind`, checks `127.0.0.1:8088`. Setting `MUR_MODEL_GATEWAY_BIND_PORT` now
+  prints a note and is otherwise ignored. On Linux the `ss` check also stopped
+  counting a listener on `:8088` as one on `:80`.
+  **Upgrade:** nothing to install — the fix is in the scripts, not the binary.
+  If a run with `--bind` said the service never came up, check
+  `/__mur/health` on that address; it was likely running all along.
 
 ### Changed
 

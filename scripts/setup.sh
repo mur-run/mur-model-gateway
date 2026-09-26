@@ -21,7 +21,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_PATH="$INSTALL_DIR/mur-model-gateway"
 SERVICE_LABEL="run.mur-model-gateway"
-BIND_PORT="${MUR_MODEL_GATEWAY_BIND_PORT:-8088}"
+# Listen address the post-install check looks at. Set by resolve_bind from
+# `--bind` after `--`; these are the gateway's own defaults (DEFAULT_BIND in
+# src/lib.rs) for when no --bind is given.
+BIND_ADDR=127.0.0.1:8088
+BIND_PORT=8088
+CHECK_HOST=127.0.0.1
+URL_HOST=127.0.0.1
 
 case "$(uname -s)" in
   Darwin) PLATFORM=macos ;;
@@ -70,25 +76,78 @@ start_service() {
   esac
 }
 
+# Work out where the service will listen, from the args after `--`.
+#
+# `--bind` is what `mur-model-gateway install` bakes into the service as
+# MUR_MODEL_GATEWAY_BIND (src/install.rs, env_pairs); without it the gateway
+# falls back to DEFAULT_BIND. The check used to read a separate
+# MUR_MODEL_GATEWAY_BIND_PORT instead, so the usage example above
+# (`-- --bind 127.0.0.1:9099`) got a healthy service on 9099 and a failed
+# install from a check still waiting on 8088.
+resolve_bind() {
+  local i=0 n=${#INSTALL_ARGS[@]} host
+  while (( i < n )); do
+    case "${INSTALL_ARGS[$i]}" in
+      --bind=*) BIND_ADDR="${INSTALL_ARGS[$i]#--bind=}" ;;
+      --bind)
+        if (( i + 1 >= n )); then
+          err "--bind needs a value, e.g. --bind 127.0.0.1:9099"; exit 2
+        fi
+        i=$((i + 1))
+        BIND_ADDR="${INSTALL_ARGS[$i]}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  # host:port, with IPv6 hosts bracketed ([::1]:9099) — the port is always
+  # after the last colon.
+  BIND_PORT="${BIND_ADDR##*:}"
+  host="${BIND_ADDR%:*}"
+  host="${host#\[}"
+  host="${host%\]}"
+  if [[ "$BIND_ADDR" != *:* || -z "$host" ]]; then
+    err "--bind wants host:port (e.g. 127.0.0.1:9099), got: $BIND_ADDR"; exit 2
+  fi
+  if ! [[ "$BIND_PORT" =~ ^[0-9]+$ ]] || (( 10#$BIND_PORT < 1 || 10#$BIND_PORT > 65535 )); then
+    err "--bind port must be 1-65535, got: $BIND_PORT"; exit 2
+  fi
+  BIND_PORT=$((10#$BIND_PORT))  # 080 → 80, the way ss and lsof print it
+
+  # A wildcard bind is reached through loopback.
+  case "$host" in
+    0.0.0.0) CHECK_HOST=127.0.0.1 ;;
+    ::)      CHECK_HOST=::1 ;;
+    *)       CHECK_HOST="$host" ;;
+  esac
+  if [[ "$CHECK_HOST" == *:* ]]; then URL_HOST="[$CHECK_HOST]"; else URL_HOST="$CHECK_HOST"; fi
+
+  if [[ -n "${MUR_MODEL_GATEWAY_BIND_PORT:-}" && "$MUR_MODEL_GATEWAY_BIND_PORT" != "$BIND_PORT" ]]; then
+    log "ignoring MUR_MODEL_GATEWAY_BIND_PORT=$MUR_MODEL_GATEWAY_BIND_PORT:"
+    log "  the service will listen on $URL_HOST:$BIND_PORT (change it with -- --bind)"
+  fi
+}
+
 is_listening() {
   if command -v lsof >/dev/null 2>&1; then
     # +c 0: without it lsof truncates COMMAND to 9 chars ("mur-model")
     lsof +c 0 -nP "-iTCP:$BIND_PORT" -sTCP:LISTEN 2>/dev/null | grep -q mur-model-gateway
   elif command -v ss >/dev/null 2>&1; then
-    # ss reports /proc/comm, which the kernel caps at 15 chars
-    ss -tlnp 2>/dev/null | grep -q ":$BIND_PORT.*mur-model-gatew"
+    # ss reports /proc/comm, which the kernel caps at 15 chars. The space
+    # after the port keeps :80 from matching :8088.
+    ss -tlnp 2>/dev/null | grep -q ":$BIND_PORT[[:space:]].*mur-model-gatew"
   else
-    (echo >"/dev/tcp/127.0.0.1/$BIND_PORT") 2>/dev/null
+    (echo >"/dev/tcp/$CHECK_HOST/$BIND_PORT") 2>/dev/null
   fi
 }
 
 print_post_install_help() {
   cat <<EOF
 
-mur-model-gateway is up on 127.0.0.1:$BIND_PORT.
+mur-model-gateway is up on $URL_HOST:$BIND_PORT.
 
 Add to your shell init (\$HOME/.zshenv / \$HOME/.bashrc):
-  export ANTHROPIC_BASE_URL="http://127.0.0.1:$BIND_PORT"
+  export ANTHROPIC_BASE_URL="http://$URL_HOST:$BIND_PORT"
 
 EOF
   case "$PLATFORM" in
@@ -151,6 +210,9 @@ if [[ "$ACTION" == "uninstall" ]]; then
   ok "uninstalled (binary at $INSTALL_PATH left in place)"
   exit 0
 fi
+
+# Before the build, so a bad --bind fails in a second, not after cargo.
+resolve_bind
 
 # ─── build ──────────────────────────────────────────────────────────
 
@@ -279,10 +341,10 @@ for _ in 1 2 3 4 5; do
 done
 
 if is_listening; then
-  ok "listening on 127.0.0.1:$BIND_PORT"
+  ok "listening on $URL_HOST:$BIND_PORT"
   print_post_install_help
 else
-  err "service not listening on 127.0.0.1:$BIND_PORT"
+  err "service not listening on $URL_HOST:$BIND_PORT"
   case "$PLATFORM" in
     macos) err "check: tail ~/Library/Logs/mur-model-gateway/proxy.log" ;;
     linux)
