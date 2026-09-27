@@ -18,12 +18,15 @@ set -euo pipefail
 
 REPO_URL="https://github.com/mur-run/mur-model-gateway.git"
 
-# oMLX 固定版本：/releases/latest 可能指到 rc 版，所以不用 latest。
-# SHA-256 與 GitHub release 上公布的 digest 一致。
-OMLX_VERSION="0.6.4"
-OMLX_WHEEL_NAME="omlx-${OMLX_VERSION}-cp312-cp312-macosx_15_0_universal2.whl"
-OMLX_WHEEL_URL="https://github.com/jundot/omlx/releases/download/v${OMLX_VERSION}/${OMLX_WHEEL_NAME}"
-OMLX_WHEEL_SHA256="f13d92900bf6c7e925e9a6d5525b4465c615c404ee796d328ffc5d4d379ddb0b"
+# oMLX 版本：安裝時自動抓 GitHub 上最新的「正式版」（tag 只能是 vX.Y.Z）。
+# 作者會把 rc 版標成非 prerelease，所以不用 /releases/latest，也不看 prerelease 標記。
+# SHA-256 用 release asset 公布的 digest 比對。查不到（沒網路、API 限流、沒 jq）就退回下面的備用版本。
+# MUR_OMLX_VERSION=X.Y.Z 可以釘死某一版（仍然從 API 拿 digest 驗證）。
+OMLX_REPO="jundot/omlx"
+OMLX_FALLBACK_VERSION="0.6.4"
+OMLX_FALLBACK_SHA256="f13d92900bf6c7e925e9a6d5525b4465c615c404ee796d328ffc5d4d379ddb0b"
+OMLX_VERSION="$OMLX_FALLBACK_VERSION"
+OMLX_WHEEL_NAME="" OMLX_WHEEL_URL="" OMLX_WHEEL_SHA256=""
 OMLX_PYTHON="3.12"           # wheel 是 cp312；uv 沒找到就自己下載，不用系統 Python
 OMLX_HOST="127.0.0.1"
 OMLX_PORT="8000"             # MUR 預設找 http://127.0.0.1:8000/v1
@@ -300,7 +303,7 @@ print_mode_choices() {
 
     [1] UV 版（建議）：另外裝到 ${OMLX_HOME}，由 launchd 常駐
         + 開機就啟動，不用登入桌面、不用開 app；當掉 launchd 會自己重啟
-        + 版本固定在 ${OMLX_VERSION}（驗過 SHA-256），不會因為 app 自動更新而改變行為
+        + 每次安裝自動升到最新正式版（跳過 rc/dev，驗過 SHA-256）
         - 多一份 Python 環境（約 1GB）
         - 沒有圖形介面；oMLX.app 會改用 port ${OMLX_APP_PORT}，兩個一起開會吃兩份記憶體
 
@@ -500,8 +503,49 @@ install_gateway() {
 }
 
 # ─── 4. oMLX（release wheel，獨立 venv）─────────────────────────────
+omlx_wheel_name() { echo "omlx-${1}-cp312-cp312-macosx_15_0_universal2.whl"; }
+
+# 決定要裝哪一版 oMLX，設定 OMLX_VERSION / OMLX_WHEEL_NAME / OMLX_WHEEL_URL / OMLX_WHEEL_SHA256。
+resolve_omlx_release() {
+  local want="${MUR_OMLX_VERSION:-}" json="" ver="" sha=""
+  if command -v jq >/dev/null 2>&1; then
+    json="$(curl -fsSL -m 15 "https://api.github.com/repos/${OMLX_REPO}/releases?per_page=30" 2>/dev/null || true)"
+  fi
+  if [[ -n "$json" ]]; then
+    if [[ -n "$want" ]]; then
+      ver="$want"
+    else
+      ver="$(jq -r '.[] | select(.draft|not) | .tag_name' <<<"$json" \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1 || true)"
+    fi
+    if [[ -n "$ver" ]]; then
+      sha="$(jq -r --arg t "v$ver" --arg n "$(omlx_wheel_name "$ver")" \
+        '.[] | select(.tag_name==$t) | .assets[] | select(.name==$n) | .digest // empty' <<<"$json" \
+        | sed 's/^sha256://' | head -1)"
+    fi
+  fi
+  if [[ -n "$ver" && "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+    OMLX_VERSION="$ver" OMLX_WHEEL_SHA256="$sha"
+    if [[ -n "$want" ]]; then info "oMLX 版本：${ver}（MUR_OMLX_VERSION 指定）"; else info "oMLX 版本：${ver}（GitHub 最新正式版）"; fi
+  elif [[ -n "$want" && "$want" != "$OMLX_FALLBACK_VERSION" ]]; then
+    die "找不到 oMLX ${want} 的 wheel 或 SHA-256，不安裝。"
+  else
+    OMLX_VERSION="$OMLX_FALLBACK_VERSION" OMLX_WHEEL_SHA256="$OMLX_FALLBACK_SHA256"
+    info "⚠ 查不到 oMLX 最新版本（網路、API 限流或沒有 jq），改用備用版本 ${OMLX_VERSION}"
+  fi
+  OMLX_WHEEL_NAME="$(omlx_wheel_name "$OMLX_VERSION")"
+  OMLX_WHEEL_URL="https://github.com/${OMLX_REPO}/releases/download/v${OMLX_VERSION}/${OMLX_WHEEL_NAME}"
+}
+
 install_omlx() {
-  log "安裝 oMLX $OMLX_VERSION 到 $OMLX_VENV"
+  resolve_omlx_release
+  local cur=""
+  [[ -x "$OMLX_VENV/bin/python" ]] && cur="$(uv pip show --python "$OMLX_VENV/bin/python" omlx 2>/dev/null | awk '/^Version:/{print $2}')"
+  if [[ "$cur" == "$OMLX_VERSION" ]]; then
+    info "oMLX $OMLX_VERSION 已經是最新，略過下載"
+    return 0
+  fi
+  log "安裝 oMLX $OMLX_VERSION 到 $OMLX_VENV${cur:+（原本 $cur）}"
   local wheel="$tmp_dir/$OMLX_WHEEL_NAME" got
   curl -fL --retry 3 -o "$wheel" "$OMLX_WHEEL_URL"
   got="$(shasum -a 256 "$wheel" | awk '{print $1}')"

@@ -15,6 +15,15 @@ Notes for agents working in this repo. Keep them short and factual.
 - Setting `MUR_OMLX_MODE=uv|app` skips the question. It is **required** when there is no TTY (for example `curl | sh`). Without it the script stops rather than choosing a mode.
 - In UV mode the app is moved to port **8001** so the two can run together. Expect double memory use when both have models loaded.
 
+## oMLX version
+
+- Each install resolves the newest **stable** release of `jundot/omlx` via the GitHub API (`resolve_omlx_release()`) and upgrades to it; if the venv already has that version, the download is skipped.
+- Filter by tag name (`vX.Y.Z` only). Do not trust the `prerelease` flag or `/releases/latest`: upstream shipped `v0.7.0rc1` with `prerelease: false`.
+- The wheel's SHA-256 comes from the release asset's `digest`. No valid digest means no install.
+- If the API is unreachable, rate-limited (60/h unauthenticated), or `jq` is missing, the script falls back to `OMLX_FALLBACK_VERSION` / `OMLX_FALLBACK_SHA256` (currently 0.6.4) with a warning. Bump both together when a newer version is known good.
+- `MUR_OMLX_VERSION=X.Y.Z` pins a version. An unknown version stops the install instead of silently installing something else.
+- The digest proves integrity, not compatibility. After a new oMLX release, check `/v1/embeddings` (see Gotchas); if it breaks, pin the old version with `MUR_OMLX_VERSION`.
+
 ## Shared model library
 
 - Both modes use `~/.omlx/models` (override with `MUR_MODEL_DIR`).
