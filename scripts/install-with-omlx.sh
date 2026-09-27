@@ -11,7 +11,9 @@
 #
 # 可覆寫：
 #   MUR_GATEWAY_DIR   gateway 原始碼位置（預設：在 repo 裡執行就用這份，否則 ./mur-model-gateway）
-#   MUR_OMLX_HOME     oMLX 的 venv、設定、模型、log（預設 ~/.mur/omlx，跟 oMLX.app 的 ~/.omlx 分開）
+#   MUR_OMLX_HOME     UV 版 oMLX 的 venv、設定、log（預設 ~/.mur/omlx）
+#   MUR_MODEL_DIR     共用模型庫，UV 版和 oMLX.app 都讀這裡（預設 ~/.omlx/models，就是 oMLX.app 的預設）
+#   MUR_OMLX_MODE     uv 或 app：有裝 oMLX.app 時不用問，直接用這一版（沒有終端機可以問時必填）
 set -euo pipefail
 
 REPO_URL="https://github.com/mur-run/mur-model-gateway.git"
@@ -33,7 +35,13 @@ OMLX_VENV="$OMLX_HOME/venv"
 OMLX_BIN="$OMLX_VENV/bin/omlx"
 MODEL_ID="mlx-community/Qwen3-Embedding-0.6B-8bit"
 MODEL_NAME="${MODEL_ID##*/}"
-MODEL_DIR="$OMLX_HOME/models/$MODEL_NAME"
+# 共用模型庫：UV 版用 --model-dir 指到這裡，oMLX.app 的 model_dirs 也會把它排第一。
+SHARED_MODEL_DIR="${MUR_MODEL_DIR:-$HOME/.omlx/models}"
+MODEL_DIR="$SHARED_MODEL_DIR/$MODEL_NAME"
+OLD_MODEL_DIR="$OMLX_HOME/models/$MODEL_NAME"   # 改共用之前 UV 版放模型的地方
+OMLX_APP_LOG_DIR="$HOME/.omlx/logs"
+OMLX_MODE=""                 # uv 或 app，preflight 決定
+OMLX_APP_BUNDLE=""
 LOG_DIR="$OMLX_HOME/logs"
 LAUNCH_AGENT="$HOME/Library/LaunchAgents/$OMLX_LABEL.plist"
 GUI_DOMAIN="gui/$(id -u)"
@@ -66,7 +74,7 @@ CHECK_ONLY=0
 case "${1:-}" in
   "") ;;
   --check) CHECK_ONLY=1 ;;
-  -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
   *) echo "Unknown option: ${1}（只接受 --check）" >&2; exit 2 ;;
 esac
 
@@ -180,10 +188,10 @@ stop_omlx_app() {
   local holders p on_port=0
   holders="$(lsof -nP -tiTCP:"$OMLX_PORT" -sTCP:LISTEN 2>/dev/null | sort -u | tr '\n' ' ' || true)"
   for p in $pids; do [[ " $holders " == *" $p "* ]] && on_port=1; done
-  # 設定檔還寫著 ${OMLX_PORT} 的話也要關：app 開著時改設定檔會被它寫回去。
-  [[ "$(omlx_app_settings_port)" == "$OMLX_PORT" ]] && on_port=1
+  # 設定檔要改（port 或模型庫）的話也要關：app 開著時改設定檔會被它寫回去。
+  omlx_app_settings_need_change "$OMLX_APP_PORT" 0 && on_port=1
   if [[ "$on_port" == 0 ]]; then
-    info "oMLX.app：開著（pid ${pids}），但沒占 port ${OMLX_PORT}，不用關"
+    info "oMLX.app：開著（pid ${pids}），沒占 port ${OMLX_PORT}、設定也不用改，不用關"
     return 0
   fi
   if [[ "$CHECK_ONLY" == 1 ]]; then
@@ -218,37 +226,126 @@ omlx_app_settings_port() {
   jq -r '.server.port // empty' "$OMLX_APP_SETTINGS" 2>/dev/null || true
 }
 
-# 方案 C：把 oMLX.app 的 port 從 ${OMLX_PORT} 改成 ${OMLX_APP_PORT}，重開機才不會互搶。
-# 一定要在 app 關著時改，不然 app 結束時會把舊值寫回去。
-move_omlx_app_port() {
-  local cur
-  cur="$(omlx_app_settings_port)"
-  if [[ -z "$cur" ]]; then
+# 要寫進 oMLX.app 設定檔的內容：port、共用模型庫排第一（app 下載的模型也會放這裡）；
+# $2=1 時再打開「app 啟動就開 server」（APP 版要靠它提供服務）。
+omlx_app_settings_filter() {
+  jq --argjson port "$1" --argjson auto "$2" --arg dir "$SHARED_MODEL_DIR" '
+    .server.port = $port
+    | .model.model_dirs = ([$dir] + ((.model.model_dirs // []) - [$dir]))
+    | .model.model_dir = $dir
+    | if $auto == 1 then .server.auto_start_on_launch = true else . end
+  ' "$OMLX_APP_SETTINGS"
+}
+
+omlx_app_settings_need_change() {
+  [[ -f "$OMLX_APP_SETTINGS" ]] || return 1
+  [[ "$(jq -S . "$OMLX_APP_SETTINGS")" != "$(omlx_app_settings_filter "$1" "$2" | jq -S .)" ]]
+}
+
+# 改 oMLX.app 的設定檔。一定要在 app 關著時改，不然 app 結束時會把舊值寫回去。
+# UV 版：port 讓給 UV 版，改成 ${OMLX_APP_PORT}；APP 版：port 用 ${OMLX_PORT}。兩版都共用模型庫。
+update_omlx_app_settings() {
+  local port="$1" auto="$2"
+  if [[ ! -f "$OMLX_APP_SETTINGS" ]]; then
     info "oMLX.app 設定檔：沒有（${OMLX_APP_SETTINGS}），不用改"
     return 0
   fi
-  if [[ "$cur" != "$OMLX_PORT" ]]; then
-    info "oMLX.app 設定檔：port ${cur}，沒占 ${OMLX_PORT}，不用改"
+  if ! omlx_app_settings_need_change "$port" "$auto"; then
+    info "oMLX.app 設定檔：port ${port}、模型庫 ${SHARED_MODEL_DIR}，不用改"
     return 0
   fi
   if [[ "$CHECK_ONLY" == 1 ]]; then
-    info "oMLX.app 設定檔：port ${cur}，正式安裝時會改成 ${OMLX_APP_PORT}"
+    info "oMLX.app 設定檔：正式安裝時會改成 port ${port}、模型庫 ${SHARED_MODEL_DIR} 排第一"
     return 0
   fi
-  [[ -z "$(omlx_app_pids)" ]] || die "oMLX.app 還開著，不能改它的設定檔。請先結束 app 再重跑。"
+  if [[ -n "$(omlx_app_pids)" ]]; then
+    if [[ "$OMLX_MODE" == app ]]; then
+      info "oMLX.app 設定檔：app 開著，等安裝後段關掉 app 再改"
+      return 0
+    fi
+    die "oMLX.app 還開著，不能改它的設定檔。請先結束 app 再重跑。"
+  fi
   local backup tmp
   backup="${OMLX_APP_SETTINGS}.bak-$(date +%Y%m%d-%H%M%S)"
   cp -p "$OMLX_APP_SETTINGS" "$backup"
   tmp="$(mktemp "${OMLX_APP_SETTINGS}.XXXXXX")"
-  jq --argjson port "$OMLX_APP_PORT" '.server.port = $port' "$OMLX_APP_SETTINGS" > "$tmp" \
-    && [[ "$(jq -r '.server.port' "$tmp")" == "$OMLX_APP_PORT" ]] \
+  omlx_app_settings_filter "$port" "$auto" > "$tmp" \
+    && [[ "$(jq -r '.server.port' "$tmp")" == "$port" ]] \
+    && [[ "$(jq -r '.model.model_dirs[0]' "$tmp")" == "$SHARED_MODEL_DIR" ]] \
     || { rm -f "$tmp"; die "改不了 ${OMLX_APP_SETTINGS}，原檔沒動。"; }
   chmod "$(stat -f '%Lp' "$OMLX_APP_SETTINGS")" "$tmp"
   mv "$tmp" "$OMLX_APP_SETTINGS"
-  info "oMLX.app 設定檔：port ${OMLX_PORT} → ${OMLX_APP_PORT}（備份：${backup}）"
-  if [[ "${OMLX_APP_WAS_STOPPED:-0}" == 1 ]]; then
+  info "oMLX.app 設定檔：port ${port}、模型庫 ${SHARED_MODEL_DIR}（備份：${backup}）"
+}
+
+# UV 版專用：port 讓出來之後，原本開著的 app 再打開。
+move_omlx_app_port() {
+  update_omlx_app_settings "$OMLX_APP_PORT" 0
+  if [[ "$CHECK_ONLY" == 0 && "${OMLX_APP_WAS_STOPPED:-0}" == 1 ]]; then
     open -a oMLX >/dev/null 2>&1 && info "oMLX.app：已重新打開（改用 port ${OMLX_APP_PORT}）" || true
   fi
+}
+
+find_omlx_app() {
+  local d
+  for d in /Applications/oMLX.app "$HOME/Applications/oMLX.app"; do
+    if [[ -d "$d" ]]; then echo "$d"; return 0; fi
+  done
+  return 0
+}
+
+print_mode_choices() {
+  cat <<EOF
+    偵測到 oMLX.app（${OMLX_APP_BUNDLE}）。MUR 要一個 oMLX 在 ${OMLX_HOST}:${OMLX_PORT} 提供 embedding，請選一個：
+
+    [1] UV 版（建議）：另外裝到 ${OMLX_HOME}，由 launchd 常駐
+        + 開機就啟動，不用登入桌面、不用開 app；當掉 launchd 會自己重啟
+        + 版本固定在 ${OMLX_VERSION}（驗過 SHA-256），不會因為 app 自動更新而改變行為
+        - 多一份 Python 環境（約 1GB）
+        - 沒有圖形介面；oMLX.app 會改用 port ${OMLX_APP_PORT}，兩個一起開會吃兩份記憶體
+
+    [2] APP 版：直接用這個 oMLX.app
+        + 不多裝東西，只有一份 oMLX；有圖形介面可以管模型、看狀態
+        - 要登入桌面、app 開著才有服務，結束 app，MUR 的 embedding 就斷了
+        - app 自動更新，版本不固定
+        - 會把 app 的 port 設成 ${OMLX_PORT}、打開「啟動時開 server」，並加進登入項目
+        - 如果之前裝過 UV 版服務（${OMLX_LABEL}），會把它停掉
+
+    兩版的模型庫都是 ${SHARED_MODEL_DIR}，下載一次兩邊都看得到。
+EOF
+}
+
+choose_omlx_mode() {
+  OMLX_APP_BUNDLE="$(find_omlx_app)"
+  if [[ -z "$OMLX_APP_BUNDLE" ]]; then
+    OMLX_MODE=uv
+    info "oMLX.app：沒安裝，用 UV 版"
+    return 0
+  fi
+  case "${MUR_OMLX_MODE:-}" in
+    uv|app) OMLX_MODE="$MUR_OMLX_MODE"; info "oMLX：用 ${OMLX_MODE} 版（MUR_OMLX_MODE）"; return 0 ;;
+    "") ;;
+    *) die "MUR_OMLX_MODE 只能是 uv 或 app，拿到：${MUR_OMLX_MODE}" ;;
+  esac
+  print_mode_choices
+  if [[ "$CHECK_ONLY" == 1 ]]; then
+    OMLX_MODE=uv
+    info "--check：先照 UV 版檢查，正式安裝時會問你（或用 MUR_OMLX_MODE=app 檢查 APP 版）"
+    return 0
+  fi
+  { : </dev/tty; } 2>/dev/null \
+    || die "偵測到 oMLX.app，但沒有終端機可以問。請用 MUR_OMLX_MODE=uv 或 MUR_OMLX_MODE=app 指定。"
+  local ans
+  while :; do
+    printf '    要用哪一版？輸入 1 或 2（直接 Enter = 1）：' >/dev/tty
+    read -r ans </dev/tty || die "讀不到輸入。請用 MUR_OMLX_MODE=uv 或 MUR_OMLX_MODE=app 指定。"
+    case "$ans" in
+      ""|1|uv|UV) OMLX_MODE=uv; break ;;
+      2|app|APP)  OMLX_MODE=app; break ;;
+      *) echo "    請輸入 1 或 2" >/dev/tty ;;
+    esac
+  done
+  info "選擇：${OMLX_MODE} 版"
 }
 
 preflight() {
@@ -303,18 +400,38 @@ preflight() {
     info "uv：沒有，稍後會用官方安裝器裝到 ~/.local/bin"
   fi
 
-  OMLX_APP_WILL_STOP=0
-  stop_omlx_app
-  move_omlx_app_port
+  command -v jq >/dev/null 2>&1 || die "找不到 jq（macOS 15 內建 /usr/bin/jq）。"
 
+  choose_omlx_mode
+  OMLX_APP_WILL_STOP=0
+  if [[ "$OMLX_MODE" == uv ]]; then
+    stop_omlx_app
+    move_omlx_app_port
+  else
+    [[ -f "$OMLX_APP_SETTINGS" ]] \
+      || die "找不到 ${OMLX_APP_SETTINGS}：oMLX.app 還沒開過。請先打開一次 oMLX.app 再重跑。"
+    update_omlx_app_settings "$OMLX_PORT" 1
+  fi
+
+  local app_on_port=0 p listeners
+  listeners=" $(lsof -nP -tiTCP:"$OMLX_PORT" -sTCP:LISTEN 2>/dev/null | tr '\n' ' ' || true) "
+  for p in $(omlx_app_pids); do
+    [[ "$listeners" == *" $p "* ]] && app_on_port=1
+  done
   if [[ "$OMLX_APP_WILL_STOP" == 1 ]] && port_listening; then
     info "port ${OMLX_PORT}：oMLX.app 在用，正式安裝關掉它之後就會空出來"
+  elif [[ "$OMLX_MODE" == app && "$app_on_port" == 1 ]]; then
+    info "port ${OMLX_PORT}：oMLX.app 在用，APP 版就是要它"
   elif port_listening; then
     local ours holders
     ours="$(service_pid)"
     holders="$(lsof -nP -tiTCP:"$OMLX_PORT" -sTCP:LISTEN 2>/dev/null | sort -u | tr '\n' ' ' || true)"
     if [[ -n "$ours" && ( -z "$holders" || " $holders " == *" $ours "* ) ]]; then
-      info "port ${OMLX_PORT}：上次安裝的 $OMLX_LABEL 在用，稍後會換成新的"
+      if [[ "$OMLX_MODE" == app ]]; then
+        info "port ${OMLX_PORT}：上次安裝的 $OMLX_LABEL 在用，稍後會停掉它，換 oMLX.app"
+      else
+        info "port ${OMLX_PORT}：上次安裝的 $OMLX_LABEL 在用，稍後會換成新的"
+      fi
     else
       {
         echo
@@ -368,7 +485,12 @@ install_gateway() {
   log "準備 gateway 原始碼：$GATEWAY_SRC"
   if [[ -e "$GATEWAY_SRC" ]]; then
     [[ -d "$GATEWAY_SRC/.git" ]] || die "$GATEWAY_SRC 已存在，但不是 Git repository。"
-    git -C "$GATEWAY_SRC" pull --ff-only
+    if [[ -n "$(git -C "$GATEWAY_SRC" status --porcelain --untracked-files=no)" ]]; then
+      info "⚠ $GATEWAY_SRC 有未 commit 的修改，略過 git pull，沿用目前的原始碼。"
+    else
+      git -C "$GATEWAY_SRC" pull --ff-only --no-rebase \
+        || info "⚠ git pull 失敗，沿用目前的原始碼繼續安裝。"
+    fi
   else
     git clone "$REPO_URL" "$GATEWAY_SRC"
   fi
@@ -395,10 +517,74 @@ install_omlx() {
 }
 
 download_model() {
-  log "下載模型 $MODEL_ID"
-  [[ -x "$OMLX_VENV/bin/hf" ]] || die "找不到 $OMLX_VENV/bin/hf（應該隨 oMLX 的 huggingface-hub 一起裝好）。"
+  log "下載模型 $MODEL_ID 到共用模型庫 $SHARED_MODEL_DIR"
+  mkdir -p "$SHARED_MODEL_DIR"
+  # 以前 UV 版的模型放在自己的目錄；共用模型庫還沒有的話直接搬過去，省得重下載。
+  if [[ "$OLD_MODEL_DIR" != "$MODEL_DIR" && -d "$OLD_MODEL_DIR" && ! -e "$MODEL_DIR" ]]; then
+    mv "$OLD_MODEL_DIR" "$MODEL_DIR"
+    info "已把 $OLD_MODEL_DIR 搬到 $MODEL_DIR"
+  fi
   mkdir -p "$MODEL_DIR"
-  "$OMLX_VENV/bin/hf" download "$MODEL_ID" --local-dir "$MODEL_DIR"
+  if [[ "$OMLX_MODE" == uv ]]; then
+    [[ -x "$OMLX_VENV/bin/hf" ]] || die "找不到 $OMLX_VENV/bin/hf（應該隨 oMLX 的 huggingface-hub 一起裝好）。"
+    "$OMLX_VENV/bin/hf" download "$MODEL_ID" --local-dir "$MODEL_DIR"
+  else
+    # APP 版沒有我們的 venv，用 uvx 臨時跑 huggingface-hub 的 hf。
+    uvx --python "$OMLX_PYTHON" --from huggingface-hub hf download "$MODEL_ID" --local-dir "$MODEL_DIR"
+  fi
+}
+
+# ─── 5b. APP 版：停掉 UV 版服務，讓 oMLX.app 接手 port 8000 ─────────
+retire_uv_service() {
+  local i
+  if launchctl print "$GUI_DOMAIN/$OMLX_LABEL" >/dev/null 2>&1; then
+    log "停掉 UV 版服務 $OMLX_LABEL（改用 oMLX.app）"
+    launchctl bootout "$GUI_DOMAIN/$OMLX_LABEL" 2>/dev/null || true
+    for i in $(seq 1 20); do
+      launchctl print "$GUI_DOMAIN/$OMLX_LABEL" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+  fi
+  if [[ -f "$LAUNCH_AGENT" ]]; then
+    rm "$LAUNCH_AGENT"
+    info "已刪除 $LAUNCH_AGENT（開機不會再啟動 UV 版）"
+  fi
+}
+
+start_omlx_app() {
+  log "用 oMLX.app 提供 embedding（port ${OMLX_PORT}）"
+  # 剛下載的模型要 app 重開才看得到；設定檔也要在 app 關著時改。
+  local pids i
+  pids="$(omlx_app_pids)"
+  if [[ -n "$pids" ]]; then
+    info "oMLX.app：開著（pid ${pids}），先關掉再改設定"
+    osascript -e 'tell application "oMLX" to quit' >/dev/null 2>&1 || true
+    for i in {1..10}; do [[ -z "$(omlx_app_pids)" ]] && break; sleep 1; done
+    pids="$(omlx_app_pids)"
+    if [[ -n "$pids" ]]; then
+      kill $pids 2>/dev/null || true; sleep 2
+      pids="$(omlx_app_pids)"; [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true; sleep 1
+    fi
+    [[ -z "$(omlx_app_pids)" ]] || die "關不掉 oMLX.app，請從選單列手動結束再重跑。"
+  fi
+  update_omlx_app_settings "$OMLX_PORT" 1
+  for i in $(seq 1 20); do
+    port_listening || break
+    sleep 0.5
+  done
+  port_listening && die "port $OMLX_PORT 被別的程式占走了（lsof -nP -iTCP:$OMLX_PORT -sTCP:LISTEN 看是誰）。"
+  open -a "$OMLX_APP_BUNDLE" || die "打不開 ${OMLX_APP_BUNDLE}。"
+  info "oMLX.app：已打開"
+  # 登入時自動打開：沒有這個，重開機後 MUR 就沒有 embedding。
+  local items
+  items="$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null || true)"
+  if [[ "$items" == *oMLX* ]]; then
+    info "登入項目：已經有 oMLX"
+  elif osascript -e "tell application \"System Events\" to make login item at end with properties {path:\"$OMLX_APP_BUNDLE\", hidden:true}" >/dev/null 2>&1; then
+    info "登入項目：已加入 oMLX（登入時自動打開）"
+  else
+    info "登入項目：加不進去（可能沒給終端機「自動化」權限）。請到「系統設定 → 一般 → 登入項目」手動加入 oMLX.app，不然重開機後 MUR 會沒有 embedding。"
+  fi
 }
 
 # ─── 5. LaunchAgent 常駐 ─────────────────────────────────────────────
@@ -423,7 +609,7 @@ write_launch_agent() {
     <string>--base-path</string>
     <string>$OMLX_HOME</string>
     <string>--model-dir</string>
-    <string>$OMLX_HOME/models</string>
+    <string>$SHARED_MODEL_DIR</string>
     <string>--host</string>
     <string>$OMLX_HOST</string>
     <string>--port</string>
@@ -477,10 +663,12 @@ fail_with_logs() {
   {
     echo
     echo "Error: $1"
-    echo "--- $LOG_DIR/server.error.log（最後 30 行）"
-    tail -n 30 "$LOG_DIR/server.error.log" 2>/dev/null || true
-    echo "--- $LOG_DIR/server.log（最後 30 行）"
-    tail -n 30 "$LOG_DIR/server.log" 2>/dev/null || true
+    local d="$LOG_DIR"
+    [[ "$OMLX_MODE" == app ]] && d="$OMLX_APP_LOG_DIR"
+    echo "--- $d/server.error.log（最後 30 行）"
+    tail -n 30 "$d/server.error.log" 2>/dev/null || true
+    echo "--- $d/server.log（最後 30 行）"
+    tail -n 30 "$d/server.log" 2>/dev/null || true
   } >&2
   exit 1
 }
@@ -496,12 +684,8 @@ verify_omlx() {
   [[ "$models" == *"$MODEL_NAME"* ]] \
     || fail_with_logs "3 分鐘內 $base/models 沒有列出 ${MODEL_NAME}。"
 
-  model_id="$(printf '%s' "$models" | "$OMLX_VENV/bin/python" -c '
-import json, sys
-name = sys.argv[1]
-ids = [m.get("id", "") for m in json.load(sys.stdin).get("data", [])]
-print(next((i for i in ids if name in i), ""))
-' "$MODEL_NAME")"
+  model_id="$(printf '%s' "$models" | jq -r --arg n "$MODEL_NAME" \
+                '[.data[]?.id // empty | select(contains($n))][0] // empty' 2>/dev/null || true)"
   [[ -n "$model_id" ]] || fail_with_logs "看不懂 $base/models 的回應：$models"
 
   local resp
@@ -535,7 +719,8 @@ summary() {
 
 ==> 完成
     gateway：${GATEWAY_URL}（${gw_state}）
-    oMLX：http://$OMLX_HOST:$OMLX_PORT/v1（不需要 API key，已實際打過 /v1/embeddings）
+    oMLX：http://$OMLX_HOST:$OMLX_PORT/v1（${OMLX_MODE} 版，不帶 API key 實際打過 /v1/embeddings）
+    模型庫：${SHARED_MODEL_DIR}（UV 版和 oMLX.app 共用）
     模型：$MODEL_SERVED_AS
     安裝 log：$INSTALL_LOG
 
@@ -557,10 +742,27 @@ EOF
 ==> 位置
     gateway 程式：$GATEWAY_BIN
     gateway log：$GATEWAY_LOG_DIR/proxy.log
+    停止 gateway：launchctl bootout $GUI_DOMAIN/$GATEWAY_LABEL
+EOF
+  if [[ "$OMLX_MODE" == uv ]]; then
+    cat <<EOF
     oMLX 資料：$OMLX_HOME
     oMLX log：$LOG_DIR/server.log、server.error.log
-    停止 gateway：launchctl bootout $GUI_DOMAIN/$GATEWAY_LABEL
     停止 oMLX：launchctl bootout $GUI_DOMAIN/$OMLX_LABEL
+EOF
+  else
+    cat <<EOF
+    oMLX：${OMLX_APP_BUNDLE}（結束 app，MUR 的 embedding 就會斷）
+    oMLX log：$OMLX_APP_LOG_DIR/server.log
+EOF
+    if [[ -d "$OMLX_HOME/venv" ]]; then
+      echo "    以前的 UV 版 venv 還在，用不到了可以刪：rm -rf \"$OMLX_HOME/venv\""
+    fi
+  fi
+  if [[ "$OLD_MODEL_DIR" != "$MODEL_DIR" && -d "$OLD_MODEL_DIR" ]]; then
+    echo "    舊的模型副本還在，共用模型庫已經有一份，可以刪：rm -rf \"$OLD_MODEL_DIR\""
+  fi
+  cat <<EOF
 
     移除 gateway（先把 ${rc_hint} 裡的 ANTHROPIC_BASE_URL 刪掉，不然 Claude Code 會連不上）：
       launchctl bootout $GUI_DOMAIN/$GATEWAY_LABEL
@@ -571,6 +773,7 @@ EOF
   if [[ "$GATEWAY_SRC_OWNED" == 1 ]]; then
     echo "      rm -rf \"$GATEWAY_SRC\""
   fi
+  if [[ "$OMLX_MODE" == uv ]]; then
   cat <<EOF
 
     移除 oMLX（四行照順序貼；第三行只在 cluster shim 指向這裡時才刪，不會動到 oMLX.app 的）：
@@ -578,6 +781,10 @@ EOF
       rm "$LAUNCH_AGENT"
       grep -qF "$OMLX_VENV/" "\$HOME/.omlx/bin/omlx-cluster-python" 2>/dev/null && rm "\$HOME/.omlx/bin/omlx-cluster-python"
       rm -rf "$OMLX_HOME"
+    （共用模型庫 $SHARED_MODEL_DIR 不會刪，oMLX.app 也在用）
+EOF
+  fi
+  cat <<EOF
 
 接下來安裝 MUR：
     curl -fsSL https://mur.run/install.sh | sh
@@ -602,9 +809,15 @@ preflight
 ensure_rust
 ensure_uv
 install_gateway
-install_omlx
-download_model
-write_launch_agent
-restart_service
+if [[ "$OMLX_MODE" == uv ]]; then
+  install_omlx
+  download_model
+  write_launch_agent
+  restart_service
+else
+  retire_uv_service
+  download_model
+  start_omlx_app
+fi
 verify_omlx
 summary
