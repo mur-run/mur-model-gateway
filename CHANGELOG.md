@@ -12,6 +12,28 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+## v0.5.0 — 2026-09-27
+
+**Upgrade: yes** — stopping or reinstalling the service no longer kills
+requests in flight, the OAuth keepalive is now on by default, and large
+compressed sessions can read their files again. Re-run `setup.sh` /
+`install-release.sh` so the service file picks up the new shutdown grace.
+
+### Added
+
+- `MUR_MODEL_GATEWAY_MAX_CONCURRENCY` caps simultaneous upstream calls per
+  provider (unset = unlimited, as before). A call that cannot get a slot within
+  `MUR_MODEL_GATEWAY_QUEUE_TIMEOUT_SECS` (default 30) gets a local `429` with
+  `retry-after: 5` and a JSON body naming the provider and cap, instead of
+  hanging until the caller's own timeout. A slot is held for the whole
+  upstream stream, not just until headers. `0` or garbage in either variable
+  is logged and treated as unset; both values appear in the `listening` line.
+- `/__mur/health` reports `claudeHook` beside `codexHook`, so MUR Hub can tell
+  a build without the Anthropic disguise hook from an unreachable gateway.
+- `scripts/install-with-omlx.sh`: one-shot Apple Silicon setup that builds the
+  gateway from source with compression on and sets up a local oMLX embedding
+  server beside it. `--check` runs only the preflight.
+
 ### Fixed
 
 - Stopping or restarting the service no longer cuts requests in flight. launchd
@@ -32,16 +54,18 @@ release is worth interrupting a working install for; the ones that are say so.
   immediately; the limit only matters while requests are in flight.
   **Upgrade:** takes effect on the next `setup.sh` / `install`, which
   rewrites the service file.
-
-- Requests larger than 10 MiB no longer fail with `502 read incoming body`. A
-  conversation carrying a few screenshots crosses that line easily, and the
-  gateway — not the upstream, which takes 32 MB — was the one refusing it. The
-  buffer the gateway needs to disguise, compress, or translate a body is now
-  capped at 32 MiB, above the upstream's own ceiling, so the upstream decides.
-  **Upgrade:** yes, if you paste images or share long sessions — the failure
-  looked transient and the client retried it ten times, all in vain.
-- `proxy error` log lines now carry the whole error chain
-  (`read incoming body: length limit exceeded`), not just the outermost step.
+- With `MUR_MODEL_GATEWAY_COMPRESS=1`, the gateway no longer compresses the
+  output of `Read`, `mur_retrieve`, or a Bash `mur retrieve`. It used to
+  compress every tool result, so a retrieval came back under a new hash and
+  could never be read in full, and file reads turned into stubs. Anthropic
+  wire format only.
+- OpenAI-style vision requests on the Codex route no longer arrive empty.
+  Array `content` (`text` + `image_url`) was read as a plain string, so both
+  the text and the image vanished and the model answered a blank turn. Parts
+  now map to `input_text` / `input_image`; string content is unchanged.
+- The 401 Fix line for a rejected Claude OAuth credential now says to run
+  `claude auth logout` before `claude auth login`. On its own, `login` reports
+  "already authenticated" and keeps the stale token.
 - A client that hangs up before the response starts now leaves one WARN line,
   `client went away before a response`, with `method`, `path` (without the
   query string), `provider` and `waited_ms`. Until now such a request left no
@@ -72,6 +96,23 @@ release is worth interrupting a working install for; the ones that are say so.
   `MUR_MODEL_GATEWAY_OAUTH_KEEPALIVE=0` turns it off, and an install run with
   that set keeps it off in the service definition.
   **Upgrade:** yes, if your agents greet you with a 401 each morning.
+
+## v0.4.1 — 2026-09-15
+
+### Fixed
+
+- Requests larger than 10 MiB no longer fail with `502 read incoming body`. A
+  conversation carrying a few screenshots crosses that line easily, and the
+  gateway — not the upstream, which takes 32 MB — was the one refusing it. The
+  buffer the gateway needs to disguise, compress, or translate a body is now
+  capped at 32 MiB, above the upstream's own ceiling, so the upstream decides.
+  **Upgrade:** yes, if you paste images or share long sessions — the failure
+  looked transient and the client retried it ten times, all in vain.
+- `proxy error` log lines now carry the whole error chain
+  (`read incoming body: length limit exceeded`), not just the outermost step.
+
+### Changed
+
 - An Anthropic 401 on a credential the gateway attached is now retried when —
   and only when — the credential store has since come to hold a *different*
   token. Previously the retry was gated on a delegated-refresh probe that
