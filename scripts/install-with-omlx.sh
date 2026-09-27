@@ -164,6 +164,40 @@ on_exit() {
 }
 
 # ─── 1. 前置檢查：全部在安裝任何東西之前 ─────────────────────────────
+# 只比對 .app bundle 裡的程式，不會動到 ~/.mur/omlx 底下我們自己的服務。
+omlx_app_pids() { pgrep -f '/oMLX\.app/Contents/' 2>/dev/null | tr '\n' ' ' | sed 's/ *$//' || true; }
+
+stop_omlx_app() {
+  local pids
+  pids="$(omlx_app_pids)"
+  if [[ -z "$pids" ]]; then
+    info "oMLX.app：沒有開著"
+    return 0
+  fi
+  if [[ "$CHECK_ONLY" == 1 ]]; then
+    info "oMLX.app：開著（pid ${pids}），正式安裝時會把它關掉"
+    OMLX_APP_WILL_STOP=1
+    return 0
+  fi
+  info "oMLX.app：開著（pid ${pids}），先把它關掉"
+  osascript -e 'tell application "oMLX" to quit' >/dev/null 2>&1 || true
+  local i
+  for i in {1..10}; do
+    [[ -z "$(omlx_app_pids)" ]] && break
+    sleep 1
+  done
+  pids="$(omlx_app_pids)"
+  if [[ -n "$pids" ]]; then
+    kill $pids 2>/dev/null || true
+    sleep 2
+    pids="$(omlx_app_pids)"
+    [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+    sleep 1
+  fi
+  [[ -z "$(omlx_app_pids)" ]] || die "關不掉 oMLX.app（pid $(omlx_app_pids)），請從選單列手動結束再重跑。"
+  info "oMLX.app：已關閉"
+}
+
 preflight() {
   log "檢查環境（這一步不會安裝任何東西）"
 
@@ -216,7 +250,12 @@ preflight() {
     info "uv：沒有，稍後會用官方安裝器裝到 ~/.local/bin"
   fi
 
-  if port_listening; then
+  OMLX_APP_WILL_STOP=0
+  stop_omlx_app
+
+  if [[ "$OMLX_APP_WILL_STOP" == 1 ]] && port_listening; then
+    info "port ${OMLX_PORT}：oMLX.app 在用，正式安裝關掉它之後就會空出來"
+  elif port_listening; then
     local ours holders
     ours="$(service_pid)"
     holders="$(lsof -nP -tiTCP:"$OMLX_PORT" -sTCP:LISTEN 2>/dev/null | sort -u | tr '\n' ' ' || true)"
