@@ -20,13 +20,17 @@ release is worth interrupting a working install for; the ones that are say so.
   the spot. SIGTERM now goes through the same graceful shutdown as Ctrl-C:
   requests already in flight finish, and the log shows
   `shutdown signal signal="SIGTERM"` before the process exits.
-- The service manager now waits up to 300 s for that drain before it
-  force-kills the gateway (`ExitTimeOut` in the launchd plist,
-  `TimeoutStopSec` in both systemd units). The defaults — 20 s on launchd,
-  90 s on systemd — cut long streaming responses mid-generation. An idle
-  gateway still exits immediately; the limit only matters while requests are
-  in flight. **Upgrade:** takes effect on the next `setup.sh` / `install`,
-  which rewrites the service file.
+- The service manager now waits longer for that drain before it force-kills
+  the gateway: 300 s on systemd (`TimeoutStopSec` in both units), 60 s on
+  macOS. The launchd plist asks for 300 s too (`ExitTimeOut`), but launchd
+  caps the value — `launchctl print gui/$(id -u)/run.mur-model-gateway` shows
+  `exit timeout = 60` on the machines we checked. Without the key, launchd
+  typically allows only a few seconds (5 s for most agents), and systemd
+  90 s, which cut long streaming responses mid-generation. On macOS a stream
+  still running 60 s after the stop is still cut. An idle gateway exits
+  immediately; the limit only matters while requests are in flight.
+  **Upgrade:** takes effect on the next `setup.sh` / `install`, which
+  rewrites the service file.
 
 - Requests larger than 10 MiB no longer fail with `502 read incoming body`. A
   conversation carrying a few screenshots crosses that line easily, and the
