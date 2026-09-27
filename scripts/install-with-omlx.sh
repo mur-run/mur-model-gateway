@@ -25,6 +25,8 @@ OMLX_WHEEL_SHA256="f13d92900bf6c7e925e9a6d5525b4465c615c404ee796d328ffc5d4d379dd
 OMLX_PYTHON="3.12"           # wheel 是 cp312；uv 沒找到就自己下載，不用系統 Python
 OMLX_HOST="127.0.0.1"
 OMLX_PORT="8000"             # MUR 預設找 http://127.0.0.1:8000/v1
+OMLX_APP_PORT="8001"         # oMLX.app 讓出 8000 後改用這個 port
+OMLX_APP_SETTINGS="$HOME/.omlx/settings.json"
 OMLX_LABEL="com.mur.omlx"
 OMLX_HOME="${MUR_OMLX_HOME:-$HOME/.mur/omlx}"
 OMLX_VENV="$OMLX_HOME/venv"
@@ -174,6 +176,16 @@ stop_omlx_app() {
     info "oMLX.app：沒有開著"
     return 0
   fi
+  # 方案 C：app 改用別的 port（例如 8001）就讓它繼續開著，只有占住 ${OMLX_PORT} 才關。
+  local holders p on_port=0
+  holders="$(lsof -nP -tiTCP:"$OMLX_PORT" -sTCP:LISTEN 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+  for p in $pids; do [[ " $holders " == *" $p "* ]] && on_port=1; done
+  # 設定檔還寫著 ${OMLX_PORT} 的話也要關：app 開著時改設定檔會被它寫回去。
+  [[ "$(omlx_app_settings_port)" == "$OMLX_PORT" ]] && on_port=1
+  if [[ "$on_port" == 0 ]]; then
+    info "oMLX.app：開著（pid ${pids}），但沒占 port ${OMLX_PORT}，不用關"
+    return 0
+  fi
   if [[ "$CHECK_ONLY" == 1 ]]; then
     info "oMLX.app：開著（pid ${pids}），正式安裝時會把它關掉"
     OMLX_APP_WILL_STOP=1
@@ -186,8 +198,10 @@ stop_omlx_app() {
     [[ -z "$(omlx_app_pids)" ]] && break
     sleep 1
   done
+  local how="quit"
   pids="$(omlx_app_pids)"
   if [[ -n "$pids" ]]; then
+    how="kill"
     kill $pids 2>/dev/null || true
     sleep 2
     pids="$(omlx_app_pids)"
@@ -195,7 +209,46 @@ stop_omlx_app() {
     sleep 1
   fi
   [[ -z "$(omlx_app_pids)" ]] || die "關不掉 oMLX.app（pid $(omlx_app_pids)），請從選單列手動結束再重跑。"
-  info "oMLX.app：已關閉"
+  info "oMLX.app：已關閉（方式：${how}）"
+  OMLX_APP_WAS_STOPPED=1
+}
+
+omlx_app_settings_port() {
+  [[ -f "$OMLX_APP_SETTINGS" ]] || return 0
+  jq -r '.server.port // empty' "$OMLX_APP_SETTINGS" 2>/dev/null || true
+}
+
+# 方案 C：把 oMLX.app 的 port 從 ${OMLX_PORT} 改成 ${OMLX_APP_PORT}，重開機才不會互搶。
+# 一定要在 app 關著時改，不然 app 結束時會把舊值寫回去。
+move_omlx_app_port() {
+  local cur
+  cur="$(omlx_app_settings_port)"
+  if [[ -z "$cur" ]]; then
+    info "oMLX.app 設定檔：沒有（${OMLX_APP_SETTINGS}），不用改"
+    return 0
+  fi
+  if [[ "$cur" != "$OMLX_PORT" ]]; then
+    info "oMLX.app 設定檔：port ${cur}，沒占 ${OMLX_PORT}，不用改"
+    return 0
+  fi
+  if [[ "$CHECK_ONLY" == 1 ]]; then
+    info "oMLX.app 設定檔：port ${cur}，正式安裝時會改成 ${OMLX_APP_PORT}"
+    return 0
+  fi
+  [[ -z "$(omlx_app_pids)" ]] || die "oMLX.app 還開著，不能改它的設定檔。請先結束 app 再重跑。"
+  local backup tmp
+  backup="${OMLX_APP_SETTINGS}.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$OMLX_APP_SETTINGS" "$backup"
+  tmp="$(mktemp "${OMLX_APP_SETTINGS}.XXXXXX")"
+  jq --argjson port "$OMLX_APP_PORT" '.server.port = $port' "$OMLX_APP_SETTINGS" > "$tmp" \
+    && [[ "$(jq -r '.server.port' "$tmp")" == "$OMLX_APP_PORT" ]] \
+    || { rm -f "$tmp"; die "改不了 ${OMLX_APP_SETTINGS}，原檔沒動。"; }
+  chmod "$(stat -f '%Lp' "$OMLX_APP_SETTINGS")" "$tmp"
+  mv "$tmp" "$OMLX_APP_SETTINGS"
+  info "oMLX.app 設定檔：port ${OMLX_PORT} → ${OMLX_APP_PORT}（備份：${backup}）"
+  if [[ "${OMLX_APP_WAS_STOPPED:-0}" == 1 ]]; then
+    open -a oMLX >/dev/null 2>&1 && info "oMLX.app：已重新打開（改用 port ${OMLX_APP_PORT}）" || true
+  fi
 }
 
 preflight() {
@@ -252,6 +305,7 @@ preflight() {
 
   OMLX_APP_WILL_STOP=0
   stop_omlx_app
+  move_omlx_app_port
 
   if [[ "$OMLX_APP_WILL_STOP" == 1 ]] && port_listening; then
     info "port ${OMLX_PORT}：oMLX.app 在用，正式安裝關掉它之後就會空出來"
@@ -387,7 +441,7 @@ write_launch_agent() {
   <key>KeepAlive</key>
   <true/>
   <key>ThrottleInterval</key>
-  <integer>10</integer>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>$LOG_DIR/server.log</string>
   <key>StandardErrorPath</key>
