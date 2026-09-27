@@ -23,8 +23,9 @@ release is worth interrupting a working install for; the ones that are say so.
 - The service manager now waits longer for that drain before it force-kills
   the gateway: 300 s on systemd (`TimeoutStopSec` in both units), 60 s on
   macOS. The launchd plist asks for 300 s too (`ExitTimeOut`), but launchd
-  caps the value — `launchctl print gui/$(id -u)/run.mur-model-gateway` shows
-  `exit timeout = 60` on the machines we checked. Without the key, launchd
+  caps `ExitTimeOut` at 60 s: throwaway agents set to 59 and 60 keep their
+  value, while 61 and 120 both come back as `exit timeout = 60` in
+  `launchctl print`. Without the key, launchd
   typically allows only a few seconds (5 s for most agents), and systemd
   90 s, which cut long streaming responses mid-generation. On macOS a stream
   still running 60 s after the stop is still cut. An idle gateway exits

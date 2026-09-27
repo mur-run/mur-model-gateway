@@ -25,8 +25,9 @@ pub const LINUX_SYSTEM_ENV_FILE: &str = "/etc/mur-model-gateway.env";
 /// gateway drains in-flight requests (including long streams) on SIGTERM;
 /// the defaults (a few seconds on launchd, 90s on systemd) would cut long
 /// generations. systemd honours 300 as written. launchd caps `ExitTimeOut`
-/// (`launchctl print` reports `exit timeout = 60` for this plist), so on
-/// macOS the effective grace is 60s; 300 is kept so Linux gets the full wait.
+/// at 60 (probed: 59 and 60 kept, 61 and 120 reported as 60 by
+/// `launchctl print`), so on macOS the effective grace is 60s; 300 is kept
+/// so Linux gets the full wait.
 pub const SHUTDOWN_GRACE_SECS: u32 = 300;
 
 /// Install-time configuration collected from CLI flags.
