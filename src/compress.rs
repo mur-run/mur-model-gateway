@@ -514,6 +514,31 @@ fn exempt_tool_use_ids_anthropic(messages: &[Value]) -> std::collections::HashSe
         .collect()
 }
 
+/// `tool_call_id`s whose results [`is_verbatim_tool`] exempts (OpenAI /
+/// Codex wire format: `arguments` is a JSON-encoded string).
+fn exempt_tool_call_ids_openai(messages: &[Value]) -> std::collections::HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|call| {
+            let Some(func) = call.get("function") else {
+                return false;
+            };
+            let name = func
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            let args = func
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok());
+            is_verbatim_tool(name, args.as_ref())
+        })
+        .filter_map(|call| call.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect()
+}
+
 fn rewrite_tool_results_anthropic(
     engine: &CompressEngine,
     min_tokens: usize,
@@ -577,8 +602,16 @@ fn rewrite_tool_results_openai(
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
     };
+    let exempt = exempt_tool_call_ids_openai(messages);
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            continue;
+        }
+        if msg
+            .get("tool_call_id")
+            .and_then(|t| t.as_str())
+            .is_some_and(|id| exempt.contains(id))
+        {
             continue;
         }
         let Some(content) = msg.get_mut("content") else {
@@ -626,6 +659,12 @@ fn rewrite_tool_results_gemini(
             let Some(fr) = part.get_mut("functionResponse") else {
                 continue;
             };
+            // Gemini pairs results by function name, not id; args live on
+            // the earlier `functionCall`, so only name-based exemptions apply.
+            let name = fr.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+            if is_verbatim_tool(name, None) {
+                continue;
+            }
             let Some(response) = fr.get_mut("response") else {
                 continue;
             };
@@ -1540,5 +1579,47 @@ mod tests {
                 .unwrap(),
             repeated
         );
+    }
+
+    /// OpenAI / Codex wire: a `read_file` (or `Read`) result must reach the
+    /// model verbatim, paired via `tool_call_id`, exactly like Anthropic.
+    #[test]
+    fn openai_never_compresses_runtime_read_file() {
+        let (_dir, engine) = test_engine();
+        for name in ["read_file", "Read"] {
+            let body = serde_json::to_vec(&json!({
+                "messages": [
+                    {"role": "assistant", "tool_calls": [{
+                        "id": "call_r", "type": "function",
+                        "function": {"name": name, "arguments": "{\"path\":\"big.log\"}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_r", "content": fat_log()}
+                ]
+            }))
+            .unwrap();
+            assert!(
+                rewrite_tool_results_openai(&engine, 800, &body).is_none(),
+                "{name} result must pass through untouched"
+            );
+        }
+    }
+
+    /// Gemini wire: `functionResponse.name` names the tool; a read result
+    /// must pass through untouched.
+    #[test]
+    fn gemini_never_compresses_runtime_read_file() {
+        let (_dir, engine) = test_engine();
+        let body = serde_json::to_vec(&json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "read_file", "args": {"path": "big.log"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "read_file", "response": {"result": fat_log()}}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(rewrite_tool_results_gemini(&engine, 800, &body).is_none());
     }
 }
