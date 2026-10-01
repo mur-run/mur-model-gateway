@@ -92,6 +92,24 @@ struct StaleCandidate {
     text: String,
 }
 
+/// Whether `name` is a file-read tool: Claude Code's `Read`, or the MUR
+/// agent runtime's `read_file` (bare, or in `mcp__<server>__read_file` wire
+/// form). Both mean the model asked to SEE those bytes.
+fn is_read_tool(name: &str) -> bool {
+    name == "Read" || name == "read_file" || name.ends_with("__read_file")
+}
+
+/// The file a read tool targeted, whichever key the tool uses: Claude Code's
+/// `Read` says `file_path`, the MUR runtime's `read_file` says `path`.
+fn file_path_of(input: Option<&Value>) -> Option<String> {
+    let input = input?;
+    input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(|p| p.as_str())
+        .map(String::from)
+}
+
 /// Decide which `candidates` (in transcript order) are provably stale: a
 /// Read whose file was read or edited again later, or a byte-exact duplicate
 /// of a later result. The most recent view of any given path, and every
@@ -165,11 +183,7 @@ fn collapse_stale_tool_results_anthropic(engine: &CompressEngine, root: &mut Val
                 .and_then(|n| n.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let path = block
-                .get("input")
-                .and_then(|i| i.get("file_path"))
-                .and_then(|p| p.as_str())
-                .map(String::from);
+            let path = file_path_of(block.get("input"));
             tool_meta.insert(id.to_string(), (name, path));
         }
     }
@@ -205,7 +219,7 @@ fn collapse_stale_tool_results_anthropic(engine: &CompressEngine, root: &mut Val
             locators.push((msg_idx, block_idx));
             candidates.push(StaleCandidate {
                 path: path.clone(),
-                is_read: name == "Read",
+                is_read: is_read_tool(name),
                 text,
             });
         }
@@ -266,11 +280,7 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
                 .get("arguments")
                 .and_then(|a| a.as_str())
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .and_then(|v| {
-                    v.get("file_path")
-                        .and_then(|p| p.as_str())
-                        .map(String::from)
-                });
+                .and_then(|v| file_path_of(Some(&v)));
             tool_meta.insert(id.to_string(), (name, path));
         }
     }
@@ -302,7 +312,7 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
         locators.push(msg_idx);
         candidates.push(StaleCandidate {
             path: path.clone(),
-            is_read: name == "Read",
+            is_read: is_read_tool(name),
             text,
         });
     }
@@ -352,11 +362,7 @@ fn collapse_stale_tool_results_gemini(engine: &CompressEngine, root: &mut Value)
                     .and_then(|n| n.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let path = fc
-                    .get("args")
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .map(String::from);
+                let path = file_path_of(fc.get("args"));
                 pending_paths.entry(name).or_default().push_back(path);
                 continue;
             }
@@ -385,7 +391,7 @@ fn collapse_stale_tool_results_gemini(engine: &CompressEngine, root: &mut Value)
             locators.push((content_idx, part_idx));
             candidates.push(StaleCandidate {
                 path,
-                is_read: name == "Read",
+                is_read: is_read_tool(name),
                 text,
             });
         }
@@ -478,7 +484,7 @@ pub fn has_retrieve_marker(text: &str) -> bool {
 /// the original again under a new hash, so it can never be read back. Mirrors
 /// `is_own_compress_tool` in mur's Claude Code hook.
 fn is_verbatim_tool(name: &str, input: Option<&Value>) -> bool {
-    if name == "Read" || name.ends_with("mur_retrieve") {
+    if is_read_tool(name) || name.ends_with("mur_retrieve") {
         return true;
     }
     let Some(command) = input
@@ -843,6 +849,60 @@ mod tests {
         let body =
             body_with_named_tool_result("Bash", json!({"command": "cat x.log"}), json!(fat_log()));
         assert!(rewrite_tool_results_anthropic(&engine, 800, &body).is_some());
+    }
+
+    /// The MUR agent runtime's own file reader is `read_file` (input key
+    /// `path`), not Claude Code's `Read` (`file_path`). Both are the model
+    /// asking to SEE the bytes; neither may be offloaded to a hash stub —
+    /// that is the "murmur can't read a file over ~30 lines" bug.
+    #[test]
+    fn never_compresses_runtime_read_file() {
+        let (_dir, engine) = test_engine();
+        for name in ["read_file", "mcp__fs__read_file"] {
+            let body = body_with_named_tool_result(
+                name,
+                json!({"path": "/x.log", "offset": 1, "limit": 400}),
+                json!(fat_log()),
+            );
+            assert!(
+                rewrite_tool_results_anthropic(&engine, 800, &body).is_none(),
+                "{name} must pass through verbatim"
+            );
+        }
+    }
+
+    /// A superseded `read_file` (same `path` read again later) collapses to
+    /// a skeleton exactly like a superseded `Read` — the stale-pass must
+    /// recognise the runtime's `path` key, not only Claude Code's `file_path`.
+    #[test]
+    fn superseded_runtime_read_file_collapses_like_read() {
+        let (_dir, engine) = test_engine();
+        let original = "fn main() {}\n".repeat(5);
+        let mut messages = Vec::new();
+        for (id, text) in [
+            ("toolu_rf1", original.as_str()),
+            ("toolu_rf2", "fn main() { x }\n"),
+        ] {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "read_file", "input": {"path": "src/main.rs"}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": text}
+            ]}));
+        }
+        let mut root = json!({"messages": messages});
+        assert!(
+            collapse_stale_tool_results_anthropic(&engine, &mut root),
+            "the earlier read_file of the same path is stale and must collapse"
+        );
+        let first = root["messages"][1]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_ne!(first, original, "stale view replaced");
+        let last = root["messages"][3]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(last, "fn main() { x }\n", "latest view untouched");
     }
 
     #[test]
