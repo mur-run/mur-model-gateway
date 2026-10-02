@@ -213,9 +213,11 @@ stop_omlx_app() {
   pids="$(omlx_app_pids)"
   if [[ -n "$pids" ]]; then
     how="kill"
+    # shellcheck disable=SC2086 # $pids 是多個 PID，需要分詞
     kill $pids 2>/dev/null || true
     sleep 2
     pids="$(omlx_app_pids)"
+    # shellcheck disable=SC2086
     [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
     sleep 1
   fi
@@ -606,7 +608,9 @@ start_omlx_app() {
     for i in {1..10}; do [[ -z "$(omlx_app_pids)" ]] && break; sleep 1; done
     pids="$(omlx_app_pids)"
     if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086 # $pids 是多個 PID，需要分詞
       kill $pids 2>/dev/null || true; sleep 2
+      # shellcheck disable=SC2086
       pids="$(omlx_app_pids)"; [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true; sleep 1
     fi
     [[ -z "$(omlx_app_pids)" ]] || die "關不掉 oMLX.app，請從選單列手動結束再重跑。"
@@ -756,7 +760,9 @@ summary() {
     fi
   done
   # 移除說明要指到實際設定的那個檔；還沒設的話就是我們叫他加的 ~/.zshenv。
+  # shellcheck disable=SC2088 # 只是顯示給使用者看的字串
   local rc_hint="~/.zshenv"
+  # shellcheck disable=SC2088
   [[ -n "$rc_file" ]] && rc_hint="~${rc_file#"$HOME"}"
 
   cat <<EOF
