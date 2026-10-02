@@ -217,8 +217,10 @@ stop_omlx_app() {
     kill $pids 2>/dev/null || true
     sleep 2
     pids="$(omlx_app_pids)"
-    # shellcheck disable=SC2086
-    [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086 # $pids 是多個 PID，需要分詞
+      kill -9 $pids 2>/dev/null || true
+    fi
     sleep 1
   fi
   [[ -z "$(omlx_app_pids)" ]] || die "關不掉 oMLX.app（pid $(omlx_app_pids)），請從選單列手動結束再重跑。"
@@ -274,10 +276,11 @@ update_omlx_app_settings() {
   backup="${OMLX_APP_SETTINGS}.bak-$(date +%Y%m%d-%H%M%S)"
   cp -p "$OMLX_APP_SETTINGS" "$backup"
   tmp="$(mktemp "${OMLX_APP_SETTINGS}.XXXXXX")"
-  omlx_app_settings_filter "$port" "$auto" > "$tmp" \
-    && [[ "$(jq -r '.server.port' "$tmp")" == "$port" ]] \
-    && [[ "$(jq -r '.model.model_dirs[0]' "$tmp")" == "$SHARED_MODEL_DIR" ]] \
-    || { rm -f "$tmp"; die "改不了 ${OMLX_APP_SETTINGS}，原檔沒動。"; }
+  if ! { omlx_app_settings_filter "$port" "$auto" > "$tmp" \
+      && [[ "$(jq -r '.server.port' "$tmp")" == "$port" ]] \
+      && [[ "$(jq -r '.model.model_dirs[0]' "$tmp")" == "$SHARED_MODEL_DIR" ]]; }; then
+    rm -f "$tmp"; die "改不了 ${OMLX_APP_SETTINGS}，原檔沒動。"
+  fi
   chmod "$(stat -f '%Lp' "$OMLX_APP_SETTINGS")" "$tmp"
   mv "$tmp" "$OMLX_APP_SETTINGS"
   info "oMLX.app 設定檔：port ${port}、模型庫 ${SHARED_MODEL_DIR}（備份：${backup}）"
@@ -287,7 +290,9 @@ update_omlx_app_settings() {
 move_omlx_app_port() {
   update_omlx_app_settings "$OMLX_APP_PORT" 0
   if [[ "$CHECK_ONLY" == 0 && "${OMLX_APP_WAS_STOPPED:-0}" == 1 ]]; then
-    open -a oMLX >/dev/null 2>&1 && info "oMLX.app：已重新打開（改用 port ${OMLX_APP_PORT}）" || true
+    if open -a oMLX >/dev/null 2>&1; then
+      info "oMLX.app：已重新打開（改用 port ${OMLX_APP_PORT}）"
+    fi
   fi
 }
 
@@ -611,8 +616,10 @@ start_omlx_app() {
       # shellcheck disable=SC2086 # $pids 是多個 PID，需要分詞
       kill $pids 2>/dev/null || true; sleep 2
       pids="$(omlx_app_pids)"
-      # shellcheck disable=SC2086
-      [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+      if [[ -n "$pids" ]]; then
+        # shellcheck disable=SC2086 # $pids 是多個 PID，需要分詞
+        kill -9 $pids 2>/dev/null || true
+      fi
       sleep 1
     fi
     [[ -z "$(omlx_app_pids)" ]] || die "關不掉 oMLX.app，請從選單列手動結束再重跑。"
