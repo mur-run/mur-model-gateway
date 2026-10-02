@@ -610,8 +610,10 @@ start_omlx_app() {
     if [[ -n "$pids" ]]; then
       # shellcheck disable=SC2086 # $pids 是多個 PID，需要分詞
       kill $pids 2>/dev/null || true; sleep 2
+      pids="$(omlx_app_pids)"
       # shellcheck disable=SC2086
-      pids="$(omlx_app_pids)"; [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true; sleep 1
+      [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+      sleep 1
     fi
     [[ -z "$(omlx_app_pids)" ]] || die "關不掉 oMLX.app，請從選單列手動結束再重跑。"
   fi
