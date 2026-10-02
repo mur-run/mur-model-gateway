@@ -92,6 +92,24 @@ struct StaleCandidate {
     text: String,
 }
 
+/// Whether `name` is a file-read tool: Claude Code's `Read`, or the MUR
+/// agent runtime's `read_file` (bare, or in `mcp__<server>__read_file` wire
+/// form). Both mean the model asked to SEE those bytes.
+fn is_read_tool(name: &str) -> bool {
+    name == "Read" || name == "read_file" || name.ends_with("__read_file")
+}
+
+/// The file a read tool targeted, whichever key the tool uses: Claude Code's
+/// `Read` says `file_path`, the MUR runtime's `read_file` says `path`.
+fn file_path_of(input: Option<&Value>) -> Option<String> {
+    let input = input?;
+    input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(|p| p.as_str())
+        .map(String::from)
+}
+
 /// Decide which `candidates` (in transcript order) are provably stale: a
 /// Read whose file was read or edited again later, or a byte-exact duplicate
 /// of a later result. The most recent view of any given path, and every
@@ -165,11 +183,7 @@ fn collapse_stale_tool_results_anthropic(engine: &CompressEngine, root: &mut Val
                 .and_then(|n| n.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let path = block
-                .get("input")
-                .and_then(|i| i.get("file_path"))
-                .and_then(|p| p.as_str())
-                .map(String::from);
+            let path = file_path_of(block.get("input"));
             tool_meta.insert(id.to_string(), (name, path));
         }
     }
@@ -205,7 +219,7 @@ fn collapse_stale_tool_results_anthropic(engine: &CompressEngine, root: &mut Val
             locators.push((msg_idx, block_idx));
             candidates.push(StaleCandidate {
                 path: path.clone(),
-                is_read: name == "Read",
+                is_read: is_read_tool(name),
                 text,
             });
         }
@@ -266,11 +280,7 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
                 .get("arguments")
                 .and_then(|a| a.as_str())
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .and_then(|v| {
-                    v.get("file_path")
-                        .and_then(|p| p.as_str())
-                        .map(String::from)
-                });
+                .and_then(|v| file_path_of(Some(&v)));
             tool_meta.insert(id.to_string(), (name, path));
         }
     }
@@ -302,7 +312,7 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
         locators.push(msg_idx);
         candidates.push(StaleCandidate {
             path: path.clone(),
-            is_read: name == "Read",
+            is_read: is_read_tool(name),
             text,
         });
     }
@@ -352,11 +362,7 @@ fn collapse_stale_tool_results_gemini(engine: &CompressEngine, root: &mut Value)
                     .and_then(|n| n.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let path = fc
-                    .get("args")
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .map(String::from);
+                let path = file_path_of(fc.get("args"));
                 pending_paths.entry(name).or_default().push_back(path);
                 continue;
             }
@@ -385,7 +391,7 @@ fn collapse_stale_tool_results_gemini(engine: &CompressEngine, root: &mut Value)
             locators.push((content_idx, part_idx));
             candidates.push(StaleCandidate {
                 path,
-                is_read: name == "Read",
+                is_read: is_read_tool(name),
                 text,
             });
         }
@@ -478,7 +484,7 @@ pub fn has_retrieve_marker(text: &str) -> bool {
 /// the original again under a new hash, so it can never be read back. Mirrors
 /// `is_own_compress_tool` in mur's Claude Code hook.
 fn is_verbatim_tool(name: &str, input: Option<&Value>) -> bool {
-    if name == "Read" || name.ends_with("mur_retrieve") {
+    if is_read_tool(name) || name.ends_with("mur_retrieve") {
         return true;
     }
     let Some(command) = input
@@ -505,6 +511,31 @@ fn exempt_tool_use_ids_anthropic(messages: &[Value]) -> std::collections::HashSe
             is_verbatim_tool(name, b.get("input"))
         })
         .filter_map(|b| b.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect()
+}
+
+/// `tool_call_id`s whose results [`is_verbatim_tool`] exempts (OpenAI /
+/// Codex wire format: `arguments` is a JSON-encoded string).
+fn exempt_tool_call_ids_openai(messages: &[Value]) -> std::collections::HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|call| {
+            let Some(func) = call.get("function") else {
+                return false;
+            };
+            let name = func
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            let args = func
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok());
+            is_verbatim_tool(name, args.as_ref())
+        })
+        .filter_map(|call| call.get("id").and_then(|i| i.as_str()).map(String::from))
         .collect()
 }
 
@@ -571,8 +602,16 @@ fn rewrite_tool_results_openai(
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
     };
+    let exempt = exempt_tool_call_ids_openai(messages);
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            continue;
+        }
+        if msg
+            .get("tool_call_id")
+            .and_then(|t| t.as_str())
+            .is_some_and(|id| exempt.contains(id))
+        {
             continue;
         }
         let Some(content) = msg.get_mut("content") else {
@@ -620,6 +659,12 @@ fn rewrite_tool_results_gemini(
             let Some(fr) = part.get_mut("functionResponse") else {
                 continue;
             };
+            // Gemini pairs results by function name, not id; args live on
+            // the earlier `functionCall`, so only name-based exemptions apply.
+            let name = fr.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+            if is_verbatim_tool(name, None) {
+                continue;
+            }
             let Some(response) = fr.get_mut("response") else {
                 continue;
             };
@@ -843,6 +888,60 @@ mod tests {
         let body =
             body_with_named_tool_result("Bash", json!({"command": "cat x.log"}), json!(fat_log()));
         assert!(rewrite_tool_results_anthropic(&engine, 800, &body).is_some());
+    }
+
+    /// The MUR agent runtime's own file reader is `read_file` (input key
+    /// `path`), not Claude Code's `Read` (`file_path`). Both are the model
+    /// asking to SEE the bytes; neither may be offloaded to a hash stub —
+    /// that is the "murmur can't read a file over ~30 lines" bug.
+    #[test]
+    fn never_compresses_runtime_read_file() {
+        let (_dir, engine) = test_engine();
+        for name in ["read_file", "mcp__fs__read_file"] {
+            let body = body_with_named_tool_result(
+                name,
+                json!({"path": "/x.log", "offset": 1, "limit": 400}),
+                json!(fat_log()),
+            );
+            assert!(
+                rewrite_tool_results_anthropic(&engine, 800, &body).is_none(),
+                "{name} must pass through verbatim"
+            );
+        }
+    }
+
+    /// A superseded `read_file` (same `path` read again later) collapses to
+    /// a skeleton exactly like a superseded `Read` — the stale-pass must
+    /// recognise the runtime's `path` key, not only Claude Code's `file_path`.
+    #[test]
+    fn superseded_runtime_read_file_collapses_like_read() {
+        let (_dir, engine) = test_engine();
+        let original = "fn main() {}\n".repeat(5);
+        let mut messages = Vec::new();
+        for (id, text) in [
+            ("toolu_rf1", original.as_str()),
+            ("toolu_rf2", "fn main() { x }\n"),
+        ] {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "read_file", "input": {"path": "src/main.rs"}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": text}
+            ]}));
+        }
+        let mut root = json!({"messages": messages});
+        assert!(
+            collapse_stale_tool_results_anthropic(&engine, &mut root),
+            "the earlier read_file of the same path is stale and must collapse"
+        );
+        let first = root["messages"][1]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_ne!(first, original, "stale view replaced");
+        let last = root["messages"][3]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(last, "fn main() { x }\n", "latest view untouched");
     }
 
     #[test]
@@ -1480,5 +1579,47 @@ mod tests {
                 .unwrap(),
             repeated
         );
+    }
+
+    /// OpenAI / Codex wire: a `read_file` (or `Read`) result must reach the
+    /// model verbatim, paired via `tool_call_id`, exactly like Anthropic.
+    #[test]
+    fn openai_never_compresses_runtime_read_file() {
+        let (_dir, engine) = test_engine();
+        for name in ["read_file", "Read"] {
+            let body = serde_json::to_vec(&json!({
+                "messages": [
+                    {"role": "assistant", "tool_calls": [{
+                        "id": "call_r", "type": "function",
+                        "function": {"name": name, "arguments": "{\"path\":\"big.log\"}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_r", "content": fat_log()}
+                ]
+            }))
+            .unwrap();
+            assert!(
+                rewrite_tool_results_openai(&engine, 800, &body).is_none(),
+                "{name} result must pass through untouched"
+            );
+        }
+    }
+
+    /// Gemini wire: `functionResponse.name` names the tool; a read result
+    /// must pass through untouched.
+    #[test]
+    fn gemini_never_compresses_runtime_read_file() {
+        let (_dir, engine) = test_engine();
+        let body = serde_json::to_vec(&json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "read_file", "args": {"path": "big.log"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "read_file", "response": {"result": fat_log()}}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(rewrite_tool_results_gemini(&engine, 800, &body).is_none());
     }
 }
