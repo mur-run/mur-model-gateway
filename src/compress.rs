@@ -917,6 +917,13 @@ fn shared_engine() -> Option<Arc<Shared>> {
     }
     let min_tokens = cfg.auto.min_tokens;
     let engine = CompressEngine::new(home.join("compress"), cfg).ok()?;
+    // One line per (re)build, so cold starts are countable from the log.
+    // Expected once per process; more means the fingerprint moved at runtime.
+    tracing::info!(
+        fingerprint,
+        rebuild = guard.is_some(),
+        "compress engine built"
+    );
     let shared = Arc::new(Shared {
         engine,
         min_tokens,
