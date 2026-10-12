@@ -73,7 +73,7 @@ turn 重送只會 hit。`stale_miss` 每個新的取代事件大約一次;若持
 
 `compress summary`、`upstream usage`、`proxied` 都帶 `client=`,值是請求 User-Agent 的
 第一個 token:Claude Code 是 `claude-cli`,MUR agent runtime 沒送 User-Agent 所以是 `none`。
-`compress summary` 另有 `system_bytes` / `tools_bytes` / `messages_bytes`,是 body 三個區段
+`compress summary` 另有 `model=`(body 裡的 model,Gemini 沒有)和 `system_bytes` / `tools_bytes` / `messages_bytes`,是 body 三個區段
 序列化後的大小,用來看每種 client 的請求是由什麼組成的。
 
 ```

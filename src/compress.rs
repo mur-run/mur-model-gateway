@@ -116,6 +116,10 @@ pub struct Summary {
     pub system_bytes: usize,
     pub tools_bytes: usize,
     pub messages_bytes: usize,
+    /// `model` from the body (Anthropic / OpenAI shapes; Gemini carries it in
+    /// the path, so it stays empty there). Splits a client's main requests
+    /// from its side calls, and one MUR agent from another.
+    pub model: String,
     pub before: usize,
     pub after: usize,
     /// Token totals over judged blocks only (hit + miss); `small`, `marker`
@@ -178,6 +182,11 @@ fn extract_tool_result_text(content: &Value) -> Option<String> {
 /// three subtrees costs about as much as one full serialise (~3 ms per MB),
 /// so callers only run it when the summary line will actually be emitted.
 fn note_composition(root: &Value, summary: &mut Summary) {
+    summary.model = root
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
     let size = |v: Option<&Value>| {
         v.and_then(|v| serde_json::to_vec(v).ok())
             .map_or(0, |b| b.len())
@@ -1079,6 +1088,7 @@ pub fn rewrite_request_body(body: &[u8], provider: Provider, client: &str) -> Re
     summary.took_ms = started.elapsed().as_millis();
     tracing::debug!(
         client,
+        model = %summary.model,
         system_bytes = summary.system_bytes,
         tools_bytes = summary.tools_bytes,
         messages_bytes = summary.messages_bytes,
@@ -1662,11 +1672,13 @@ mod tests {
     fn composition_covers_anthropic_openai_and_gemini_shapes() {
         let mut s = Summary::default();
         let anthropic = json!({
+            "model": "claude-test-1",
             "system": [{"type": "text", "text": "x".repeat(300)}],
             "tools": [{"name": "t", "description": "d".repeat(200), "input_schema": {}}],
             "messages": [{"role": "user", "content": "hi"}]
         });
         note_composition(&anthropic, &mut s);
+        assert_eq!(s.model, "claude-test-1");
         assert!(s.system_bytes > 300 && s.tools_bytes > 200 && s.messages_bytes > 10);
         assert!(s.system_bytes + s.tools_bytes + s.messages_bytes < anthropic.to_string().len());
 
@@ -1687,6 +1699,7 @@ mod tests {
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
         });
         note_composition(&gemini, &mut s);
+        assert!(s.model.is_empty());
         assert!(s.system_bytes > 50 && s.messages_bytes > 10);
     }
 

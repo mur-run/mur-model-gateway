@@ -81,12 +81,13 @@ strip | grep "upstream usage" | sed -E 's/.*upstream usage //' \
   }'
 
 echo
-echo "== by client (summary lines; composition = share of body bytes) =="
+echo "== by client and model (summary lines; composition = share of body bytes) =="
 strip | grep "compress summary" | sed -E 's/.*compress summary //' \
 | awk '
   {
     for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
     c = v["client"]; gsub(/"/, "", c); if (c == "") c = "(old binary)"
+    m = v["model"]; gsub(/"/, "", m); if (m != "") c = c " " m
     n[c]++; ms[c] += v["took_ms"]; if (v["took_ms"] + 0 > mx[c]) mx[c] = v["took_ms"] + 0
     b[c] += v["before"]; a[c] += v["after"]
     sy[c] += v["system_bytes"]; to[c] += v["tools_bytes"]; me[c] += v["messages_bytes"]
@@ -95,7 +96,7 @@ strip | grep "compress summary" | sed -E 's/.*compress summary //' \
   function pct(x, y) { return y ? sprintf("%.0f%%", 100 * x / y) : "n/a" }
   END {
     for (c in n)
-      printf "%-14s requests=%-5d avg %6.0f ms  max %6d ms  avg body %7.0f KB  saved %s  fired in %s  | system %s  tools %s  messages %s\n",
+      printf "%-32s requests=%-5d avg %6.0f ms  max %6d ms  avg body %7.0f KB  saved %s  fired in %s  | system %s  tools %s  messages %s\n",
         c, n[c], ms[c] / n[c], mx[c], b[c] / n[c] / 1024, pct(b[c] - a[c], b[c]), pct(f[c], n[c]), pct(sy[c], b[c]), pct(to[c], b[c]), pct(me[c], b[c])
   }' | sort
 
