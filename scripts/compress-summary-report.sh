@@ -37,3 +37,17 @@ strip | grep "compress summary" | sed -E 's/.*compress summary //' \
     printf "tokens (judged)   %d -> %d  saved %s\n", tb, ta, pct(tb - ta, tb)
     printf "time              avg %.0f ms  max %d ms\n", n ? ms / n : 0, maxms
   }'
+
+echo
+echo "== whole-body token savings (compress body tokens lines) =="
+strip | grep "compress body tokens" | sed -E 's/.*compress body tokens //' \
+| awk '
+  {
+    for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+    n++; b += v["body_tokens_before"]; a += v["body_tokens_after"]
+  }
+  END {
+    if (!n) { print "none logged"; exit }
+    printf "requests          %d\n", n
+    printf "body tokens       %d -> %d  saved %.2f%%\n", b, a, b ? 100 * (b - a) / b : 0
+  }'

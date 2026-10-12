@@ -818,7 +818,24 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // Wire-level compression (opt-in): rewrite fat tool_result blocks
     // before disguise. Fail-open — None means forward the original.
     let body_bytes = if state.compress && compress::should_compress(path_only, provider) {
-        match compress::rewrite_request_body(&body_bytes, provider) {
+        let rewrite = compress::rewrite_request_body(&body_bytes, provider);
+        // Whole-body token count, the denominator the summary line lacks.
+        // Tokenising ~1 MB costs ~150 ms of CPU, so it runs off the request
+        // path and only while someone is collecting the summary.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let original = body_bytes.clone();
+            let saved = rewrite.tokens_saved;
+            tokio::task::spawn_blocking(move || {
+                if let Some(before) = compress::count_body_tokens(&original) {
+                    tracing::debug!(
+                        body_tokens_before = before,
+                        body_tokens_after = before.saturating_sub(saved),
+                        "compress body tokens"
+                    );
+                }
+            });
+        }
+        match rewrite.body {
             Some(rewritten) => {
                 tracing::debug!(
                     before = body_bytes.len(),

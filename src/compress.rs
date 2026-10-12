@@ -934,10 +934,23 @@ fn shared_engine() -> Option<Arc<Shared>> {
     Some(shared)
 }
 
-/// Fail-open entry point for `forward()`: `Some(rewritten)` or `None` to
-/// forward the original body untouched. Always logs one summary line.
-pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Option<Vec<u8>> {
-    let shared = shared_engine()?;
+/// Outcome of [`rewrite_request_body`]: the rewritten body (or `None` to
+/// forward the original) plus the token delta the rewrite achieved, so the
+/// caller can relate it to the whole-body count without re-running
+/// compression.
+pub struct Rewrite {
+    pub body: Option<Vec<u8>>,
+    pub tokens_saved: usize,
+}
+
+/// Fail-open entry point for `forward()`. Always logs one summary line.
+pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Rewrite {
+    let Some(shared) = shared_engine() else {
+        return Rewrite {
+            body: None,
+            tokens_saved: 0,
+        };
+    };
     let started = Instant::now();
     let mut summary = Summary::default();
     let (engine, min_tokens, memo) = (&shared.engine, shared.min_tokens, &shared.memo);
@@ -967,7 +980,20 @@ pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Option<Vec<u8>> 
         took_ms = summary.took_ms,
         "compress summary"
     );
-    out
+    Rewrite {
+        body: out,
+        tokens_saved: summary.tokens_before.saturating_sub(summary.tokens_after),
+    }
+}
+
+/// Tokenise a whole request body with the shared engine's tokenizer. This
+/// is the denominator the summary line lacks (`tokens_before` only covers
+/// judged blocks). Costs ~0.15 ms/KB, so callers run it off the request
+/// path and only while the summary is being collected.
+pub fn count_body_tokens(body: &[u8]) -> Option<usize> {
+    let shared = shared_engine()?;
+    let text = std::str::from_utf8(body).ok()?;
+    Some(shared.engine.count_tokens(text))
 }
 
 #[cfg(test)]
