@@ -4,10 +4,17 @@
 # keeping: fired share, skip distribution, token vs byte savings, cold starts.
 #
 #   scripts/compress-summary-report.sh [proxy.log]
+#   MUR_REPORT_CLIENT=claude-cli scripts/compress-summary-report.sh   # one client only
+#
+# `client=` is the first token of the request's user-agent: `claude-cli`
+# for Claude Code, `none` for the MUR agent runtime (it sends no user-agent).
 set -euo pipefail
 
 LOG="${1:-$HOME/Library/Logs/mur-model-gateway/proxy.log}"
-strip() { sed 's/\x1b\[[0-9;]*m//g' "$LOG"; }
+strip() {
+  sed 's/\x1b\[[0-9;]*m//g' "$LOG" \
+  | if [ -n "${MUR_REPORT_CLIENT:-}" ]; then grep -E "client=\"?${MUR_REPORT_CLIENT}\"?( |$)" || true; else cat; fi
+}
 
 echo "== cold starts (expect 1 per process start) =="
 strip | grep -E "compress engine built|listening addr" | sed -E 's/ mur_model_gateway(::compress)?: / /' | cut -c1-120 || true
@@ -72,3 +79,38 @@ strip | grep "upstream usage" | sed -E 's/.*upstream usage //' \
     printf "tokens            uncached %d  cache_read %d  cache_creation %d  (creation share %s)\n", in_, r, c, pct(c, r + c)
     printf "big cache writes  >10k: %d  >50k: %d  (first turn of a session is expected to be one)\n", big10, big50
   }'
+
+echo
+echo "== by client (summary lines; composition = share of body bytes) =="
+strip | grep "compress summary" | sed -E 's/.*compress summary //' \
+| awk '
+  {
+    for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+    c = v["client"]; gsub(/"/, "", c); if (c == "") c = "(old binary)"
+    n[c]++; ms[c] += v["took_ms"]; if (v["took_ms"] + 0 > mx[c]) mx[c] = v["took_ms"] + 0
+    b[c] += v["before"]; a[c] += v["after"]
+    sy[c] += v["system_bytes"]; to[c] += v["tools_bytes"]; me[c] += v["messages_bytes"]
+    if (v["fired"] + 0 > 0) f[c]++
+  }
+  function pct(x, y) { return y ? sprintf("%.0f%%", 100 * x / y) : "n/a" }
+  END {
+    for (c in n)
+      printf "%-14s requests=%-5d avg %6.0f ms  max %6d ms  avg body %7.0f KB  saved %s  fired in %s  | system %s  tools %s  messages %s\n",
+        c, n[c], ms[c] / n[c], mx[c], b[c] / n[c] / 1024, pct(b[c] - a[c], b[c]), pct(f[c], n[c]), pct(sy[c], b[c]), pct(to[c], b[c]), pct(me[c], b[c])
+  }' | sort
+
+echo
+echo "== by client (upstream usage lines) =="
+strip | grep "upstream usage" | sed -E 's/.*upstream usage //' \
+| awk '
+  {
+    for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+    c = v["client"]; gsub(/"/, "", c); if (c == "") c = "(old binary)"
+    n[c]++; in_[c] += v["input_tokens"]; r[c] += v["cache_read_input_tokens"]; cr[c] += v["cache_creation_input_tokens"]
+  }
+  function pct(x, y) { return y ? sprintf("%.1f%%", 100 * x / y) : "n/a" }
+  END {
+    for (c in n)
+      printf "%-14s responses=%-5d avg input/response %8.0f  uncached %s  cache_read %d  cache_creation %d  (creation share %s)\n",
+        c, n[c], (in_[c] + r[c] + cr[c]) / n[c], in_[c], r[c], cr[c], pct(cr[c], r[c] + cr[c])
+  }' | sort

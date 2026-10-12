@@ -827,8 +827,11 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
 
     // Wire-level compression (opt-in): rewrite fat tool_result blocks
     // before disguise. Fail-open — None means forward the original.
+    // Attribution for the log lines below: Claude Code identifies itself
+    // (`claude-cli/...`), the MUR agent runtime sends no user-agent at all.
+    let client = client_label(&parts.headers);
     let body_bytes = if state.compress && compress::should_compress(path_only, provider) {
-        let rewrite = compress::rewrite_request_body(&body_bytes, provider);
+        let rewrite = compress::rewrite_request_body(&body_bytes, provider, &client);
         // Whole-body token count, the denominator the summary line lacks.
         // Tokenising ~1 MB costs ~150 ms of CPU, so it runs off the request
         // path and only under its own flag, never implicitly with DEBUG.
@@ -1349,6 +1352,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         status = %status,
         provider = ?provider,
         disguise = override_token.is_some(),
+        client = %client,
         content_encoding = response_headers
             .get("content-encoding")
             .and_then(|v| v.to_str().ok())
@@ -1364,7 +1368,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("text/event-stream"));
     let tap = matches!(provider, Provider::Anthropic) && status.is_success();
-    let stream = UsageTap::new(upstream_resp.bytes_stream(), tap, streaming);
+    let stream = UsageTap::new(upstream_resp.bytes_stream(), tap, streaming, client);
     let body = Body::from_stream(hold_permit_through(stream, permit));
 
     let mut builder = Response::builder().status(status.as_u16());
@@ -1395,8 +1399,9 @@ impl UpstreamUsage {
         })
     }
 
-    fn log(&self, streaming: bool) {
+    fn log(&self, streaming: bool, client: &str) {
         tracing::debug!(
+            client,
             input_tokens = self.input_tokens,
             cache_read_input_tokens = self.cache_read_input_tokens,
             cache_creation_input_tokens = self.cache_creation_input_tokens,
@@ -1455,15 +1460,17 @@ struct UsageTap<S> {
     buf: Vec<u8>,
     streaming: bool,
     done: bool,
+    client: String,
 }
 
 impl<S> UsageTap<S> {
-    fn new(inner: S, enabled: bool, streaming: bool) -> Self {
+    fn new(inner: S, enabled: bool, streaming: bool, client: String) -> Self {
         Self {
             inner: Box::pin(inner),
             buf: Vec::new(),
             streaming,
             done: !enabled,
+            client,
         }
     }
 
@@ -1487,7 +1494,7 @@ impl<S> UsageTap<S> {
             match usage_from_sse(&self.buf) {
                 SseScan::Pending => {}
                 SseScan::Found(u) => {
-                    u.log(true);
+                    u.log(true, &self.client);
                     self.finish();
                 }
                 SseScan::Absent => self.finish(),
@@ -1501,7 +1508,7 @@ impl<S> UsageTap<S> {
                 .ok()
                 .and_then(|v| UpstreamUsage::from_container(&v))
         {
-            u.log(false);
+            u.log(false, &self.client);
         }
         self.finish();
     }
@@ -1823,6 +1830,31 @@ fn has_client_credential(headers: &HeaderMap) -> bool {
 /// path as opaque bytes. Not advertising an encoding makes the upstream
 /// send identity, which every client accepts. Responses here are token
 /// streams of a few KB; the bandwidth is not worth the blind spot.
+/// Which client sent a request: the first product token of its
+/// `user-agent` (`claude-cli/2.1.296 (external, cli)` → `claude-cli`), or
+/// `none` when the header is absent — the MUR agent runtime uses a bare
+/// reqwest client and sends none. Attribution for the log only; it never
+/// changes what is forwarded.
+fn client_label(headers: &HeaderMap) -> String {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    let token: String = ua
+        .split(|c: char| c == '/' || c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(32)
+        .collect();
+    if token.is_empty() {
+        "none".to_string()
+    } else {
+        token
+    }
+}
+
 fn never_forwarded(name: &HeaderName) -> bool {
     is_hop_by_hop(name)
         || name == "host"
@@ -1865,6 +1897,21 @@ mod tests {
     fn hop_by_hop_filter_lowercase() {
         let n = HeaderName::from_static("connection");
         assert!(is_hop_by_hop(&n));
+    }
+
+    #[test]
+    fn client_label_takes_the_user_agent_product_token() {
+        let mut h = HeaderMap::new();
+        assert_eq!(client_label(&h), "none");
+        h.insert(
+            header::USER_AGENT,
+            "claude-cli/2.1.296 (external, cli)".parse().unwrap(),
+        );
+        assert_eq!(client_label(&h), "claude-cli");
+        h.insert(header::USER_AGENT, "Mozilla/5.0 (X11)".parse().unwrap());
+        assert_eq!(client_label(&h), "Mozilla");
+        h.insert(header::USER_AGENT, "   ".parse().unwrap());
+        assert_eq!(client_label(&h), "none");
     }
 
     #[test]

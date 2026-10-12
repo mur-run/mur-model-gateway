@@ -108,6 +108,14 @@ pub struct Summary {
     /// Stale stubs served from the memo / built fresh (archive + skeleton).
     pub stale_hit: usize,
     pub stale_miss: usize,
+    /// Serialized size of the body's main sections, so the log shows what a
+    /// request is made of per client (system prompt / tool schemas /
+    /// messages). For OpenAI-shaped bodies the system prompt lives inside
+    /// `messages`, so `system_bytes` is the `role: system` part of
+    /// `messages_bytes` rather than a disjoint section.
+    pub system_bytes: usize,
+    pub tools_bytes: usize,
+    pub messages_bytes: usize,
     pub before: usize,
     pub after: usize,
     /// Token totals over judged blocks only (hit + miss); `small`, `marker`
@@ -163,6 +171,39 @@ fn extract_tool_result_text(content: &Value) -> Option<String> {
             )
         }
         _ => None,
+    }
+}
+
+/// Fill [`Summary`]'s composition fields from a parsed body. Serialising the
+/// three subtrees costs about as much as one full serialise (~3 ms per MB),
+/// so callers only run it when the summary line will actually be emitted.
+fn note_composition(root: &Value, summary: &mut Summary) {
+    let size = |v: Option<&Value>| {
+        v.and_then(|v| serde_json::to_vec(v).ok())
+            .map_or(0, |b| b.len())
+    };
+    // Anthropic: system / tools / messages. Gemini: systemInstruction /
+    // tools / contents. OpenAI: tools / messages, system inside messages.
+    summary.system_bytes = size(root.get("system")).max(size(root.get("systemInstruction")));
+    summary.tools_bytes = size(root.get("tools"));
+    let msgs = root
+        .get("messages")
+        .or_else(|| root.get("contents"))
+        .or_else(|| root.get("input"));
+    summary.messages_bytes = size(msgs);
+    if summary.system_bytes == 0
+        && let Some(arr) = msgs.and_then(|m| m.as_array())
+    {
+        summary.system_bytes = arr
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.get("role").and_then(|r| r.as_str()),
+                    Some("system" | "developer")
+                )
+            })
+            .map(|m| size(Some(m)))
+            .sum();
     }
 }
 
@@ -705,6 +746,9 @@ fn rewrite_anthropic_with(
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        note_composition(&root, summary);
+    }
     let mut changed = collapse_stale_tool_results_anthropic(engine, memo, summary, &mut root);
     summary.stale = changed;
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
@@ -773,6 +817,9 @@ fn rewrite_openai_with(
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        note_composition(&root, summary);
+    }
     let mut changed = collapse_stale_tool_results_openai(engine, memo, summary, &mut root);
     summary.stale = changed;
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
@@ -837,6 +884,9 @@ fn rewrite_gemini_with(
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        note_composition(&root, summary);
+    }
     let mut changed = collapse_stale_tool_results_gemini(engine, memo, summary, &mut root);
     summary.stale = changed;
     let Some(contents) = root.get_mut("contents").and_then(|c| c.as_array_mut()) else {
@@ -1007,7 +1057,7 @@ pub struct Rewrite {
 }
 
 /// Fail-open entry point for `forward()`. Always logs one summary line.
-pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Rewrite {
+pub fn rewrite_request_body(body: &[u8], provider: Provider, client: &str) -> Rewrite {
     let Some(shared) = shared_engine() else {
         return Rewrite {
             body: None,
@@ -1028,6 +1078,10 @@ pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Rewrite {
     summary.after = out.as_ref().map_or(body.len(), Vec::len);
     summary.took_ms = started.elapsed().as_millis();
     tracing::debug!(
+        client,
+        system_bytes = summary.system_bytes,
+        tools_bytes = summary.tools_bytes,
+        messages_bytes = summary.messages_bytes,
         blocks = summary.blocks,
         hit = summary.hit,
         miss = summary.miss,
@@ -1602,6 +1656,38 @@ mod tests {
         assert!(first.contains("identical to a later tool result"));
         let second = v["messages"][3]["content"][0]["content"].as_str().unwrap();
         assert_eq!(second, repeated_output, "last occurrence kept in full");
+    }
+
+    #[test]
+    fn composition_covers_anthropic_openai_and_gemini_shapes() {
+        let mut s = Summary::default();
+        let anthropic = json!({
+            "system": [{"type": "text", "text": "x".repeat(300)}],
+            "tools": [{"name": "t", "description": "d".repeat(200), "input_schema": {}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        note_composition(&anthropic, &mut s);
+        assert!(s.system_bytes > 300 && s.tools_bytes > 200 && s.messages_bytes > 10);
+        assert!(s.system_bytes + s.tools_bytes + s.messages_bytes < anthropic.to_string().len());
+
+        let mut s = Summary::default();
+        let openai = json!({
+            "messages": [
+                {"role": "system", "content": "s".repeat(100)},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        note_composition(&openai, &mut s);
+        assert!(s.system_bytes > 100 && s.system_bytes < s.messages_bytes);
+        assert_eq!(s.tools_bytes, 0);
+
+        let mut s = Summary::default();
+        let gemini = json!({
+            "systemInstruction": {"parts": [{"text": "g".repeat(50)}]},
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        note_composition(&gemini, &mut s);
+        assert!(s.system_bytes > 50 && s.messages_bytes > 10);
     }
 
     #[test]

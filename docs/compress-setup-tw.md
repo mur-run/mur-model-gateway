@@ -68,3 +68,15 @@ Anthropic 的每個成功回應會多一行 `upstream usage`,帶 `input_tokens`�
 取代的 Read、與後面完全相同的 tool result)現在是 memo 過的,同一段 transcript 每個
 turn 重送只會 hit。`stale_miss` 每個新的取代事件大約一次;若持續偏高,代表 memo
 容量不夠或 transcript 內容在變。兩者都由 `scripts/compress-summary-report.sh` 彙總。
+
+## 診斷:分 client 看
+
+`compress summary`、`upstream usage`、`proxied` 都帶 `client=`,值是請求 User-Agent 的
+第一個 token:Claude Code 是 `claude-cli`,MUR agent runtime 沒送 User-Agent 所以是 `none`。
+`compress summary` 另有 `system_bytes` / `tools_bytes` / `messages_bytes`,是 body 三個區段
+序列化後的大小,用來看每種 client 的請求是由什麼組成的。
+
+```
+scripts/compress-summary-report.sh                          # 全部,最後兩段按 client 分列
+MUR_REPORT_CLIENT=none scripts/compress-summary-report.sh   # 只看 MUR agent 的流量
+```
