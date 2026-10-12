@@ -26,7 +26,10 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
   in, Responses upstream; point an OpenAI client here to use a ChatGPT
   subscription).
 - **Optional wire compression.** `MUR_MODEL_GATEWAY_COMPRESS=1` applies MUR's
-  CCR compression to `tool_result` blocks on all three providers.
+  CCR compression to `tool_result` blocks on all three providers. Verdicts
+  are memoised per block, so a resent transcript costs only its new blocks;
+  each request logs one `compress summary` line at `debug` (hit/miss/skip
+  counts, bytes before/after, time taken).
 - **Cheap to leave running.** One static Rust binary, ~40 MB resident with
   compression off — no runtime, no Node process, no container.
   [Measured numbers below.](#resource-usage-and-sizing)
