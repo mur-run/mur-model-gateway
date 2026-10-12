@@ -959,7 +959,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
 
     let mut client_betas: Vec<String> = Vec::new();
     for (name, value) in parts.headers.iter() {
-        if is_hop_by_hop(name) || name == "host" || name == "content-length" {
+        if never_forwarded(name) {
             continue;
         }
         // When disguising we own auth headers — drop client copies — and
@@ -1042,12 +1042,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         // as its own loop rather than reusing the one above so the
         // Anthropic disguise path stays untouched by this fix.
         for (name, value) in parts.headers.iter() {
-            if is_hop_by_hop(name)
-                || name == "host"
-                || name == "content-length"
-                || name == "authorization"
-                || name == "x-api-key"
-            {
+            if never_forwarded(name) || name == "authorization" || name == "x-api-key" {
                 continue;
             }
             retry = retry.header(name, value);
@@ -1183,9 +1178,7 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         // attempt: `apply_disguise_headers` re-adds the merged value, and
         // forwarding the client's raw header too would send upstream two.
         for (name, value) in parts.headers.iter() {
-            if is_hop_by_hop(name)
-                || name == "host"
-                || name == "content-length"
+            if never_forwarded(name)
                 || name == "authorization"
                 || name == "x-api-key"
                 || name == "anthropic-beta"
@@ -1356,6 +1349,10 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         status = %status,
         provider = ?provider,
         disguise = override_token.is_some(),
+        content_encoding = response_headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("identity"),
         "proxied"
     );
 
@@ -1819,6 +1816,20 @@ fn has_client_credential(headers: &HeaderMap) -> bool {
     non_empty(headers.get(header::AUTHORIZATION)) || non_empty(headers.get("x-api-key"))
 }
 
+/// Request headers the gateway never copies upstream: hop-by-hop ones, the
+/// two the HTTP client sets itself, and `accept-encoding`. The last is
+/// deliberate: reqwest is built without response decompression, so an
+/// encoded upstream body would reach the usage tap and the Codex translate
+/// path as opaque bytes. Not advertising an encoding makes the upstream
+/// send identity, which every client accepts. Responses here are token
+/// streams of a few KB; the bandwidth is not worth the blind spot.
+fn never_forwarded(name: &HeaderName) -> bool {
+    is_hop_by_hop(name)
+        || name == "host"
+        || name == "content-length"
+        || name == header::ACCEPT_ENCODING
+}
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -1854,6 +1865,16 @@ mod tests {
     fn hop_by_hop_filter_lowercase() {
         let n = HeaderName::from_static("connection");
         assert!(is_hop_by_hop(&n));
+    }
+
+    #[test]
+    fn accept_encoding_is_never_forwarded() {
+        assert!(never_forwarded(&header::ACCEPT_ENCODING));
+        assert!(never_forwarded(&HeaderName::from_static("host")));
+        assert!(!never_forwarded(&HeaderName::from_static(
+            "anthropic-version"
+        )));
+        assert!(!never_forwarded(&HeaderName::from_static("accept")));
     }
 
     #[test]
