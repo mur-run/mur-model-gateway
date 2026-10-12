@@ -17,11 +17,11 @@ strip() {
 }
 
 echo "== cold starts (expect 1 per process start) =="
-strip | grep -E "compress engine built|listening addr" | sed -E 's/ mur_model_gateway(::compress)?: / /' | cut -c1-120 || true
+strip | { grep -E "compress engine built|listening addr" || true; } | sed -E 's/ mur_model_gateway(::compress)?: / /' | cut -c1-120 || true
 
 echo
 echo "== compress summary totals =="
-strip | grep "compress summary" | sed -E 's/.*compress summary //' \
+strip | { grep "compress summary" || true; } | sed -E 's/.*compress summary //' \
 | awk '
   {
     for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
@@ -49,7 +49,7 @@ strip | grep "compress summary" | sed -E 's/.*compress summary //' \
 
 echo
 echo "== whole-body token savings (compress body tokens lines) =="
-strip | grep "compress body tokens" | sed -E 's/.*compress body tokens //' \
+strip | { grep "compress body tokens" || true; } | sed -E 's/.*compress body tokens //' \
 | awk '
   {
     for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
@@ -63,7 +63,7 @@ strip | grep "compress body tokens" | sed -E 's/.*compress body tokens //' \
 
 echo
 echo "== upstream usage (Anthropic responses; cache_creation = prompt-cache writes) =="
-strip | grep "upstream usage" | sed -E 's/.*upstream usage //' \
+strip | { grep "upstream usage" || true; } | sed -E 's/.*upstream usage //' \
 | awk '
   {
     for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
@@ -82,7 +82,7 @@ strip | grep "upstream usage" | sed -E 's/.*upstream usage //' \
 
 echo
 echo "== by client and model (summary lines; composition = share of body bytes) =="
-strip | grep "compress summary" | sed -E 's/.*compress summary //' \
+strip | { grep "compress summary" || true; } | sed -E 's/.*compress summary //' \
 | awk '
   {
     for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
@@ -102,7 +102,7 @@ strip | grep "compress summary" | sed -E 's/.*compress summary //' \
 
 echo
 echo "== by client (upstream usage lines) =="
-strip | grep "upstream usage" | sed -E 's/.*upstream usage //' \
+strip | { grep "upstream usage" || true; } | sed -E 's/.*upstream usage //' \
 | awk '
   {
     for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
