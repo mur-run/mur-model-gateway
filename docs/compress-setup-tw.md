@@ -43,3 +43,16 @@ mur compress stats
 壓縮後的原文存在 `~/.mur/compress`,模型可透過 `mur_retrieve` MCP tool 還原。
 沒有掛 mur MCP server 的 client 只看得到壓縮摘要,無法還原——全面預設開啓前
 先確認各 mur agent 都有接上。
+
+## 診斷:整個 body 的 token 數
+
+`compress summary` 的 `tokens_before/after` 只算有進 tokenizer 的 block,不是整個請求。
+要知道「這層對整個請求省了幾 %」,另外開:
+
+```
+MUR_MODEL_GATEWAY_COMPRESS_BODY_TOKENS=1   # 搭配 RUST_LOG=debug
+```
+
+每個請求會多做一次全 body tokenize(約 150 ms CPU / MB),在背景執行、不擋請求,
+但是持續的 CPU 稅,觀察結束就關掉。結果記在 `compress body tokens` 這行,
+用 `scripts/compress-summary-report.sh` 彙總。

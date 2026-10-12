@@ -350,6 +350,12 @@ pub struct AppState {
     /// Wire-level tool_result compression (spec: docs/specs/2026-07-03).
     /// Env-gated: MUR_MODEL_GATEWAY_COMPRESS=1. Tests flip the field directly.
     pub compress: bool,
+    /// Log whole-body token counts for every compressed request
+    /// (`compress body tokens` debug line). Env-gated separately
+    /// (MUR_MODEL_GATEWAY_COMPRESS_BODY_TOKENS=1) because it tokenises the
+    /// full body off the request path: ~150 ms of background CPU per MB,
+    /// a tax that must not ride along with the DEBUG log level forever.
+    pub compress_body_tokens: bool,
     /// Cross-process upstream concurrency cap (see module docs on
     /// `ProviderSemaphores`). `None` (the default) is unlimited — today's
     /// behaviour for every deployment that never calls
@@ -401,6 +407,8 @@ impl AppState {
             token_source_codex: TokenSource::Disabled,
             version_cache,
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
+            compress_body_tokens: std::env::var("MUR_MODEL_GATEWAY_COMPRESS_BODY_TOKENS")
+                .is_ok_and(|v| v == "1"),
             concurrency: None,
             queue_timeout: DEFAULT_QUEUE_TIMEOUT,
         })
@@ -821,8 +829,10 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         let rewrite = compress::rewrite_request_body(&body_bytes, provider);
         // Whole-body token count, the denominator the summary line lacks.
         // Tokenising ~1 MB costs ~150 ms of CPU, so it runs off the request
-        // path and only while someone is collecting the summary.
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        // path and only under its own flag, never implicitly with DEBUG.
+        // It is spawned, not awaited: the line may land after the summary
+        // or be lost on restart, and the report script tolerates both.
+        if state.compress_body_tokens && tracing::enabled!(tracing::Level::DEBUG) {
             let original = body_bytes.clone();
             let saved = rewrite.tokens_saved;
             tokio::task::spawn_blocking(move || {
