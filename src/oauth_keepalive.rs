@@ -26,6 +26,9 @@ const LEAD: Duration = Duration::from_secs(2 * 60);
 /// A spawn that left the expiry unchanged waits this long before the next.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
+/// How much of a failed spawn's stdout/stderr is logged — enough for Claude
+/// Code's error line, not a whole transcript.
+const OUTPUT_TAIL_CHARS: usize = 2000;
 /// The cheapest request that makes Claude Code check its credential.
 const CLAUDE_ARGS: [&str; 4] = ["-p", "ok", "--model", "haiku"];
 
@@ -53,6 +56,26 @@ pub fn refresh_due(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
     expires_at_ms.is_some_and(|e| e - LEAD.as_millis() as i64 <= now_ms)
 }
 
+/// Claude Code zeroes `expiresAt` when its own refresh fails. From there only
+/// an interactive login recovers, so spawning `claude -p` again is pointless.
+pub fn needs_relogin(expires_at_ms: Option<i64>) -> bool {
+    expires_at_ms.is_some_and(|e| e <= 0)
+}
+
+/// The last [`OUTPUT_TAIL_CHARS`] characters of a captured stream, trimmed.
+fn output_tail(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let text = text.trim();
+    let skip = text.chars().count().saturating_sub(OUTPUT_TAIL_CHARS);
+    text.chars().skip(skip).collect()
+}
+
+struct ClaudeRun {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -70,16 +93,20 @@ fn stored_expiry(source: &TokenSource) -> Option<i64> {
     }
 }
 
-async fn run_claude(bin: &std::path::Path) -> Result<std::process::ExitStatus, String> {
+async fn run_claude(bin: &std::path::Path) -> Result<ClaudeRun, String> {
     let child = tokio::process::Command::new(bin)
         .args(CLAUDE_ARGS)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .status();
+        .output();
     match tokio::time::timeout(SPAWN_TIMEOUT, child).await {
-        Ok(Ok(status)) => Ok(status),
+        Ok(Ok(out)) => Ok(ClaudeRun {
+            status: out.status,
+            stdout: output_tail(&out.stdout),
+            stderr: output_tail(&out.stderr),
+        }),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!("timed out after {}s", SPAWN_TIMEOUT.as_secs())),
     }
@@ -109,9 +136,22 @@ pub fn spawn_if_enabled(source: TokenSource) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(TICK);
         let mut backoff_until_ms = 0;
+        let mut relogin_warned = false;
         loop {
             interval.tick().await;
             let before = stored_expiry(&source);
+            if needs_relogin(before) {
+                if !relogin_warned {
+                    tracing::warn!(
+                        expires_at_ms = ?before,
+                        "oauth keepalive: Claude Code marked the credential expired after a failed refresh; \
+                         re-login needed — run `claude` interactively once"
+                    );
+                    relogin_warned = true;
+                }
+                continue;
+            }
+            relogin_warned = false;
             if now_ms() < backoff_until_ms || !refresh_due(before, now_ms()) {
                 continue;
             }
@@ -121,14 +161,24 @@ pub fn spawn_if_enabled(source: TokenSource) {
             let after = stored_expiry(&source);
             if after != before && !refresh_due(after, now_ms()) {
                 tracing::info!(expires_at_ms = ?after, "oauth keepalive: credential refreshed");
-            } else {
-                backoff_until_ms = now_ms() + FAILURE_BACKOFF.as_millis() as i64;
-                tracing::warn!(
-                    ?result,
+                continue;
+            }
+            backoff_until_ms = now_ms() + FAILURE_BACKOFF.as_millis() as i64;
+            match &result {
+                Ok(run) => tracing::warn!(
+                    status = %run.status,
+                    stderr = %run.stderr,
+                    stdout = %run.stdout,
                     expires_at_ms = ?after,
                     backoff_secs = FAILURE_BACKOFF.as_secs(),
                     "oauth keepalive: claude ran but the credential did not change"
-                );
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    expires_at_ms = ?after,
+                    backoff_secs = FAILURE_BACKOFF.as_secs(),
+                    "oauth keepalive: claude spawn failed; credential did not change"
+                ),
             }
         }
     });
@@ -146,6 +196,27 @@ mod tests {
         assert!(!refresh_due(Some(now + lead + 1), now));
         assert!(refresh_due(Some(now + lead), now));
         assert!(refresh_due(Some(now - 1), now), "already expired is due");
+    }
+
+    #[test]
+    fn zeroed_expiry_needs_relogin_not_a_respawn() {
+        assert!(needs_relogin(Some(0)));
+        assert!(needs_relogin(Some(-1)));
+        assert!(!needs_relogin(None), "unknown expiry is not a zeroed one");
+        assert!(!needs_relogin(Some(1_791_356_125_689)));
+    }
+
+    #[test]
+    fn output_tail_keeps_the_trimmed_end() {
+        assert_eq!(
+            output_tail(b"  error: refresh failed\n"),
+            "error: refresh failed"
+        );
+        let long = "x".repeat(OUTPUT_TAIL_CHARS) + "END";
+        let tail = output_tail(long.as_bytes());
+        assert_eq!(tail.chars().count(), OUTPUT_TAIL_CHARS);
+        assert!(tail.ends_with("END"));
+        assert_eq!(output_tail("錯誤".as_bytes()), "錯誤", "multi-byte safe");
     }
 
     #[test]
