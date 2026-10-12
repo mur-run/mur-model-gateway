@@ -20,7 +20,16 @@ use std::time::Instant;
 /// `None` is a verdict too ("leave it alone") — without negative entries
 /// every under-threshold block would be re-tokenised each turn.
 pub struct Memo {
-    inner: Mutex<lru::LruCache<u64, Option<Arc<str>>>>,
+    inner: Mutex<lru::LruCache<u64, Arc<Verdict>>>,
+}
+
+/// One memoised outcome. Token counts ride along so a replayed verdict
+/// still contributes to the per-request token tally without re-tokenising.
+struct Verdict {
+    /// `Some` → replace the block with this text; `None` → leave it alone.
+    text: Option<Arc<str>>,
+    tokens_before: usize,
+    tokens_after: usize,
 }
 
 impl Memo {
@@ -38,11 +47,11 @@ impl Memo {
     }
 
     /// `Some(verdict)` on hit; the outer `None` is a miss.
-    fn get(&self, key: u64) -> Option<Option<Arc<str>>> {
+    fn get(&self, key: u64) -> Option<Arc<Verdict>> {
         self.inner.lock().unwrap().get(&key).cloned()
     }
 
-    fn put(&self, key: u64, verdict: Option<Arc<str>>) {
+    fn put(&self, key: u64, verdict: Arc<Verdict>) {
         self.inner.lock().unwrap().put(key, verdict);
     }
 }
@@ -67,6 +76,10 @@ pub struct Summary {
     pub stale: bool,
     pub before: usize,
     pub after: usize,
+    /// Token totals over judged blocks only (hit + miss); `small`, `marker`
+    /// and `exempt` blocks are never tokenised, so they are not included.
+    pub tokens_before: usize,
+    pub tokens_after: usize,
     pub took_ms: u128,
 }
 
@@ -830,18 +843,25 @@ fn compress_text(
         None => {
             summary.miss += 1;
             let out = auto_compress(engine, s, None, min_tokens);
-            let v = out.fired.then(|| {
+            let text = out.fired.then(|| {
                 let text = match out.hash.as_deref() {
                     Some(h) => format!("{}\n[{}]", out.text, retrieval_note(Some(h), None)),
                     None => out.text,
                 };
                 Arc::<str>::from(text)
             });
-            memo.put(key, v.clone());
+            let v = Arc::new(Verdict {
+                text,
+                tokens_before: out.original_tokens,
+                tokens_after: out.compressed_tokens,
+            });
+            memo.put(key, Arc::clone(&v));
             v
         }
     };
-    match verdict {
+    summary.tokens_before += verdict.tokens_before;
+    summary.tokens_after += verdict.tokens_after;
+    match &verdict.text {
         Some(text) => {
             summary.fired += 1;
             *s = text.to_string();
@@ -935,6 +955,8 @@ pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Option<Vec<u8>> 
         stale = summary.stale,
         before = summary.before,
         after = summary.after,
+        tokens_before = summary.tokens_before,
+        tokens_after = summary.tokens_after,
         took_ms = summary.took_ms,
         "compress summary"
     );
@@ -1078,10 +1100,16 @@ mod tests {
         let mut s1 = Summary::default();
         let out1 = rewrite_anthropic_with(&engine, 800, &memo, &mut s1, &body).unwrap();
         assert_eq!((s1.blocks, s1.miss, s1.hit, s1.fired), (1, 1, 0, 1));
+        assert!(s1.tokens_before > 800 && s1.tokens_after < s1.tokens_before);
 
         let mut s2 = Summary::default();
         let out2 = rewrite_anthropic_with(&engine, 800, &memo, &mut s2, &body).unwrap();
         assert_eq!((s2.blocks, s2.miss, s2.hit, s2.fired), (1, 0, 1, 1));
+        // A replayed verdict still reports the same token tally.
+        assert_eq!(
+            (s2.tokens_before, s2.tokens_after),
+            (s1.tokens_before, s1.tokens_after)
+        );
         assert_eq!(out1, out2);
     }
 
