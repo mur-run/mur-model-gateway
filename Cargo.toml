@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "5"
 futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+lru = "0.12"
 # git tag (not local path) so mur-model-gateway builds on deploy hosts without a mur checkout;
 # keep the tag in lockstep with the mur version you develop against.
 mur-compress = { git = "https://github.com/mur-run/mur.git", tag = "v2.91.9", package = "mur-compress" }

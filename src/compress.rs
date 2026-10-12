@@ -7,7 +7,78 @@ use crate::codex;
 use mur_compress::{CompressConfig, CompressEngine, auto_compress, retrieval_note};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+/// Content-addressed memo of `compress_text` verdicts. Claude Code resends
+/// the whole transcript every turn, so nearly every block the gateway sees
+/// was already judged on an earlier turn; compression is a pure function
+/// of the text (given a fixed config), so the verdict can be replayed.
+/// `None` is a verdict too ("leave it alone") — without negative entries
+/// every under-threshold block would be re-tokenised each turn.
+pub struct Memo {
+    inner: Mutex<lru::LruCache<u64, Option<Arc<str>>>>,
+}
+
+impl Memo {
+    pub fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
+        Self {
+            inner: Mutex::new(lru::LruCache::new(cap)),
+        }
+    }
+
+    fn key(text: &str) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        h.finish()
+    }
+
+    /// `Some(verdict)` on hit; the outer `None` is a miss.
+    fn get(&self, key: u64) -> Option<Option<Arc<str>>> {
+        self.inner.lock().unwrap().get(&key).cloned()
+    }
+
+    fn put(&self, key: u64, verdict: Option<Arc<str>>) {
+        self.inner.lock().unwrap().put(key, verdict);
+    }
+}
+
+/// Per-request accounting, logged as one line so the "why only N%?"
+/// question is answerable from the proxy log instead of guesswork.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Summary {
+    /// Blocks that reached `compress_text` (everything except exempt ones).
+    pub blocks: usize,
+    pub hit: usize,
+    pub miss: usize,
+    /// Skipped before the memo: fewer bytes than `min_tokens`.
+    pub small: usize,
+    /// Skipped before the memo: already carries a retrieval marker.
+    pub marker: usize,
+    /// Read / retrieve results, never compressed.
+    pub exempt: usize,
+    /// Blocks whose verdict was "compress" (hit or miss).
+    pub fired: usize,
+    /// Whether any stale tool_result was collapsed into a stub this request.
+    pub stale: bool,
+    pub before: usize,
+    pub after: usize,
+    pub took_ms: u128,
+}
+
+/// Every output-affecting setting lives in `CompressConfig` and it is
+/// `Serialize`, so its JSON form is the fingerprint. The memo is only
+/// valid beside the engine it was built with; when this changes both are
+/// rebuilt together.
+pub fn config_fingerprint(cfg: &CompressConfig) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(cfg).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
 
 /// Why a `tool_result` was collapsed into a stub — drives the wording so the
 /// model understands what happened without needing to retrieve the original.
@@ -539,13 +610,27 @@ fn exempt_tool_call_ids_openai(messages: &[Value]) -> std::collections::HashSet<
         .collect()
 }
 
+#[cfg(test)]
 fn rewrite_tool_results_anthropic(
     engine: &CompressEngine,
     min_tokens: usize,
     body: &[u8],
 ) -> Option<Vec<u8>> {
+    let memo = Memo::new(1);
+    let mut summary = Summary::default();
+    rewrite_anthropic_with(engine, min_tokens, &memo, &mut summary, body)
+}
+
+fn rewrite_anthropic_with(
+    engine: &CompressEngine,
+    min_tokens: usize,
+    memo: &Memo,
+    summary: &mut Summary,
+    body: &[u8],
+) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
     let mut changed = collapse_stale_tool_results_anthropic(engine, &mut root);
+    summary.stale = changed;
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
     };
@@ -563,20 +648,21 @@ fn rewrite_tool_results_anthropic(
                 .and_then(|t| t.as_str())
                 .is_some_and(|id| exempt.contains(id))
             {
+                summary.exempt += 1;
                 continue;
             }
             let Some(inner) = block.get_mut("content") else {
                 continue;
             };
             match inner {
-                Value::String(s) => changed |= compress_text(engine, min_tokens, s),
+                Value::String(s) => changed |= compress_text(engine, min_tokens, memo, summary, s),
                 Value::Array(items) => {
                     for item in items.iter_mut() {
                         if item.get("type").and_then(|t| t.as_str()) != Some("text") {
                             continue;
                         }
                         if let Some(Value::String(s)) = item.get_mut("text") {
-                            changed |= compress_text(engine, min_tokens, s);
+                            changed |= compress_text(engine, min_tokens, memo, summary, s);
                         }
                     }
                 }
@@ -592,13 +678,27 @@ fn rewrite_tool_results_anthropic(
 
 /// Compress oversized `content` fields in OpenAI `role: "tool"` messages.
 /// Sibling fields (`role`, `tool_call_id`) are preserved in-place.
+#[cfg(test)]
 fn rewrite_tool_results_openai(
     engine: &CompressEngine,
     min_tokens: usize,
     body: &[u8],
 ) -> Option<Vec<u8>> {
+    let memo = Memo::new(1);
+    let mut summary = Summary::default();
+    rewrite_openai_with(engine, min_tokens, &memo, &mut summary, body)
+}
+
+fn rewrite_openai_with(
+    engine: &CompressEngine,
+    min_tokens: usize,
+    memo: &Memo,
+    summary: &mut Summary,
+    body: &[u8],
+) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
     let mut changed = collapse_stale_tool_results_openai(engine, &mut root);
+    summary.stale = changed;
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
     };
@@ -612,20 +712,21 @@ fn rewrite_tool_results_openai(
             .and_then(|t| t.as_str())
             .is_some_and(|id| exempt.contains(id))
         {
+            summary.exempt += 1;
             continue;
         }
         let Some(content) = msg.get_mut("content") else {
             continue;
         };
         match content {
-            Value::String(s) => changed |= compress_text(engine, min_tokens, s),
+            Value::String(s) => changed |= compress_text(engine, min_tokens, memo, summary, s),
             Value::Array(items) => {
                 for item in items.iter_mut() {
                     if item.get("type").and_then(|t| t.as_str()) != Some("text") {
                         continue;
                     }
                     if let Some(Value::String(s)) = item.get_mut("text") {
-                        changed |= compress_text(engine, min_tokens, s);
+                        changed |= compress_text(engine, min_tokens, memo, summary, s);
                     }
                 }
             }
@@ -641,13 +742,27 @@ fn rewrite_tool_results_openai(
 /// Compress oversized `functionResponse` parts in Gemini request bodies.
 /// The `functionResponse.response` field is either a string or an object
 /// with a `result` key — both are handled. Sibling fields (`name`) survive.
+#[cfg(test)]
 fn rewrite_tool_results_gemini(
     engine: &CompressEngine,
     min_tokens: usize,
     body: &[u8],
 ) -> Option<Vec<u8>> {
+    let memo = Memo::new(1);
+    let mut summary = Summary::default();
+    rewrite_gemini_with(engine, min_tokens, &memo, &mut summary, body)
+}
+
+fn rewrite_gemini_with(
+    engine: &CompressEngine,
+    min_tokens: usize,
+    memo: &Memo,
+    summary: &mut Summary,
+    body: &[u8],
+) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
     let mut changed = collapse_stale_tool_results_gemini(engine, &mut root);
+    summary.stale = changed;
     let Some(contents) = root.get_mut("contents").and_then(|c| c.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
     };
@@ -663,16 +778,17 @@ fn rewrite_tool_results_gemini(
             // the earlier `functionCall`, so only name-based exemptions apply.
             let name = fr.get("name").and_then(|n| n.as_str()).unwrap_or_default();
             if is_verbatim_tool(name, None) {
+                summary.exempt += 1;
                 continue;
             }
             let Some(response) = fr.get_mut("response") else {
                 continue;
             };
             match response {
-                Value::String(s) => changed |= compress_text(engine, min_tokens, s),
+                Value::String(s) => changed |= compress_text(engine, min_tokens, memo, summary, s),
                 Value::Object(obj) => {
                     if let Some(Value::String(s)) = obj.get_mut("result") {
-                        changed |= compress_text(engine, min_tokens, s);
+                        changed |= compress_text(engine, min_tokens, memo, summary, s);
                     }
                 }
                 _ => {}
@@ -687,19 +803,52 @@ fn rewrite_tool_results_gemini(
 
 /// Replace `s` with its compressed form when compression fires.
 /// Returns true iff replaced.
-fn compress_text(engine: &CompressEngine, min_tokens: usize, s: &mut String) -> bool {
+fn compress_text(
+    engine: &CompressEngine,
+    min_tokens: usize,
+    memo: &Memo,
+    summary: &mut Summary,
+    s: &mut String,
+) -> bool {
+    summary.blocks += 1;
+    // A BPE token is at least one byte, so fewer bytes than `min_tokens`
+    // means fewer tokens: skip without tokenising or touching the memo.
+    if s.len() < min_tokens {
+        summary.small += 1;
+        return false;
+    }
     if has_retrieve_marker(s) {
+        summary.marker += 1;
         return false;
     }
-    let out = auto_compress(engine, s, None, min_tokens);
-    if !out.fired {
-        return false;
-    }
-    *s = match out.hash.as_deref() {
-        Some(h) => format!("{}\n[{}]", out.text, retrieval_note(Some(h), None)),
-        None => out.text,
+    let key = Memo::key(s);
+    let verdict = match memo.get(key) {
+        Some(v) => {
+            summary.hit += 1;
+            v
+        }
+        None => {
+            summary.miss += 1;
+            let out = auto_compress(engine, s, None, min_tokens);
+            let v = out.fired.then(|| {
+                let text = match out.hash.as_deref() {
+                    Some(h) => format!("{}\n[{}]", out.text, retrieval_note(Some(h), None)),
+                    None => out.text,
+                };
+                Arc::<str>::from(text)
+            });
+            memo.put(key, v.clone());
+            v
+        }
     };
-    true
+    match verdict {
+        Some(text) => {
+            summary.fired += 1;
+            *s = text.to_string();
+            true
+        }
+        None => false,
+    }
 }
 
 /// mur's home resolution, mirrored: `MUR_HOME` env else `~/.mur`.
@@ -710,33 +859,86 @@ fn mur_home() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.home_dir().join(".mur"))
 }
 
-/// Per-request engine rooted at `<mur_home>/compress` — the same store mur
-/// itself uses, so `mur_retrieve` recovers proxy-compressed blocks. Returns
-/// `None` (→ passthrough) when mur config disables compression or the
-/// store can't be opened. Per-request construction matches mur's own
-/// call sites (MCP server); cost is negligible next to an LLM round trip.
-fn build_engine() -> Option<(CompressEngine, usize)> {
+/// Engine + memo that outlive a single request. The engine is rooted at
+/// `<mur_home>/compress` — the same store mur itself uses, so
+/// `mur_retrieve` recovers proxy-compressed blocks. Building it loads the
+/// tiktoken BPE (~40 ms), which is why it is not per-request.
+struct Shared {
+    engine: CompressEngine,
+    min_tokens: usize,
+    memo: Memo,
+    fingerprint: u64,
+}
+
+/// Upper bound on memoised verdicts. Values are compressed blocks (a few
+/// KB each), so the worst case is a few tens of MB.
+const MEMO_CAPACITY: usize = 8192;
+
+static SHARED: OnceLock<Mutex<Option<Arc<Shared>>>> = OnceLock::new();
+
+/// Returns `None` (→ passthrough) when mur config disables compression or
+/// the store can't be opened. Config is re-read every call (it is a
+/// sub-millisecond file read) so edits take effect without a restart; a
+/// changed fingerprint rebuilds engine and memo together, never one
+/// without the other.
+fn shared_engine() -> Option<Arc<Shared>> {
     let home = mur_home()?;
     let cfg = CompressConfig::load(&home);
     if !cfg.enabled || !cfg.auto.enabled {
         return None;
     }
+    let fingerprint = config_fingerprint(&cfg);
+    let slot = SHARED.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap();
+    if let Some(s) = guard.as_ref()
+        && s.fingerprint == fingerprint
+    {
+        return Some(Arc::clone(s));
+    }
     let min_tokens = cfg.auto.min_tokens;
-    CompressEngine::new(home.join("compress"), cfg)
-        .ok()
-        .map(|e| (e, min_tokens))
+    let engine = CompressEngine::new(home.join("compress"), cfg).ok()?;
+    let shared = Arc::new(Shared {
+        engine,
+        min_tokens,
+        memo: Memo::new(MEMO_CAPACITY),
+        fingerprint,
+    });
+    *guard = Some(Arc::clone(&shared));
+    Some(shared)
 }
 
 /// Fail-open entry point for `forward()`: `Some(rewritten)` or `None` to
-/// forward the original body untouched.
+/// forward the original body untouched. Always logs one summary line.
 pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Option<Vec<u8>> {
-    let (engine, min_tokens) = build_engine()?;
-    match provider {
-        Provider::Anthropic => rewrite_tool_results_anthropic(&engine, min_tokens, body),
-        Provider::OpenAI => rewrite_tool_results_openai(&engine, min_tokens, body),
-        Provider::Gemini => rewrite_tool_results_gemini(&engine, min_tokens, body),
-        Provider::Codex => rewrite_tool_results_openai(&engine, min_tokens, body),
-    }
+    let shared = shared_engine()?;
+    let started = Instant::now();
+    let mut summary = Summary::default();
+    let (engine, min_tokens, memo) = (&shared.engine, shared.min_tokens, &shared.memo);
+    let out = match provider {
+        Provider::Anthropic => rewrite_anthropic_with(engine, min_tokens, memo, &mut summary, body),
+        Provider::OpenAI | Provider::Codex => {
+            rewrite_openai_with(engine, min_tokens, memo, &mut summary, body)
+        }
+        Provider::Gemini => rewrite_gemini_with(engine, min_tokens, memo, &mut summary, body),
+    };
+    summary.before = body.len();
+    summary.after = out.as_ref().map_or(body.len(), Vec::len);
+    summary.took_ms = started.elapsed().as_millis();
+    tracing::debug!(
+        blocks = summary.blocks,
+        hit = summary.hit,
+        miss = summary.miss,
+        fired = summary.fired,
+        small = summary.small,
+        marker = summary.marker,
+        exempt = summary.exempt,
+        stale = summary.stale,
+        before = summary.before,
+        after = summary.after,
+        took_ms = summary.took_ms,
+        "compress summary"
+    );
+    out
 }
 
 #[cfg(test)]
@@ -861,6 +1063,103 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    /// Claude Code resends the whole transcript every turn, so the same
+    /// tool_result text arrives at the gateway turn after turn. The second
+    /// pass over an identical body must come entirely from the memo and
+    /// produce byte-identical output (stable under prefix caching).
+    #[test]
+    fn second_identical_body_is_served_from_memo() {
+        let (_dir, engine) = test_engine();
+        let memo = Memo::new(64);
+        let body = body_with_tool_result(json!(fat_log()));
+
+        let mut s1 = Summary::default();
+        let out1 = rewrite_anthropic_with(&engine, 800, &memo, &mut s1, &body).unwrap();
+        assert_eq!((s1.blocks, s1.miss, s1.hit, s1.fired), (1, 1, 0, 1));
+
+        let mut s2 = Summary::default();
+        let out2 = rewrite_anthropic_with(&engine, 800, &memo, &mut s2, &body).unwrap();
+        assert_eq!((s2.blocks, s2.miss, s2.hit, s2.fired), (1, 0, 1, 1));
+        assert_eq!(out1, out2);
+    }
+
+    /// "Leave it alone" is a result too. Without a negative entry every
+    /// under-threshold block would be re-tokenised on every turn.
+    #[test]
+    fn negative_outcome_is_memoised() {
+        let (_dir, engine) = test_engine();
+        let memo = Memo::new(64);
+        // 2000 bytes (clears the byte pre-gate) but only ~400 tokens.
+        let body = body_with_tool_result(json!("word ".repeat(400)));
+
+        let mut s1 = Summary::default();
+        assert!(rewrite_anthropic_with(&engine, 800, &memo, &mut s1, &body).is_none());
+        assert_eq!((s1.miss, s1.hit, s1.fired), (1, 0, 0));
+
+        let mut s2 = Summary::default();
+        assert!(rewrite_anthropic_with(&engine, 800, &memo, &mut s2, &body).is_none());
+        assert_eq!((s2.miss, s2.hit, s2.fired), (0, 1, 0));
+    }
+
+    /// A BPE never yields more tokens than bytes, so a block with fewer
+    /// bytes than `min_tokens` can be skipped without touching the
+    /// tokenizer or the memo.
+    #[test]
+    fn tiny_blocks_skip_tokenizer_and_memo() {
+        let (_dir, engine) = test_engine();
+        let memo = Memo::new(64);
+        let body = body_with_tool_result(json!("short output"));
+        let mut s = Summary::default();
+        assert!(rewrite_anthropic_with(&engine, 800, &memo, &mut s, &body).is_none());
+        assert_eq!((s.blocks, s.small, s.miss, s.hit), (1, 1, 0, 0));
+    }
+
+    /// Already-compressed blocks are counted so the summary can show when
+    /// an upstream layer (mur's MCP) has done the work already.
+    #[test]
+    fn marker_blocks_are_counted_not_memoised() {
+        let (_dir, engine) = test_engine();
+        let memo = Memo::new(64);
+        let text = format!(
+            "{}\n[408 items compressed. Retrieve more: hash=365700af5c32b04c0a4b0443]",
+            "x".repeat(2000)
+        );
+        let body = body_with_tool_result(json!(text));
+        let mut s = Summary::default();
+        assert!(rewrite_anthropic_with(&engine, 800, &memo, &mut s, &body).is_none());
+        assert_eq!((s.blocks, s.marker, s.miss, s.hit), (1, 1, 0, 0));
+    }
+
+    /// Exempt (Read / retrieve) blocks never reach the memo either.
+    #[test]
+    fn exempt_blocks_are_counted() {
+        let (_dir, engine) = test_engine();
+        let memo = Memo::new(64);
+        let body =
+            body_with_named_tool_result("Read", json!({"file_path": "/x.log"}), json!(fat_log()));
+        let mut s = Summary::default();
+        assert!(rewrite_anthropic_with(&engine, 800, &memo, &mut s, &body).is_none());
+        assert_eq!((s.exempt, s.blocks, s.miss), (1, 0, 0));
+    }
+
+    /// The memo is only valid for the engine it was built beside. Any
+    /// setting that can change an output must change the fingerprint, so
+    /// a config edit rebuilds engine + memo together instead of serving
+    /// stale verdicts.
+    #[test]
+    fn fingerprint_tracks_every_output_affecting_setting() {
+        let a = CompressConfig::default();
+        assert_eq!(config_fingerprint(&a), config_fingerprint(&a.clone()));
+
+        let mut b = a.clone();
+        b.bloat_threshold = 0.5;
+        assert_ne!(config_fingerprint(&a), config_fingerprint(&b));
+
+        let mut c = a.clone();
+        c.auto.min_tokens = 1200;
+        assert_ne!(config_fingerprint(&a), config_fingerprint(&c));
     }
 
     /// A file read and a retrieval are the model asking to SEE the bytes.
