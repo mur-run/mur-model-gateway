@@ -10,7 +10,7 @@ LOG="${1:-$HOME/Library/Logs/mur-model-gateway/proxy.log}"
 strip() { sed 's/\x1b\[[0-9;]*m//g' "$LOG"; }
 
 echo "== cold starts (expect 1 per process start) =="
-strip | grep -E "compress engine built|listening addr" | sed -E 's/ mur_model_gateway(::compress)?: / /' | cut -c1-120
+strip | grep -E "compress engine built|listening addr" | sed -E 's/ mur_model_gateway(::compress)?: / /' | cut -c1-120 || true
 
 echo
 echo "== compress summary totals =="
