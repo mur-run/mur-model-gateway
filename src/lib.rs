@@ -29,7 +29,9 @@ use axum::{
     response::IntoResponse,
     routing::any,
 };
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -1357,7 +1359,15 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         "proxied"
     );
 
-    let stream = upstream_resp.bytes_stream();
+    // Anthropic reports prompt-cache reads/writes in `usage`; one debug line
+    // per response makes "did the rewrite bust the cache?" answerable from
+    // proxy.log instead of the client's own transcripts.
+    let streaming = response_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    let tap = matches!(provider, Provider::Anthropic) && status.is_success();
+    let stream = UsageTap::new(upstream_resp.bytes_stream(), tap, streaming);
     let body = Body::from_stream(hold_permit_through(stream, permit));
 
     let mut builder = Response::builder().status(status.as_u16());
@@ -1365,6 +1375,163 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         *h = response_headers;
     }
     builder.body(body).context("build response")
+}
+
+/// Prompt-cache accounting from an Anthropic response's `usage` block.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpstreamUsage {
+    input_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+}
+
+impl UpstreamUsage {
+    /// `container` is the object holding `usage`: the response root for a
+    /// JSON body, `message` inside the `message_start` frame for SSE.
+    fn from_container(container: &serde_json::Value) -> Option<Self> {
+        let u = container.get("usage")?.as_object()?;
+        let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        Some(Self {
+            input_tokens: n("input_tokens"),
+            cache_read_input_tokens: n("cache_read_input_tokens"),
+            cache_creation_input_tokens: n("cache_creation_input_tokens"),
+        })
+    }
+
+    fn log(&self, streaming: bool) {
+        tracing::debug!(
+            input_tokens = self.input_tokens,
+            cache_read_input_tokens = self.cache_read_input_tokens,
+            cache_creation_input_tokens = self.cache_creation_input_tokens,
+            streaming,
+            "upstream usage"
+        );
+    }
+}
+
+enum SseScan {
+    /// No complete `data:` line yet; keep buffering.
+    Pending,
+    Found(UpstreamUsage),
+    /// The first complete frame was not a parseable `message_start`.
+    Absent,
+}
+
+/// Scan the SSE bytes seen so far for the `message_start` frame, which is
+/// always the first event of an Anthropic stream and carries the input-side
+/// usage. Only lines terminated by `\n` are considered, so a frame split
+/// across chunks is retried rather than misparsed.
+fn usage_from_sse(buf: &[u8]) -> SseScan {
+    let Some(end) = buf.iter().rposition(|&b| b == b'\n') else {
+        return SseScan::Pending;
+    };
+    let text = String::from_utf8_lossy(&buf[..end]);
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let parsed: Option<serde_json::Value> = serde_json::from_str(data.trim()).ok();
+        return match parsed
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message_start"))
+            .and_then(|v| v.get("message").and_then(UpstreamUsage::from_container))
+        {
+            Some(u) => SseScan::Found(u),
+            None => SseScan::Absent,
+        };
+    }
+    SseScan::Pending
+}
+
+/// Bytes of an SSE body to buffer while waiting for `message_start` (it is
+/// the first frame and well under 1 KB; the cap only bounds a pathological
+/// upstream).
+const USAGE_TAP_SSE_CAP: usize = 64 * 1024;
+/// Bytes of a JSON body to buffer for its trailing `usage` object.
+const USAGE_TAP_JSON_CAP: usize = 4 * 1024 * 1024;
+
+/// Pass-through body stream that peeks at an Anthropic response for its
+/// `usage` and logs it once. Disabled (`done` from the start) for other
+/// providers and non-2xx responses, so it costs nothing there. Never alters
+/// or delays the bytes: a chunk is handed on in the same poll it arrived.
+struct UsageTap<S> {
+    inner: Pin<Box<S>>,
+    buf: Vec<u8>,
+    streaming: bool,
+    done: bool,
+}
+
+impl<S> UsageTap<S> {
+    fn new(inner: S, enabled: bool, streaming: bool) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            buf: Vec::new(),
+            streaming,
+            done: !enabled,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+        self.buf = Vec::new();
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        let cap = if self.streaming {
+            USAGE_TAP_SSE_CAP
+        } else {
+            USAGE_TAP_JSON_CAP
+        };
+        if self.buf.len() + chunk.len() > cap {
+            self.finish();
+            return;
+        }
+        self.buf.extend_from_slice(chunk);
+        if self.streaming {
+            match usage_from_sse(&self.buf) {
+                SseScan::Pending => {}
+                SseScan::Found(u) => {
+                    u.log(true);
+                    self.finish();
+                }
+                SseScan::Absent => self.finish(),
+            }
+        }
+    }
+
+    fn eof(&mut self) {
+        if !self.streaming
+            && let Some(u) = serde_json::from_slice::<serde_json::Value>(&self.buf)
+                .ok()
+                .and_then(|v| UpstreamUsage::from_container(&v))
+        {
+            u.log(false);
+        }
+        self.finish();
+    }
+}
+
+impl<S> futures_util::Stream for UsageTap<S>
+where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>>,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let polled = this.inner.as_mut().poll_next(cx);
+        if !this.done {
+            match &polled {
+                Poll::Ready(Some(Ok(chunk))) => this.observe(chunk),
+                Poll::Ready(Some(Err(_))) => this.finish(),
+                Poll::Ready(None) => this.eof(),
+                Poll::Pending => {}
+            }
+        }
+        polled
+    }
 }
 
 /// Tie a provider permit to a response stream so the slot frees when the
@@ -2268,5 +2435,66 @@ mod tests {
             "empty and non-dot PATHEXT entries are skipped rather than \
              producing a `claudejunk` candidate"
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_tap_tests {
+    use super::*;
+
+    const START: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"cache_creation_input_tokens":300,"cache_read_input_tokens":45000,"output_tokens":1}}}
+
+"#;
+
+    #[test]
+    fn sse_message_start_yields_usage() {
+        match usage_from_sse(START.as_bytes()) {
+            SseScan::Found(u) => assert_eq!(
+                u,
+                UpstreamUsage {
+                    input_tokens: 12,
+                    cache_read_input_tokens: 45000,
+                    cache_creation_input_tokens: 300,
+                }
+            ),
+            _ => panic!("expected usage"),
+        }
+    }
+
+    #[test]
+    fn sse_frame_split_across_chunks_is_pending_until_terminated() {
+        let cut = START.find("cache_read").unwrap();
+        assert!(matches!(
+            usage_from_sse(&START.as_bytes()[..cut]),
+            SseScan::Pending
+        ));
+        // Terminated but truncated JSON: not retried forever, reported absent.
+        let mut broken = START.as_bytes()[..cut].to_vec();
+        broken.push(b'\n');
+        assert!(matches!(usage_from_sse(&broken), SseScan::Absent));
+    }
+
+    #[test]
+    fn sse_first_frame_not_message_start_is_absent() {
+        let err = b"event: error\ndata: {\"type\":\"error\",\"error\":{}}\n\n";
+        assert!(matches!(usage_from_sse(err), SseScan::Absent));
+    }
+
+    #[test]
+    fn json_body_usage_is_read_from_root() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"id":"m","content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            UpstreamUsage::from_container(&v).unwrap(),
+            UpstreamUsage {
+                input_tokens: 5,
+                cache_read_input_tokens: 7,
+                cache_creation_input_tokens: 0,
+            }
+        );
+        assert!(UpstreamUsage::from_container(&serde_json::json!({"id": "m"})).is_none());
     }
 }

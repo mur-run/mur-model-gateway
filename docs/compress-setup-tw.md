@@ -56,3 +56,15 @@ MUR_MODEL_GATEWAY_COMPRESS_BODY_TOKENS=1   # 搭配 RUST_LOG=debug
 每個請求會多做一次全 body tokenize(約 150 ms CPU / MB),在背景執行、不擋請求,
 但是持續的 CPU 稅,觀察結束就關掉。結果記在 `compress body tokens` 這行,
 用 `scripts/compress-summary-report.sh` 彙總。
+
+## 診斷:prompt cache 與 stale stub
+
+Anthropic 的每個成功回應會多一行 `upstream usage`,帶 `input_tokens`、
+`cache_read_input_tokens`、`cache_creation_input_tokens`(串流取自 `message_start`,
+非串流取自 JSON 根層)。`cache_creation` 大於前一個 turn 新增的內容,就表示
+前綴快取被打掉了。不需要額外 flag,`RUST_LOG=mur_model_gateway=debug` 就有。
+
+`compress summary` 另有 `stale_hit` / `stale_miss`:stale stub(被後來的 Read/Edit
+取代的 Read、與後面完全相同的 tool result)現在是 memo 過的,同一段 transcript 每個
+turn 重送只會 hit。`stale_miss` 每個新的取代事件大約一次;若持續偏高,代表 memo
+容量不夠或 transcript 內容在變。兩者都由 `scripts/compress-summary-report.sh` 彙總。

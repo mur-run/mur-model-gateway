@@ -21,6 +21,12 @@ use std::time::Instant;
 /// every under-threshold block would be re-tokenised each turn.
 pub struct Memo {
     inner: Mutex<lru::LruCache<u64, Arc<Verdict>>>,
+    /// Stale-collapse stubs, keyed on (reason, original text). Building one
+    /// archives the original (a store write plus a full-directory eviction
+    /// scan in mur-compress) and may skeletonize it, and the same superseded
+    /// Read is resent on every later turn, so without this memo the stale
+    /// pass cost 60x more than the compressor it sits in front of.
+    stale: Mutex<lru::LruCache<u64, Arc<str>>>,
 }
 
 /// One memoised outcome. Token counts ride along so a replayed verdict
@@ -37,6 +43,7 @@ impl Memo {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
             inner: Mutex::new(lru::LruCache::new(cap)),
+            stale: Mutex::new(lru::LruCache::new(cap)),
         }
     }
 
@@ -53,6 +60,30 @@ impl Memo {
 
     fn put(&self, key: u64, verdict: Arc<Verdict>) {
         self.inner.lock().unwrap().put(key, verdict);
+    }
+
+    /// The stub text depends on the reason as well as the text: the same
+    /// bytes can be a superseded Read in one transcript and an exact
+    /// duplicate in another.
+    fn stale_key(reason: &StaleReason, text: &str) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match reason {
+            StaleReason::SupersededPath(path) => {
+                0u8.hash(&mut h);
+                path.hash(&mut h);
+            }
+            StaleReason::Duplicate => 1u8.hash(&mut h),
+        }
+        text.hash(&mut h);
+        h.finish()
+    }
+
+    fn stale_get(&self, key: u64) -> Option<Arc<str>> {
+        self.stale.lock().unwrap().get(&key).cloned()
+    }
+
+    fn stale_put(&self, key: u64, stub: Arc<str>) {
+        self.stale.lock().unwrap().put(key, stub);
     }
 }
 
@@ -74,6 +105,9 @@ pub struct Summary {
     pub fired: usize,
     /// Whether any stale tool_result was collapsed into a stub this request.
     pub stale: bool,
+    /// Stale stubs served from the memo / built fresh (archive + skeleton).
+    pub stale_hit: usize,
+    pub stale_miss: usize,
     pub before: usize,
     pub after: usize,
     /// Token totals over judged blocks only (hit + miss); `small`, `marker`
@@ -144,7 +178,19 @@ fn extract_tool_result_text(content: &Value) -> Option<String> {
 /// retrieval hop, for content that's already dead (never the most recent
 /// view of a path, so no Edit anchor risk). Falls back to the plain marker
 /// when the extension isn't recognized or there's nothing worth eliding.
-fn stale_stub(engine: &CompressEngine, reason: &StaleReason, original: &str) -> String {
+fn stale_stub(
+    engine: &CompressEngine,
+    memo: &Memo,
+    summary: &mut Summary,
+    reason: &StaleReason,
+    original: &str,
+) -> String {
+    let key = Memo::stale_key(reason, original);
+    if let Some(stub) = memo.stale_get(key) {
+        summary.stale_hit += 1;
+        return stub.to_string();
+    }
+    summary.stale_miss += 1;
     let (what, skeleton) = match reason {
         StaleReason::SupersededPath(path) => (
             format!(
@@ -161,10 +207,12 @@ fn stale_stub(engine: &CompressEngine, reason: &StaleReason, original: &str) -> 
         Some(hash) => format!("[{what}. {}]", retrieval_note(Some(&hash), None)),
         None => format!("[{what}]"),
     };
-    match skeleton {
+    let stub = match skeleton {
         Some(sk) => format!("{marker}\n\n{sk}"),
         None => marker,
-    }
+    };
+    memo.stale_put(key, Arc::from(stub.as_str()));
+    stub
 }
 
 /// One collapsible `tool_result`/`functionResponse`, stripped of any
@@ -241,7 +289,12 @@ fn compute_stale_reasons(candidates: &[StaleCandidate]) -> Vec<Option<StaleReaso
 
 /// Collapse `tool_result` blocks in Anthropic `messages` that
 /// [`compute_stale_reasons`] finds stale into a short stub.
-fn collapse_stale_tool_results_anthropic(engine: &CompressEngine, root: &mut Value) -> bool {
+fn collapse_stale_tool_results_anthropic(
+    engine: &CompressEngine,
+    memo: &Memo,
+    summary: &mut Summary,
+    root: &mut Value,
+) -> bool {
     let Some(messages) = root.get("messages").and_then(|m| m.as_array()) else {
         return false;
     };
@@ -319,7 +372,7 @@ fn collapse_stale_tool_results_anthropic(engine: &CompressEngine, root: &mut Val
         .expect("messages array checked present above");
     for (i, &(msg_idx, block_idx)) in locators.iter().enumerate() {
         let Some(r) = &reasons[i] else { continue };
-        let stub = stale_stub(engine, r, &candidates[i].text);
+        let stub = stale_stub(engine, memo, summary, r, &candidates[i].text);
         if let Some(content_field) = messages_mut
             .get_mut(msg_idx)
             .and_then(|m| m.get_mut("content"))
@@ -336,7 +389,12 @@ fn collapse_stale_tool_results_anthropic(engine: &CompressEngine, root: &mut Val
 /// Collapse stale `role: "tool"` results in OpenAI `messages`. Matching is
 /// by `tool_call_id`, same as the wire protocol itself, so it's exact even
 /// when multiple calls target the same file.
-fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value) -> bool {
+fn collapse_stale_tool_results_openai(
+    engine: &CompressEngine,
+    memo: &Memo,
+    summary: &mut Summary,
+    root: &mut Value,
+) -> bool {
     let Some(messages) = root.get("messages").and_then(|m| m.as_array()) else {
         return false;
     };
@@ -409,7 +467,7 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
         .expect("messages array checked present above");
     for (i, &msg_idx) in locators.iter().enumerate() {
         let Some(r) = &reasons[i] else { continue };
-        let stub = stale_stub(engine, r, &candidates[i].text);
+        let stub = stale_stub(engine, memo, summary, r, &candidates[i].text);
         if let Some(content_field) = messages_mut
             .get_mut(msg_idx)
             .and_then(|m| m.get_mut("content"))
@@ -426,7 +484,12 @@ fn collapse_stale_tool_results_openai(engine: &CompressEngine, root: &mut Value)
 /// order responses are sent back in), which is exact as long as calls to the
 /// same function are answered in the order they were issued (true for any
 /// well-formed transcript: a response always follows its own call).
-fn collapse_stale_tool_results_gemini(engine: &CompressEngine, root: &mut Value) -> bool {
+fn collapse_stale_tool_results_gemini(
+    engine: &CompressEngine,
+    memo: &Memo,
+    summary: &mut Summary,
+    root: &mut Value,
+) -> bool {
     let Some(contents) = root.get("contents").and_then(|c| c.as_array()) else {
         return false;
     };
@@ -492,7 +555,7 @@ fn collapse_stale_tool_results_gemini(engine: &CompressEngine, root: &mut Value)
         .expect("contents array checked present above");
     for (i, &(content_idx, part_idx)) in locators.iter().enumerate() {
         let Some(r) = &reasons[i] else { continue };
-        let stub = stale_stub(engine, r, &candidates[i].text);
+        let stub = stale_stub(engine, memo, summary, r, &candidates[i].text);
         let Some(part) = contents_mut
             .get_mut(content_idx)
             .and_then(|c| c.get_mut("parts"))
@@ -642,7 +705,7 @@ fn rewrite_anthropic_with(
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
-    let mut changed = collapse_stale_tool_results_anthropic(engine, &mut root);
+    let mut changed = collapse_stale_tool_results_anthropic(engine, memo, summary, &mut root);
     summary.stale = changed;
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
@@ -710,7 +773,7 @@ fn rewrite_openai_with(
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
-    let mut changed = collapse_stale_tool_results_openai(engine, &mut root);
+    let mut changed = collapse_stale_tool_results_openai(engine, memo, summary, &mut root);
     summary.stale = changed;
     let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
@@ -774,7 +837,7 @@ fn rewrite_gemini_with(
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let mut root: Value = serde_json::from_slice(body).ok()?;
-    let mut changed = collapse_stale_tool_results_gemini(engine, &mut root);
+    let mut changed = collapse_stale_tool_results_gemini(engine, memo, summary, &mut root);
     summary.stale = changed;
     let Some(contents) = root.get_mut("contents").and_then(|c| c.as_array_mut()) else {
         return changed.then(|| serde_json::to_vec(&root).ok()).flatten();
@@ -973,6 +1036,8 @@ pub fn rewrite_request_body(body: &[u8], provider: Provider) -> Rewrite {
         marker = summary.marker,
         exempt = summary.exempt,
         stale = summary.stale,
+        stale_hit = summary.stale_hit,
+        stale_miss = summary.stale_miss,
         before = summary.before,
         after = summary.after,
         tokens_before = summary.tokens_before,
@@ -1291,7 +1356,12 @@ mod tests {
         }
         let mut root = json!({"messages": messages});
         assert!(
-            collapse_stale_tool_results_anthropic(&engine, &mut root),
+            collapse_stale_tool_results_anthropic(
+                &engine,
+                &Memo::new(1),
+                &mut Summary::default(),
+                &mut root
+            ),
             "the earlier read_file of the same path is stale and must collapse"
         );
         let first = root["messages"][1]["content"][0]["content"]
@@ -1532,6 +1602,39 @@ mod tests {
         assert!(first.contains("identical to a later tool result"));
         let second = v["messages"][3]["content"][0]["content"].as_str().unwrap();
         assert_eq!(second, repeated_output, "last occurrence kept in full");
+    }
+
+    #[test]
+    fn stale_stub_is_served_from_memo_on_the_next_turn() {
+        let (_dir, engine) = test_engine();
+        let memo = Memo::new(64);
+        let mut messages = Vec::new();
+        for (id, text) in [
+            ("toolu_r1", "struct Foo { x: i32 }\n".repeat(5)),
+            ("toolu_r2", "struct Foo { x: i32, y: i32 }".to_string()),
+        ] {
+            messages.extend(
+                tool_use_and_result(id, "Read", "src/foo.rs", &text)
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        let body =
+            serde_json::to_vec(&json!({"messages": messages, "model": "x", "max_tokens": 16}))
+                .unwrap();
+
+        let mut s1 = Summary::default();
+        let out1 = rewrite_anthropic_with(&engine, 800, &memo, &mut s1, &body).unwrap();
+        assert!(s1.stale);
+        assert_eq!((s1.stale_miss, s1.stale_hit), (1, 0));
+
+        // Claude Code resends the same transcript next turn: no archive, no
+        // skeletonize, byte-identical output.
+        let mut s2 = Summary::default();
+        let out2 = rewrite_anthropic_with(&engine, 800, &memo, &mut s2, &body).unwrap();
+        assert_eq!((s2.stale_miss, s2.stale_hit), (0, 1));
+        assert_eq!(out1, out2);
     }
 
     #[test]
