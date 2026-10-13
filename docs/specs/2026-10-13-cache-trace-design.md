@@ -1,7 +1,7 @@
 # mur-model-gateway: cache trace (prompt-cache diagnostics)
 
 **Date:** 2026-10-13
-**Status:** Draft
+**Status:** Implemented (2026-10-13, plan docs/superpowers/plans/2026-10-13-cache-trace.md)
 **Scope:** mur-model-gateway only. First sub-project of the cache-write work
 ("B2 + C": prefix-divergence logging plus the cache-economics report). The
 runtime breakpoint layout (A), the gateway-added tools breakpoint (B1) and

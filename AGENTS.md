@@ -32,6 +32,14 @@ Notes for agents working in this repo. Keep them short and factual.
 - Uninstalling UV mode must **not** delete the shared library, because the app uses it too.
 - The old location `~/.mur/omlx/models` is obsolete.
 
+## Logs
+
+- `cache trace` (DEBUG, Anthropic `/v1/messages` only) is one line per
+  request pairing request-side fingerprints with the response's prompt-cache
+  usage; `scripts/cache-trace-report.sh` aggregates it. Definitions live in
+  `docs/specs/2026-10-13-cache-trace-design.md`; change the spec before the
+  script. Hashes and sizes only, never block content.
+
 ## Gotchas
 
 - The gateway source clone may have `pull.rebase=true`. Use `git pull --ff-only --no-rebase`. If the clone has uncommitted changes, skip the pull and warn instead of aborting the install.

@@ -30,6 +30,13 @@ agents / tools ──► http://127.0.0.1:8088 ──► api.anthropic.com
   are memoised per block, so a resent transcript costs only its new blocks;
   each request logs one `compress summary` line at `debug` (hit/miss/skip
   counts, bytes before/after, time taken).
+- **Prompt-cache diagnostics.** At `debug`, every Anthropic `/v1/messages`
+  request logs one `cache trace` line: fingerprints of the cached prefix,
+  breakpoint layout, how recently the same prefix was sent and whether a
+  writer was still pending, next to the response's cache reads and writes.
+  `scripts/cache-trace-report.sh` turns a day of them into cold-start
+  buckets and avoidable write tokens per model. Hashes and sizes only,
+  never content.
 - **Cheap to leave running.** One static Rust binary, ~40 MB resident with
   compression off — no runtime, no Node process, no container.
   [Measured numbers below.](#resource-usage-and-sizing)
