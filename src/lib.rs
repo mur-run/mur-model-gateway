@@ -1379,12 +1379,20 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     builder.body(body).context("build response")
 }
 
-/// Prompt-cache accounting from an Anthropic response's `usage` block.
+/// Prompt-cache accounting from an Anthropic response's `usage` block, plus
+/// the response's `id` and `model` and the 5m/1h split of the write, which
+/// only the `cache trace` line prints.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct UpstreamUsage {
-    input_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
+pub(crate) struct UpstreamUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
+    pub(crate) id: Option<String>,
+    pub(crate) model: Option<String>,
+    /// `usage.cache_creation.ephemeral_5m_input_tokens`; `None` when the
+    /// `cache_creation` object is absent (a field missing inside it is 0).
+    pub(crate) ephemeral_5m: Option<u64>,
+    pub(crate) ephemeral_1h: Option<u64>,
 }
 
 impl UpstreamUsage {
@@ -1393,10 +1401,22 @@ impl UpstreamUsage {
     fn from_container(container: &serde_json::Value) -> Option<Self> {
         let u = container.get("usage")?.as_object()?;
         let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let s = |k: &str| {
+            container
+                .get(k)
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        };
+        let cc = u.get("cache_creation").and_then(|x| x.as_object());
+        let split = |k: &str| cc.map(|c| c.get(k).and_then(|x| x.as_u64()).unwrap_or(0));
         Some(Self {
             input_tokens: n("input_tokens"),
             cache_read_input_tokens: n("cache_read_input_tokens"),
             cache_creation_input_tokens: n("cache_creation_input_tokens"),
+            id: s("id"),
+            model: s("model"),
+            ephemeral_5m: split("ephemeral_5m_input_tokens"),
+            ephemeral_1h: split("ephemeral_1h_input_tokens"),
         })
     }
 
@@ -2512,7 +2532,7 @@ mod usage_tap_tests {
     use super::*;
 
     const START: &str = r#"event: message_start
-data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"cache_creation_input_tokens":300,"cache_read_input_tokens":45000,"output_tokens":1}}}
+data: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-5-5","usage":{"input_tokens":12,"cache_creation_input_tokens":300,"cache_read_input_tokens":45000,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200},"output_tokens":1}}}
 
 "#;
 
@@ -2525,6 +2545,10 @@ data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"ca
                     input_tokens: 12,
                     cache_read_input_tokens: 45000,
                     cache_creation_input_tokens: 300,
+                    id: Some("m".into()),
+                    model: Some("claude-sonnet-5-5".into()),
+                    ephemeral_5m: Some(100),
+                    ephemeral_1h: Some(200),
                 }
             ),
             _ => panic!("expected usage"),
@@ -2562,8 +2586,17 @@ data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":12,"ca
                 input_tokens: 5,
                 cache_read_input_tokens: 7,
                 cache_creation_input_tokens: 0,
+                id: Some("m".into()),
+                ..Default::default()
             }
         );
         assert!(UpstreamUsage::from_container(&serde_json::json!({"id": "m"})).is_none());
+        // the split object present but a side missing: that side is 0, not absent
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"usage":{"input_tokens":1,"cache_creation":{"ephemeral_1h_input_tokens":9}}}"#,
+        )
+        .unwrap();
+        let u = UpstreamUsage::from_container(&v).unwrap();
+        assert_eq!((u.ephemeral_5m, u.ephemeral_1h), (Some(0), Some(9)));
     }
 }
