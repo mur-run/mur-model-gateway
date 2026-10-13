@@ -62,7 +62,7 @@ are generated for you). **Compression is off unless you ask for it** — pass
 restarts and reinstalls:
 
 ```bash
-mur-model-gateway install --compress   # writes + starts the service, compression on
+mur-model-gateway install --compress   # writes the plist (compression on); load it with launchctl bootstrap
 mur-model-gateway status               # binary / service / env file overview
 mur-model-gateway uninstall
 ```
