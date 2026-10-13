@@ -359,6 +359,10 @@ pub struct AppState {
     /// full body off the request path: ~150 ms of background CPU per MB,
     /// a tax that must not ride along with the DEBUG log level forever.
     pub compress_body_tokens: bool,
+    /// Prompt-cache diagnostics tables (spec: docs/specs/2026-10-13). Always
+    /// on at DEBUG for Anthropic `/v1/messages`; `Arc` because `AppState` is
+    /// cloned per request and the tables must be shared.
+    pub cache_trace: Arc<cache_trace::Tracker>,
     /// Cross-process upstream concurrency cap (see module docs on
     /// `ProviderSemaphores`). `None` (the default) is unlimited — today's
     /// behaviour for every deployment that never calls
@@ -412,6 +416,7 @@ impl AppState {
             compress: std::env::var("MUR_MODEL_GATEWAY_COMPRESS").is_ok_and(|v| v == "1"),
             compress_body_tokens: std::env::var("MUR_MODEL_GATEWAY_COMPRESS_BODY_TOKENS")
                 .is_ok_and(|v| v == "1"),
+            cache_trace: Arc::new(cache_trace::Tracker::new()),
             concurrency: None,
             queue_timeout: DEFAULT_QUEUE_TIMEOUT,
         })
@@ -959,6 +964,28 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         body_bytes.to_vec()
     };
 
+    // Prompt-cache diagnostics (spec: docs/specs/2026-10-13-cache-trace-design.md).
+    // Reads the exact bytes reqwest sends: nothing between here and
+    // `upstream_req.body(final_body)` touches the body, only headers. The
+    // guard is the only writer of the `cache trace` line; this handler and
+    // `UsageTap` only call it. Runs once per request: the 401 retry below
+    // re-sends byte-identical bytes and reuses this guard.
+    let mut cache_guard: Option<cache_trace::InflightGuard> = if provider == Provider::Anthropic
+        && cache_trace::applies(path_only)
+        && tracing::enabled!(tracing::Level::DEBUG)
+    {
+        let compress_on = state.compress && compress::should_compress(path_only, provider);
+        cache_trace::on_send(
+            &state.cache_trace,
+            &client,
+            &final_body,
+            compress_on,
+            std::time::Instant::now(),
+        )
+    } else {
+        None
+    };
+
     let mut upstream_req = state.client.request(parts.method.clone(), &target_url);
 
     let mut client_betas: Vec<String> = Vec::new();
@@ -1242,6 +1269,10 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
             retried,
             "returning 401: the credential this gateway attached was rejected"
         );
+        if let Some(g) = cache_guard.as_mut() {
+            g.set_status(status.as_u16(), false);
+            g.complete(None);
+        }
         return Ok(anthropic_auth_error_response(
             anthropic_source,
             expired,
@@ -1369,7 +1400,23 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("text/event-stream"));
     let tap = matches!(provider, Provider::Anthropic) && status.is_success();
-    let stream = UsageTap::new(upstream_resp.bytes_stream(), tap, streaming, client);
+    // Non-2xx: the guard writes its line now (usage `-`) and is dropped
+    // here. 2xx: it rides inside the tap, which reports the first chunk
+    // and the usage.
+    if let Some(g) = cache_guard.as_mut() {
+        g.set_status(status.as_u16(), streaming);
+        if !status.is_success() {
+            g.complete(None);
+        }
+    }
+    let cache_guard = cache_guard.filter(|_| status.is_success());
+    let stream = UsageTap::new(
+        upstream_resp.bytes_stream(),
+        tap,
+        streaming,
+        client,
+        cache_guard,
+    );
     let body = Body::from_stream(hold_permit_through(stream, permit));
 
     let mut builder = Response::builder().status(status.as_u16());
@@ -1482,16 +1529,27 @@ struct UsageTap<S> {
     streaming: bool,
     done: bool,
     client: String,
+    /// Owner of the `cache trace` line; `None` outside Anthropic
+    /// `/v1/messages` or below DEBUG. Dropped with the tap, which is when
+    /// the body finishes or the client goes away.
+    guard: Option<cache_trace::InflightGuard>,
 }
 
 impl<S> UsageTap<S> {
-    fn new(inner: S, enabled: bool, streaming: bool, client: String) -> Self {
+    fn new(
+        inner: S,
+        enabled: bool,
+        streaming: bool,
+        client: String,
+        guard: Option<cache_trace::InflightGuard>,
+    ) -> Self {
         Self {
             inner: Box::pin(inner),
             buf: Vec::new(),
             streaming,
             done: !enabled,
             client,
+            guard,
         }
     }
 
@@ -1501,6 +1559,11 @@ impl<S> UsageTap<S> {
     }
 
     fn observe(&mut self, chunk: &[u8]) {
+        // The first chunk is the response beginning: the cache entry this
+        // request wrote (or read) is readable from here on. Idempotent.
+        if let Some(g) = self.guard.as_mut() {
+            g.begun();
+        }
         let cap = if self.streaming {
             USAGE_TAP_SSE_CAP
         } else {
@@ -1515,6 +1578,9 @@ impl<S> UsageTap<S> {
             match usage_from_sse(&self.buf) {
                 SseScan::Pending => {}
                 SseScan::Found(u) => {
+                    if let Some(g) = self.guard.as_mut() {
+                        g.complete(Some(&u));
+                    }
                     u.log(true, &self.client);
                     self.finish();
                 }
@@ -1529,6 +1595,9 @@ impl<S> UsageTap<S> {
                 .ok()
                 .and_then(|v| UpstreamUsage::from_container(&v))
         {
+            if let Some(g) = self.guard.as_mut() {
+                g.complete(Some(&u));
+            }
             u.log(false, &self.client);
         }
         self.finish();
@@ -2598,5 +2667,71 @@ data: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-5-5","u
         .unwrap();
         let u = UpstreamUsage::from_container(&v).unwrap();
         assert_eq!((u.ephemeral_5m, u.ephemeral_1h), (Some(0), Some(9)));
+    }
+
+    const TRACE_BODY: &[u8] = br#"{"model":"m","tools":[{"name":"t","input_schema":{"type":"object"}}],"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],"messages":[]}"#;
+
+    #[tokio::test]
+    async fn tap_marks_the_entry_readable_on_the_first_chunk_and_hands_over_usage() {
+        use futures_util::StreamExt;
+        let tracker = Arc::new(cache_trace::Tracker::new());
+        let now = std::time::Instant::now();
+        let mut guard = cache_trace::on_send(&tracker, "t", TRACE_BODY, false, now).unwrap();
+        guard.set_status(200, true);
+        // before any chunk: a second send sees a pending writer, nothing readable
+        let peek = cache_trace::on_send(&tracker, "t", TRACE_BODY, false, now).unwrap();
+        let p = peek.trace().clone();
+        assert_eq!((p.inflight_same_prefix, p.prefix_ttl_left_ms), (1, None));
+        drop(peek);
+        let chunks: Vec<Result<axum::body::Bytes, reqwest::Error>> =
+            vec![Ok(axum::body::Bytes::from(START))];
+        let mut tap = UsageTap::new(
+            futures_util::stream::iter(chunks),
+            true,
+            true,
+            "t".into(),
+            Some(guard),
+        );
+        assert!(tap.next().await.is_some());
+        let after = cache_trace::on_send(&tracker, "t", TRACE_BODY, false, now).unwrap();
+        let a = after.trace().clone();
+        assert_eq!(
+            a.inflight_same_prefix, 0,
+            "begun released the pending count"
+        );
+        assert!(
+            a.prefix_ttl_left_ms.is_some_and(|ms| ms > 299_000),
+            "readable for the writer's 5m: {:?}",
+            a.prefix_ttl_left_ms
+        );
+        assert!(tap.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tap_dropped_before_its_first_chunk_abandons_without_readability() {
+        let tracker = Arc::new(cache_trace::Tracker::new());
+        let now = std::time::Instant::now();
+        let mut guard = cache_trace::on_send(&tracker, "t", TRACE_BODY, false, now).unwrap();
+        guard.set_status(200, true);
+        let chunks: Vec<Result<axum::body::Bytes, reqwest::Error>> = Vec::new();
+        let tap = UsageTap::new(
+            futures_util::stream::iter(chunks),
+            true,
+            true,
+            "t".into(),
+            Some(guard),
+        );
+        drop(tap);
+        let next = cache_trace::on_send(&tracker, "t", TRACE_BODY, false, now).unwrap();
+        let n = next.trace().clone();
+        assert_eq!(
+            (
+                n.inflight_same_prefix,
+                n.prefix_ttl_left_ms,
+                n.prefix_seen_ago_ms
+            ),
+            (0, None, None),
+            "the only send never began and was abandoned, so its key is gone"
+        );
     }
 }
