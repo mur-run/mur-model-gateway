@@ -120,7 +120,14 @@ API requires 1h entries before 5m ones, and the report checks the order.
 `ttl=` is the TTL of the last breakpoint inside tools and system, i.e. the
 last element of `bp_ttls`, or `-` when there is none. It is the client's
 original value; a gateway-sent TTL (`sent_ttl`) is added only when B1
-exists. Message breakpoint TTLs are not logged.
+exists.
+
+`ttl_max=` is the highest TTL among every breakpoint in the request,
+messages and the automatic last block included, or `-` when there is none.
+Individual message breakpoint TTLs are not logged. The API requires longer
+TTLs to come first, so a breakpoint B1 adds ahead of the client's own
+cannot be shorter than any of them: B1's TTL is `ttl_max`, or `5m` when
+`ttl_max=-`. The report calls that value `b1_ttl`.
 
 ### Byte sizes
 
@@ -159,6 +166,8 @@ for responses. Values:
   slot kept hashes only (see Tracker state).
 - `msgs:i`: first differing message index; no offset, because only message
   hashes are retained.
+- `tools:1024+`, `system:64+`, `msgs:4096+`: the difference lies beyond the
+  per-section hash cap (see Tracker state), inside the folded tail.
 
 Sections are compared in order ctx, tools, system, messages, mirroring the
 cache hierarchy; the first differing section is reported.
@@ -188,6 +197,7 @@ both tables.
   only cold ones, matching the API rule that a cache entry's lifetime
   restarts at the start of any request that writes or reads it.
 - `tools_seen_ago_ms=`: the same for the tools key.
+- `inflight_same_tools=`: the same count for the tools key.
 - `inflight_same_prefix=`: number of sends with the same prefix key whose
   response had not **begun** when this one was sent. The API documents that
   "a cache entry only becomes available after the first response begins",
@@ -199,9 +209,10 @@ both tables.
   is overstated for such clients; both known clients stream, and the
   `streaming` column lets the report see the share affected.
 
-Invariant: `prefix_seen_ago_ms=-` and `inflight_same_prefix>0` never hold
-together, because an in-flight send inserted the key. The report's buckets
-rely on it. If the key ever changes, re-verify the invariant.
+Invariant, for each table: a `-` recency and an in-flight count above zero
+never hold together, because an in-flight send inserted the key. The
+report's buckets rely on it. If a key ever changes, re-verify the
+invariant.
 
 ### Cold start, avoidable, buckets
 
@@ -229,35 +240,49 @@ prefix_est = creation * prefix_bytes / span_bytes
 tools_est  = creation * tools_bytes  / span_bytes
 ```
 
+**Weighting an estimate.** An estimate is never split by the response's
+5m/1h proportion: with mixed TTLs the 1h entries sit ahead of the 5m ones,
+so the prefix is written entirely at its own breakpoint's rate and the
+messages at theirs. `prefix_est` is weighted at `ttl` (at `b1_ttl` when
+`ttl=-`, a diagnostic case) and `tools_est` at `b1_ttl`, the rate B1's
+breakpoint would pay. `weighted = tokens * 1.25` for `5m`, `tokens * 2` for
+`1h` (multiples of the model's base input price). The response's own
+`creation_5m`/`creation_1h` feed only the raw totals and a sanity check.
+
 **Avoidable write tokens (B3 and the sequential investigation)** =
 `prefix_est` summed over `concurrent` plus `sequential`. Reported as raw
-`creation` (upper bound), `prefix_est`, and `prefix_est` split into 5m and
-1h tokens with `weighted = 5m * 1.25 + 1h * 2` (multiples of the model's
-base input price), so that savings after B3 can be compared with the bill.
+`creation` (upper bound), `prefix_est`, and its weighted value, so that
+savings after B3 can be compared with the bill.
 
-**B1's target** has two parts, reported on separate lines and never added
-to the figure above:
+**B1's target** is the tools entry only: B1 adds a tools breakpoint, so a
+cold start's system and message writes are not its business even when the
+prefix was seen recently. A cold start counts, whatever its bucket, when
+its `bp` has `tools:none`, `tools_count>0`, `tools_seen_ago_ms` < `b1_ttl`
+and `inflight_same_tools=0` (the earlier request's response had begun, so
+under B1 its tools entry would have been readable). Value: `tools_est`,
+weighted at `b1_ttl`. This is the runtime's main case (identical tools, a
+system block that differs by cwd): the prefix is genuinely new, but a tools
+breakpoint would have hit. The report prints the figure with its per-bucket
+breakdown and names the part that falls in `concurrent` or `sequential` as
+the overlap with the B3 figure: both fixes address those writes, so the two
+headline numbers are not additive. Two caveats the report cannot resolve
+and B1's own design must: a tools section below the model's minimum
+cacheable length gets no entry (the report prints the model's smallest and
+median `tools_bytes` next to the figure), and the breakpoint B1 adds is one
+of the four the API allows.
 
-1. `no_prefix_bp` cold starts with `prefix_seen_ago_ms` < 5m (the TTL B1
-   would add by default), regardless of in-flight state: `prefix_est`.
-2. `tools_bp_missing`: cold starts in the `first` or `expired` bucket whose
-   `bp` has `tools:none`, `tools_count>0` and `tools_seen_ago_ms` < 5m:
-   `tools_est`. This is the runtime's main case (identical tools, a system
-   block that differs by cwd): the prefix is genuinely new, but a tools
-   breakpoint would have hit. `concurrent` and `sequential` cold starts are
-   excluded here because their whole prefix, tools included, is already
-   counted above.
+The `no_prefix_bp` bucket's `prefix_est` is a diagnostic of that client
+shape, not a B1 figure: turning it into savings needs a system breakpoint
+as well, which is a B1 extension decided when such a client shows up.
 
-Each part is reported as raw `creation`, the estimate, and the estimate's
-5m/1h split and weighted value. Everything is grouped by `model=`.
+Everything is grouped by `model=`.
 
-**5m/1h split rule.** When the response carries the `cache_creation` object,
-`creation_5m` and `creation_1h` are used directly and `ttl=` is diagnostic
-only; the estimate is split in the same proportion. When the object is
-absent (`creation_5m=-`), the whole `creation` is attributed by `ttl=`: `1h`
-to the 1h column, `5m` or `-` to the 5m column, and the line is counted in a
-`fallback` column so third-bucket weighting is never silently mixed with
-pre-split API data.
+**Raw totals and the fallback rule.** The totals section sums the
+response's own `creation_5m` and `creation_1h`. When the `cache_creation`
+object is absent (`creation_5m=-`), the whole `creation` is attributed by
+`ttl=`: `1h` to the 1h column, `5m` or `-` to the 5m column, and the line
+is counted in a `fallback` column so pre-split API data is never silently
+mixed in.
 
 ## Design
 
@@ -308,14 +333,18 @@ compress memo):
 
 - **Previous-request table**, cap 64, key (`client`, request `model`), value:
   `ctx_fp`, the three hash sequences, and the canonical bytes of the tools
-  and system blocks. Needed for `diverged=`. The bytes are kept only while
-  tools plus system total at most 512 KB canonical; above that the slot
-  stores hashes only and `diverged` offsets print as `?`. That makes the
-  table's memory a hard bound of 64 × 512 KB = 32 MB plus hash vectors,
-  instead of 64 × `MAX_BODY_BYTES` (32 MiB) in the worst case; typical
-  slots are ~150 KB. Full table evicts the least recently used
-  client+model; the only effect is that its next request logs
-  `diverged=first`.
+  and system blocks. Needed for `diverged=`. Two caps make a slot's size a
+  constant, not a function of the request: the bytes are kept only while
+  tools plus system total at most 512 KB canonical, above which the slot
+  stores hashes only and `diverged` offsets print as `?`; and each hash
+  sequence keeps at most 1024 tool, 64 system and 4096 message hashes, with
+  every block beyond the cap folded into one trailing FNV so a difference
+  there still shows, as `tools:1024+`, `system:64+` or `msgs:4096+`. A slot
+  is therefore at most 512 KB + 5184 × 8 B ≈ 553 KB, the table at most
+  64 × 553 KB ≈ 35 MB, instead of 64 × `MAX_BODY_BYTES` (32 MiB) in the
+  worst case; typical slots are ~150 KB. Full table evicts the least
+  recently used client+model; the only effect is that its next request
+  logs `diverged=first`.
 - **Prefix table**, cap 1024, key as defined, and **tools table**, cap
   1024, key as defined; both hold `{ last_seq, last_sent, prev:
   Option<(seq, Instant)>, inflight }`, a few dozen bytes plus the key. Every
@@ -336,7 +365,7 @@ have not yet reported `begun`.
 ### Line format
 
 ```
-cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 streaming=true compress_on=1 tools_count=38 system_blocks=3 msgs=27 tools_bytes=30534 system_bytes=4120 prefix_bytes=34654 span_bytes=61200 ctx_fp=… tools_fp=9f3a… system_fp=… prefix_fp=… bp=tools:none,system:last,msgs:last ttl=5m bp_ttls=5m input=1200 read=0 creation=142579 creation_5m=142579 creation_1h=0 diverged=system:0@45 prefix_seen_ago_ms=- tools_seen_ago_ms=4210 inflight_same_prefix=0
+cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 streaming=true compress_on=1 tools_count=38 system_blocks=3 msgs=27 tools_bytes=30534 system_bytes=4120 prefix_bytes=34654 span_bytes=61200 ctx_fp=… tools_fp=9f3a… system_fp=… prefix_fp=… bp=tools:none,system:last,msgs:last ttl=5m bp_ttls=5m ttl_max=5m input=1200 read=0 creation=142579 creation_5m=142579 creation_1h=0 diverged=system:0@45 prefix_seen_ago_ms=- tools_seen_ago_ms=4210 inflight_same_prefix=0 inflight_same_tools=0
 ```
 
 | field | source | notes |
@@ -352,10 +381,10 @@ cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 
 | `msgs` | entries in `messages` | |
 | `tools_bytes` `system_bytes` `prefix_bytes` `span_bytes` | Definitions, Byte sizes | canonical bytes; `span_bytes=-` without any breakpoint |
 | `ctx_fp` `tools_fp` `system_fp` `prefix_fp` | Definitions | 16 hex |
-| `bp` `bp_ttls` `ttl` | Definitions | |
+| `bp` `bp_ttls` `ttl` `ttl_max` | Definitions | |
 | `input` `read` `creation` | `usage.input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` | `-` when no usage was seen |
 | `creation_5m` `creation_1h` | `usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` | `-` when the `cache_creation` object is absent |
-| `diverged` `prefix_seen_ago_ms` `tools_seen_ago_ms` `inflight_same_prefix` | Definitions | |
+| `diverged` `prefix_seen_ago_ms` `tools_seen_ago_ms` `inflight_same_prefix` `inflight_same_tools` | Definitions | |
 
 Hashes, sizes and offsets only; no block content is ever logged.
 
@@ -428,21 +457,22 @@ empty match. Only `cache trace` lines are read. Output, one section per
    `creation_5m`, `creation_1h`, weighted; per client within the model.
 2. **Cold-start buckets**: for each of `first`, `concurrent`, `sequential`,
    `expired`, `no_prefix_bp` (with its three sub-classes): count, raw
-   `creation`, `prefix_est`, the estimate's 5m and 1h tokens and weighted
-   value, `fallback` count, and share of the model's total weighted writes.
+   `creation`, `prefix_est`, its weighted value at the prefix TTL, and
+   share of the model's total weighted writes.
 3. **Avoidable (B3 / sequential)**: `concurrent + sequential` raw
-   `creation`, `prefix_est`, its 5m/1h split, weighted, share of the model's
-   writes.
-4. **B1 target**: two lines, `no_prefix_bp` within 5m (`prefix_est`) and
-   `tools_bp_missing` (`tools_est`), each with raw `creation`, the estimate,
-   its split and weighted value.
+   `creation`, `prefix_est`, weighted, share of the model's writes.
+4. **B1 target**: the tools line as defined (count, raw `creation`,
+   `tools_est`, weighted at `b1_ttl`), its per-bucket breakdown, the
+   overlap with line 3, and the model's smallest and median `tools_bytes`.
 5. **Sanity**: lines where `ttl` is not the last element of `bp_ttls`
    (expect 0), lines where `bp_ttls` has `5m` before `1h` (expect 0), lines
-   where `prefix_bytes > span_bytes` (expect 0), lines with `status` not
-   2xx, lines with `read=-`, lines with `diverged` offsets `?`, lines
-   violating the `prefix_seen_ago_ms=-` / `inflight>0` invariant (expect 0),
-   and the share of non-streaming lines (whose in-flight window is
-   overstated).
+   where `prefix_bytes > span_bytes` (expect 0), lines where `ttl=1h` yet
+   `creation_1h=0` with `creation>0`, or `ttl_max=5m` yet `creation_1h>0`
+   (the response's split disagrees with the layout), lines with `status`
+   not 2xx, lines with `read=-`, lines with `diverged` offsets `?` or a `+`
+   tail, the `fallback` count, lines violating either recency/in-flight
+   invariant (expect 0), and the share of non-streaming lines (whose
+   in-flight window is overstated).
 
 ### Cost
 
@@ -451,7 +481,7 @@ canonical re-serialization of every block (about the body's size in bytes)
 and FNV over it. Expected single-digit milliseconds per MB, an order below
 the compress stage's 60 ms average. The implementation plan measures it on
 a 1 MB fixture and records the number; no timing field is added to the line.
-Memory: a hard 32 MB bound for the previous-request table (typically a few
+Memory: a hard 35 MB bound for the previous-request table (typically a few
 MB) plus two tables of 1024 small entries.
 
 ## Assumptions
@@ -501,13 +531,16 @@ column.
   tools alone, no prefix breakpoint gives all of both; `span_bytes` through
   a message breakpoint and `-` without any; `diverged` values `first`,
   `none`, `ctx`, tools and system offsets, message index, `@+`, `@-`, and
-  `@?` when the previous slot exceeded the 512 KB byte budget; Tracker
+  `@?` when the previous slot exceeded the 512 KB byte budget, and
+  `msgs:4096+` when the difference lies past the hash cap; `ttl_max` across
+  tools, system, message and automatic breakpoints; Tracker
   semantics: A, B, A, B interleaving gives the third send the first send's
   timestamp; two sends on one key before the first has begun give the
   second `inflight_same_prefix=1` and `prefix_seen_ago_ms` near 0; a second
   send after the first has begun but before it finished gives
   `inflight_same_prefix=0`; the tools table answers `tools_seen_ago_ms` for
-  a request whose prefix key is new; eviction never removes an entry whose
+  a request whose prefix key is new, and `inflight_same_tools=1` while that
+  earlier request has not begun; eviction never removes an entry whose
   response has not begun and refuses when none is evictable; failure
   rollback in both tables (single failure, consecutive failures, the
   documented F1/S2 boundary).
@@ -529,8 +562,10 @@ column.
   that delays only after `message_start` makes it log `0`; the 401 retry
   case of Assumption 1.
 - **Report**: `tests/fixtures/cache-trace/sample.log`, a hand-written log
-  covering every bucket and sub-class, both B1 lines, the fallback rule and
-  the `?` offset across two models and both clients; a `#[test]` runs the
+  covering every bucket and sub-class, the B1 line with its overlap and
+  per-bucket breakdown, a mixed-TTL request whose `prefix_est` is weighted
+  at `ttl` and `tools_est` at `b1_ttl`, the fallback rule, the `?` offset
+  and a `+` tail across two models and both clients; a `#[test]` runs the
   script on it and compares against an expected output file.
 
 ## Estimated size
