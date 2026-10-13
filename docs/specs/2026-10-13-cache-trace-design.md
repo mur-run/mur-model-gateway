@@ -64,9 +64,11 @@ the unit B1 would create. Messages are never part of the prefix.
 ### Fingerprints
 
 Per-block hash: FNV-1a 64 over the block's canonical bytes, where canonical
-means the block re-serialized by `serde_json::to_vec` (compact, object keys
-sorted because the crate is built without `preserve_order`). Consequences,
-by design:
+means the block, with its `cache_control` member removed, re-serialized by
+`serde_json::to_vec` (compact, object keys sorted because the crate is built
+without `preserve_order`). The breakpoint is a directive, not content: the
+same blocks with a moved breakpoint or a changed TTL are one cache unit, and
+`bp=` records the layout. Consequences, by design:
 
 - insensitive to JSON whitespace and object key order, sensitive to every
   content byte. Upstream hashes the rendered prompt, not the JSON text, so
