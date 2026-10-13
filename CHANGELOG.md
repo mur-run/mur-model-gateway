@@ -12,6 +12,63 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+## v0.6.0 — 2026-10-14
+
+**Upgrade: yes** — the MUR agent runtime's `read_file` results reach the model
+intact again, compression is much cheaper per turn, and the proxy log can now
+say who sent a request and why a prompt-cache write happened. Re-run
+`setup.sh` / `install-release.sh`.
+
+### Added
+
+- **Cache trace** (DEBUG, Anthropic `/v1/messages` only): one line per request
+  pairing request-side fingerprints and breakpoint layout with the response's
+  prompt-cache usage. Hashes and sizes only, never block content.
+  `scripts/cache-trace-report.sh` aggregates it into first / concurrent /
+  sequential / expired / no-breakpoint writes and the avoidable share.
+  Definitions: `docs/specs/2026-10-13-cache-trace-design.md`.
+- `client=` on the `proxied`, `upstream usage` and `compress summary` lines:
+  the first user-agent token (`claude-cli` for Claude Code, `none` for a
+  client that sends no user-agent, such as the MUR agent runtime).
+- One `upstream usage` line per Anthropic 2xx response (input / cache read /
+  cache creation tokens).
+- One `compress summary` line per request: memo hit/miss, exempt and stale
+  counts, bytes before/after, body composition (`system_bytes` /
+  `tools_bytes` / `messages_bytes`) and the request model.
+  `scripts/compress-summary-report.sh` aggregates it.
+- `MUR_REPORT_CLIENT=<x>` restricts either report script to one client.
+- `MUR_MODEL_GATEWAY_COMPRESS_BODY_TOKENS=1` (with DEBUG) logs whole-body token
+  counts, off the request path. Off by default: about 150 ms CPU per MB.
+
+### Changed
+
+- The compression engine is built once and shared across requests, and
+  per-block verdicts and stale stubs are memoised. Claude Code resends the
+  whole transcript every turn; a 20-block request used to cost ~440 ms of CPU
+  per turn, and requests collapsing stale results ran ~60x slower than ones
+  that did not.
+- `accept-encoding` is no longer forwarded upstream, so responses come back
+  uncompressed and the usage tap can read them. The `proxied` line records the
+  response `content-encoding`.
+- `mur-compress` bumped from v2.86.0 to v2.91.9.
+- `scripts/install-with-omlx.sh`: asks for UV or APP mode when `oMLX.app` is
+  installed (`MUR_OMLX_MODE=uv|app` to skip; required without a TTY), shares
+  `~/.omlx/models` between both, moves the app to port 8001 in UV mode, and
+  upgrades oMLX to the newest stable, digest-verified release
+  (`MUR_OMLX_VERSION` pins one). A dirty gateway clone is skipped with a
+  warning instead of aborting the install.
+
+### Fixed
+
+- Read-tool results are never compressed, on the Anthropic, OpenAI/Codex and
+  Gemini paths. Only Claude Code's `Read` was exempt, so the MUR runtime's
+  `read_file` came back as a hash stub past ~30 lines.
+- OAuth keepalive: a failed refresh logs the tail of `claude`'s output, and a
+  zeroed expiry (Claude Code's own refresh failed) warns once that an
+  interactive re-login is needed instead of respawning every 30 minutes.
+- `scripts/compress-summary-report.sh` no longer aborts when a section matches
+  nothing in the log.
+
 ## v0.5.0 — 2026-09-27
 
 **Upgrade: yes** — stopping or reinstalling the service no longer kills
