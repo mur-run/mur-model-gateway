@@ -177,7 +177,7 @@ cache hierarchy; the first differing section is reported.
 ### Prefix recency, tools recency, concurrency
 
 Two recency tables with the same entry type. An entry models one upstream
-cache entry: `{ last_seq, last_sent, expires_at, prev, inflight }`.
+cache entry: `{ last_seq, last_sent, prev, readable_until, pending }`.
 
 - **Prefix key**: (request `model`, `ctx_fp`, `prefix_fp`). `prefix_fp`
   already names the exact block set the entry covers, so the breakpoint's
@@ -204,31 +204,35 @@ both tables.
 - `prefix_seen_ago_ms=`, `tools_seen_ago_ms=`: milliseconds since the last
   send that refreshed the key, `-` when the key is new. Human-readable
   recency; the buckets do not use them.
-- `prefix_ttl_left_ms=`, `tools_ttl_left_ms=`: `expires_at - now` at send
-  time, negative once expired, `-` when the key is new. Every refreshing
-  send sets `expires_at` to `now + ttl` in the prefix table and
-  `now + b1_ttl` in the tools table: an entry's lifetime is the TTL of the
-  request that last wrote or read it, not of the request asking now, so a
-  5m client's entry is dead to a later 1h request after five minutes
-  (Assumption 5). The API's rule that a lifetime restarts at the start of
-  any request that writes or reads the entry is why every refreshing send,
-  not only a cold one, moves `expires_at`.
+- `prefix_ttl_left_ms=`, `tools_ttl_left_ms=`: `readable_until - now` at
+  send time, negative once expired, `-` when no entry has become readable
+  yet. An entry becomes readable when a refreshing send's response
+  **begins** (the API: "a cache entry only becomes available after the
+  first response begins"); at that moment `readable_until` is raised to
+  that send's `send time + ttl` (prefix table) or `send time + b1_ttl`
+  (tools table). So the lifetime is the TTL of the request that last wrote
+  or read the entry, not of the request asking now: a 5m client's entry is
+  dead to a later 1h request after five minutes (Assumption 5). Every
+  refreshing send that begins moves `readable_until`, not only a cold one,
+  matching the API's rule that a lifetime restarts at the start of any
+  request that writes or reads the entry. A send that fails never makes
+  the entry readable.
 - `inflight_same_prefix=`, `inflight_same_tools=`: number of refreshing
-  sends with the same key whose response had not **begun** when this one
-  was sent. The API documents that "a cache entry only becomes available
-  after the first response begins", so a send that overlaps only with
-  another request's output generation is not a race and must not be
-  counted. "Begun" is observed as: the first SSE chunk (which carries
-  `message_start`) for streaming responses, the response headers for
-  non-streaming ones, or any failure. For a non-streaming response the
-  headers arrive after generation, so the window is overstated for such
-  clients; both known clients stream, and the `streaming` column lets the
-  report see the share affected.
+  sends with the same key whose response had not begun when this one was
+  sent: pending writers. A pending writer next to a readable entry is not
+  a race; the entry is there to hit. "Begun" is observed as: the first SSE
+  chunk (which carries `message_start`) for streaming responses, the
+  response headers for non-streaming ones, or any failure. For a
+  non-streaming response the headers arrive after generation, so the
+  pending window is overstated for such clients; both known clients
+  stream, and the `streaming` column lets the report see the share
+  affected.
 
-Invariant, for each table: a `-` recency and an in-flight count above zero
-never hold together, because an in-flight send inserted the key. The
-report's buckets rely on it. If a key ever changes, re-verify the
-invariant.
+Invariant, for each table: a `-` in `*_seen_ago_ms` and an in-flight count
+above zero never hold together, because an in-flight send inserted the
+key and set the timestamp. `*_ttl_left_ms=-` with in-flight above zero is
+legitimate: it is the race the `concurrent` bucket names. If a key ever
+changes, re-verify the invariant.
 
 ### Cold start, avoidable, buckets
 
@@ -238,14 +242,14 @@ top to bottom and the first match wins:
 
 | bucket | condition |
 |---|---|
-| `first` | `prefix_ttl_left_ms=-` (no breakpoint-carrying send of this prefix yet) |
-| `concurrent` | `ttl!=-` and `inflight_same_prefix>0` (B3's target) |
-| `sequential` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_ttl_left_ms>=0` (the entry was alive, no hit: cause to investigate) |
-| `expired` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_ttl_left_ms<0` |
-| `no_prefix_bp` | `ttl=-`; sub-classed `no_cache_control` / `top_level_only` / `msgs_only` |
+| `no_prefix_bp` | `ttl=-`; sub-classed `no_cache_control` / `top_level_only` / `msgs_only`. Listed first: such a request never inserts into the prefix table, so its `prefix_ttl_left_ms` stays `-` and the `first` row would otherwise swallow it |
+| `first` | `prefix_ttl_left_ms=-` and `inflight_same_prefix=0` (no readable entry, no writer pending: a genuine first send) |
+| `concurrent` | no readable entry alive (`prefix_ttl_left_ms` is `-` or `<0`) and `inflight_same_prefix>0` (a writer was pending: B3's target) |
+| `sequential` | `prefix_ttl_left_ms>=0` (a readable entry was alive, no hit: cause to investigate; a pending writer beside it changes nothing) |
+| `expired` | `prefix_ttl_left_ms<0` and `inflight_same_prefix=0` |
 
-The gateway converts `5m` to 300 000 ms and `1h` to 3 600 000 ms when it
-sets `expires_at`.
+Rows after the first all have `ttl!=-`. The gateway converts `5m` to
+300 000 ms and `1h` to 3 600 000 ms when it computes `readable_until`.
 
 **Prefix estimate.** On a cold start, `creation` covers the whole span up
 to the last breakpoint, which usually includes messages. Had the prefix hit,
@@ -283,10 +287,11 @@ savings after B3 can be compared with the bill.
 **B1's target** is the tools entry only: B1 adds a tools breakpoint, so a
 cold start's system and message writes are not its business even when the
 prefix was seen recently. A cold start counts, whatever its bucket, when
-its `bp` has `tools:none`, `tools_count>0`, `tools_ttl_left_ms>=0` and
-`inflight_same_tools=0` (the hypothetical entry, written or refreshed by
-the earlier request at that request's `b1_ttl`, was still alive and its
-writer's response had begun). Value: `tools_est`,
+its `bp` has `tools:none`, `tools_count>0` and `tools_ttl_left_ms>=0` (the
+hypothetical entry, made readable by an earlier request whose response had
+begun, at that request's `b1_ttl`, was still alive). A pending writer
+beside a readable entry does not disqualify the line: the entry is there
+to hit. Value: `tools_est`,
 weighted at `b1_ttl`. This is the runtime's main case (identical tools, a
 system block that differs by cwd): the prefix is genuinely new, but a tools
 breakpoint would have hit. The report prints the figure with its per-bucket
@@ -334,14 +339,14 @@ process start, so there is no partial-state toggle problem.
 ```rust
 pub struct Tracker { inner: Mutex<Inner> }          // lives in AppState
 pub struct SendTrace { /* request-side fields of the line */ }
-pub struct InflightGuard { /* keys, seq, outcome, begun, emitted, Arc<Tracker> */ }
+pub struct InflightGuard { /* keys, seq, expiry per table, outcome, begun, emitted, Arc<Tracker> */ }
 
 pub fn applies(path: &str) -> bool;                 // /v1/messages[?...]
 pub fn on_send(t: &Arc<Tracker>, client: &str, body: &[u8], compress_on: bool)
     -> Option<(SendTrace, InflightGuard)>;
 impl InflightGuard {
     pub fn set_status(&mut self, status: u16);      // also marks begun for non-streaming / failures
-    pub fn begun(&mut self);                        // idempotent: decrements inflight once
+    pub fn begun(&mut self);                        // idempotent: releases pending once; on success raises readable_until
     pub fn complete(&mut self, usage: Option<&UsageDetail>);   // writes the line
 }
 impl Drop for InflightGuard { /* begun(); rollback on failure; write line if not emitted */ }
@@ -373,11 +378,11 @@ compress memo):
   recently used client+model; the only effect is that its next request
   logs `diverged=first`.
 - **Prefix table**, cap 1024, key as defined, and **tools table**, cap
-  1024, key as defined; both hold `{ last_seq, last_sent, expires_at, prev:
-  Option<(seq, Instant, Instant)>, inflight }`, a few dozen bytes plus the
-  key. Every refreshing send `get_mut`s the entry, which promotes it, so LRU order is send recency;
+  1024, key as defined; both hold `{ last_seq, last_sent, prev:
+  Option<(seq, Instant)>, readable_until: Option<Instant>, pending }`, a few
+  dozen bytes plus the key. Every refreshing send `get_mut`s the entry, which promotes it, so LRU order is send recency;
   no second index is needed. Eviction on insert when full: loop `peek_lru`;
-  if its `inflight == 0`, `pop_lru` and insert; otherwise `pop_lru` and
+  if its `pending == 0`, `pop_lru` and insert; otherwise `pop_lru` and
   `push` it back (it becomes most recent, which is harmless: it is in use)
   and continue; after `cap` iterations with nothing evictable, refuse the
   insert and return `-` for that table's recency (and `0` in-flight) for
@@ -386,7 +391,7 @@ compress memo):
   path can never stall on a table.
 
 `seq` is a process-wide monotonic counter assigned per send; rollback
-compares sequence numbers, not `Instant`s. `inflight` counts guards that
+compares sequence numbers, not `Instant`s. `pending` counts guards that
 have not yet reported `begun`.
 
 ### Line format
@@ -440,8 +445,9 @@ only call it:
 
 `complete` sets an `emitted` flag; `Drop` writes only when the flag is
 clear. Exactly one line per request follows from that single owner.
-`begun` is idempotent and `Drop` calls it too, so an in-flight count is
-released exactly once on every path.
+`begun` is idempotent and `Drop` calls it too, so a pending count is
+released exactly once on every path. On a success it also raises
+`readable_until`; on a failure it only releases the count.
 
 ### Failure handling
 
@@ -449,14 +455,17 @@ released exactly once on every path.
   `on_send` returns `None`, no line, no table update, request forwarded
   untouched. The trace never changes a request or a response.
 - **Failed sends must not pollute recency.** A 401, 429, 529 or connection
-  error never ran the model and wrote no cache entry; if its timestamp stayed
-  in a recency table, the next same-prefix cold start would be mis-bucketed
-  as `sequential`. When the outcome is known to be a failure (a non-2xx
-  status, or a drop before any status), in both the prefix and the tools
-  table: if the entry's `last_seq` is still this guard's `seq` (nothing was
-  sent since), restore `last_sent` and `expires_at` from `prev`; if `prev` is empty this was
-  the key's first send and nothing later touched it, so remove the entry.
-  Rollback is one level deep: `prev` is cleared after the restore.
+  error never ran the model and wrote no cache entry. The buckets are safe
+  by construction, because `readable_until` is raised only when a response
+  begins and a failure never begins one; the pending count is released by
+  `begun` on every path. What a failed send would still leave behind is its
+  timestamp in `*_seen_ago_ms`. When the outcome is known to be a failure
+  (a non-2xx status, or a drop before any status), in both the prefix and
+  the tools table: if the entry's `last_seq` is still this guard's `seq`
+  (nothing was sent since), restore `last_seq` and `last_sent` from `prev`;
+  if `prev` is empty and `readable_until` is unset this was the key's first
+  send and nothing later touched it, so remove the entry. Rollback is one
+  level deep: `prev` is cleared after the restore.
   - Consecutive failures F1, F2 on a key last seen at t0: F1 rolls back to
     t0; F2 sees t0 (the value from before F1; F1's timestamp is erased), and
     rolls back to t0 again. The log never shows F1's timestamp.
@@ -464,8 +473,9 @@ released exactly once on every path.
     bucketed `concurrent`, which under B3 is still right: it would have
     waited on F1), F1 fails: `last_seq` is S2's, so no rollback. If S2 then
     fails too, it rolls back to `prev`, which is F1's timestamp, and a third
-    send is judged against a failed send. One level is the design; this
-    case is documented, not handled.
+    send's `*_seen_ago_ms` shows a failed send's timestamp. Its bucket is
+    unaffected, since neither F1 nor S2 made the entry readable. One level
+    is the design; this case is documented, not handled.
 - **401 retry.** The retry re-sends bytes identical to `final_body` (see
   Assumptions), so the first attempt's `SendTrace` and guard are reused;
   `set_status` is called once, with the final attempt's status, so the
@@ -499,9 +509,10 @@ empty match. Only `cache trace` lines are read. Output, one section per
    not 2xx, lines with `read=-`, lines with `diverged` offsets `?` or a `+`
    tail, the `fallback` count, lines violating either recency/in-flight
    invariant (expect 0), lines where `bp_bytes` is not non-decreasing or
-   its last element differs from `prefix_bytes` (expect 0), lines where
-   `prefix_seen_ago_ms < ttl` and `prefix_ttl_left_ms >= 0` disagree
-   (non-zero only when a client changed TTL between sends), and the share
+   its last element differs from `prefix_bytes` (expect 0), lines with
+   `inflight_same_prefix=0` where `prefix_seen_ago_ms < ttl` yet
+   `prefix_ttl_left_ms` is `-` or `<0` (non-zero only when a client changed
+   TTL between sends), and the share
    of non-streaming lines (whose in-flight window is overstated).
 
 ### Cost
@@ -550,7 +561,7 @@ column.
 5. **A refresh takes the refreshing request's TTL.** The documentation says
    an entry's lifetime restarts at the start of any request that writes or
    reads it, and says nothing about which TTL applies when the reader's
-   breakpoint TTL differs from the writer's. The tables set `expires_at`
+   breakpoint TTL differs from the writer's. The tables raise `readable_until`
    from the touching request's own TTL (`ttl` for the prefix table,
    `b1_ttl` for the tools table). For a client whose TTL never changes,
    which is every client seen so far, any reading of the rule gives the
@@ -576,19 +587,22 @@ column.
   tools breakpoint followed by a 5m system one; Tracker
   semantics: A, B, A, B interleaving gives the third send the first send's
   timestamp; two sends on one key before the first has begun give the
-  second `inflight_same_prefix=1` and `prefix_seen_ago_ms` near 0; a second
-  send after the first has begun but before it finished gives
-  `inflight_same_prefix=0`; `prefix_ttl_left_ms` goes negative once the
+  second `inflight_same_prefix=1`, `prefix_seen_ago_ms` near 0 and
+  `prefix_ttl_left_ms=-`; a second send after the first has begun but
+  before it finished gives `inflight_same_prefix=0` and a positive
+  `prefix_ttl_left_ms`; `prefix_ttl_left_ms` goes negative once the
   writer's TTL has elapsed even when the asking request carries `1h` (the
   Tracker takes `now` as a parameter so tests drive the clock); a send
   without a prefix breakpoint reads the prefix table but neither inserts
   nor refreshes; `system:1` of two blocks and `system:last` of the same two
   map to one prefix key; the tools table answers `tools_seen_ago_ms` for
   a request whose prefix key is new, and `inflight_same_tools=1` while that
-  earlier request has not begun; eviction never removes an entry whose
+  earlier request has not begun; a third send with one begun and one
+  pending writer still gets a positive `tools_ttl_left_ms`; eviction never removes an entry whose
   response has not begun and refuses when none is evictable; failure
   rollback in both tables (single failure, consecutive failures, the
-  documented F1/S2 boundary), restoring `expires_at` as well.
+  documented F1/S2 boundary), and a failed writer never raises
+  `readable_until`.
 - **`lib.rs` tap tests**: extend the `message_start` fixture with `id`,
   `model` and a nested `cache_creation` object; assert the four new
   `UpstreamUsage` fields for SSE and for a JSON body; `Absent` and the
@@ -611,7 +625,8 @@ column.
   per-bucket breakdown, a mixed-TTL prefix whose `prefix_est` is weighted
   segment by segment from `bp_bytes` and `bp_ttls` and whose `tools_est` is
   weighted at `b1_ttl`, a line where `prefix_seen_ago_ms < ttl` yet
-  `prefix_ttl_left_ms < 0`, the fallback rule, the `?` offset
+  `prefix_ttl_left_ms < 0`, a breakpoint-less client whose cold starts
+  land in `no_prefix_bp` rather than `first`, the fallback rule, the `?` offset
   and a `+` tail across two models and both clients; a `#[test]` runs the
   script on it and compares against an expected output file.
 
