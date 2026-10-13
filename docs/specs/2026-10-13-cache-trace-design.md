@@ -26,12 +26,12 @@ guess would be measured against the same blind log.
 
 Emit one new DEBUG line, `cache trace`, per Anthropic `/v1/messages` request.
 The request side (fingerprints, breakpoint layout, divergence from the
-previous request, prefix recency, in-flight count) is computed at send time;
-the response side (usage, id, model, status) is added when the response's
-usage arrives, and the two halves go out as a single line. A new script,
-`scripts/cache-trace-report.sh`, aggregates the line into "avoidable write
-tokens" per model. The existing `upstream usage` and `compress summary` lines
-are unchanged.
+previous request, prefix and tools recency, in-flight count, byte sizes) is
+computed at send time; the response side (usage, id, model, status) is added
+when the response's usage arrives, and the two halves go out as a single
+line. A new script, `scripts/cache-trace-report.sh`, aggregates the line into
+"avoidable write tokens" per model. The existing `upstream usage` and
+`compress summary` lines are unchanged.
 
 Rejected alternatives:
 
@@ -52,9 +52,14 @@ must not re-derive any of them differently.
 
 ### Prefix
 
-`tools` plus `system`, in the body handed to reqwest: after compression and
-after `disguise::inject_billing_prefix`. Messages are never part of the
-prefix. This is the unit a `system`-side breakpoint caches upstream.
+The blocks of `tools` and `system`, in document order, up to and including
+the last breakpoint inside those two sections, in the body handed to reqwest
+(after compression and after `disguise::inject_billing_prefix`). That is the
+unit upstream actually caches: with `system:1` on a three-block system the
+prefix is tools plus system blocks 0 and 1, and a change to block 2 does not
+touch it; with `tools:last,system:none` the prefix is the tools alone. When
+the two sections hold no breakpoint, the prefix is all of tools plus system,
+the unit B1 would create. Messages are never part of the prefix.
 
 ### Fingerprints
 
@@ -67,11 +72,24 @@ by design:
   content byte. Upstream hashes the rendered prompt, not the JSON text, so
   this is the closer model. Byte-exact hashing of the original body would
   need block byte ranges, which serde_json does not expose.
-- `tools_fp` = FNV-1a over the sequence of tool hashes; `system_fp` likewise
-  over the system block hashes (a string `system` counts as one block);
-  `prefix_fp` = FNV-1a over (`tools_fp`, `system_fp`). All printed as 16 hex
-  digits. FNV-1a is implemented inline (no crate) and has no per-process key,
-  so fingerprints are comparable across gateway restarts.
+- `tools_fp` = FNV-1a over the sequence of all tool hashes; `system_fp`
+  likewise over all system block hashes (a string `system` counts as one
+  block). Both cover their whole section and are diagnostic.
+- `prefix_fp` = FNV-1a over the hashes of exactly the prefix blocks as
+  defined above. It is the cache-unit identity.
+- `ctx_fp` = FNV-1a over the canonical bytes of the request settings that
+  the API documents as invalidating the system or tools cache without any
+  change to their content: `thinking`, `output_config.effort`, `speed`, and
+  a boolean "any `citations.enabled: true` inside `messages`". Absent
+  settings hash as absent. Web search is a tool and is already inside
+  `tools_fp`. The thinking and effort rows are model-specific in the
+  documentation (they invalidate tools and system only on models that render
+  the configuration ahead of them); the key treats them as always
+  invalidating, which can only under-count avoidable writes, never inflate
+  them.
+- All printed as 16 hex digits. FNV-1a is implemented inline (no crate) and
+  has no per-process key, so fingerprints are comparable across gateway
+  restarts.
 
 ### Breakpoint layout `bp=`
 
@@ -94,16 +112,34 @@ The report derives the third-bucket sub-classes from `bp=`:
 
 ### TTLs
 
-`bp_ttls=` lists, in document order, the TTL of every breakpoint inside the
-prefix (tools, then system): `5m` or `1h`, with an omitted `ttl` recorded as
-its effective value `5m`. `-` when the prefix has no breakpoint. It is a
-diagnostic column: the API requires 1h entries before 5m ones, and the
-report checks the order.
+`bp_ttls=` lists, in document order, the TTL of every breakpoint inside
+tools and system: `5m` or `1h`, with an omitted `ttl` recorded as its
+effective value `5m`. `-` when there is none. It is a diagnostic column: the
+API requires 1h entries before 5m ones, and the report checks the order.
 
-`ttl=` is the TTL of the last breakpoint inside the prefix, i.e. the last
-element of `bp_ttls`, or `-` when the prefix has none. It is the client's
+`ttl=` is the TTL of the last breakpoint inside tools and system, i.e. the
+last element of `bp_ttls`, or `-` when there is none. It is the client's
 original value; a gateway-sent TTL (`sent_ttl`) is added only when B1
 exists. Message breakpoint TTLs are not logged.
+
+### Byte sizes
+
+All in canonical bytes, so they are comparable with each other and with the
+fingerprints, not with the wire body:
+
+- `tools_bytes`, `system_bytes`: the whole section.
+- `prefix_bytes`: the prefix blocks only (equals `tools_bytes +
+  system_bytes` when the last prefix breakpoint is on the last system block
+  or there is none).
+- `span_bytes`: every block from the start of the request through the last
+  breakpoint anywhere in it (tools, system, messages, or the automatic last
+  block). `-` when the request has no breakpoint at all. On a full-cold
+  response this is the span that `creation` paid for.
+
+The report uses byte shares of `creation` as token estimates (see Cold
+start). Tokens per byte differ between tool schemas, prose and tool
+results, so these are estimates and are labelled `est` wherever printed;
+the raw `creation` is always printed beside them as the upper bound.
 
 ### Divergence `diverged=`
 
@@ -113,35 +149,55 @@ for responses. Values:
 
 - `first`: no previous request for this client+model since the gateway
   started (or since the slot was evicted).
-- `none`: tools, system and messages sequences all identical.
+- `none`: ctx, tools, system and messages all identical.
+- `ctx`: `ctx_fp` differs (settings changed; content may be identical).
 - `tools:i@off` / `system:i@off`: `i` is the first block whose hash differs,
   `off` the first differing byte of that block's canonical bytes; when one
   side's bytes are a prefix of the other's, `off` is the shorter length.
   When all shared blocks match and the counts differ, `off` is `+` (this
-  request has more blocks) or `-` (fewer).
+  request has more blocks) or `-` (fewer). `off` is `?` when the previous
+  slot kept hashes only (see Tracker state).
 - `msgs:i`: first differing message index; no offset, because only message
   hashes are retained.
 
-Sections are compared in order tools, system, messages; the first differing
-section is reported.
+Sections are compared in order ctx, tools, system, messages, mirroring the
+cache hierarchy; the first differing section is reported.
 
-### Prefix recency and concurrency
+### Prefix recency, tools recency, concurrency
 
-One table keyed by (request `model`, `prefix_fp`, the `tools` and `system`
-segments of `bp`). The `msgs` segment is excluded on purpose: it says
-nothing about whether the prefix is a cache unit, and a client that changes
-its message breakpoint layout would otherwise split one prefix across keys.
-The `model` is in the key because a cache entry is the model's computed KV state; the same
-prefix on another model is a guaranteed miss.
+Two recency tables with the same entry type.
 
-At send time, under one lock, in this order: read, classify, update.
+- **Prefix key**: (request `model`, `ctx_fp`, `prefix_fp`, the `tools` and
+  `system` segments of `bp`). The `msgs` segment is excluded on purpose: it
+  says nothing about whether the prefix is a cache unit, and a client that
+  changes its message breakpoint layout would otherwise split one prefix
+  across keys. The `model` is in the key because a cache entry is the model's
+  computed KV state; the same prefix on another model is a guaranteed miss.
+  `ctx_fp` is in the key because the documented settings change the rendered
+  prompt ahead of the content.
+- **Tools key**: (request `model`, `ctx_fp`, `tools_fp`). No `bp` segment:
+  the question it answers is "would a tools-level entry have existed had
+  every request carried a tools breakpoint", which is B1's hypothetical, so
+  the client's actual layout is irrelevant.
 
-- `prefix_seen_ago_ms=`: milliseconds since the last send with the same key,
-  `-` when the key is new. Every send updates the timestamp, not only cold
-  ones, matching the API rule that a cache entry's lifetime restarts at the
-  start of any request that writes or reads it.
-- `inflight_same_prefix=`: number of sends with the same key whose response
-  has not finished when this one is sent.
+At send time, under one lock, in this order: read, classify, update, for
+both tables.
+
+- `prefix_seen_ago_ms=`: milliseconds since the last send with the same
+  prefix key, `-` when the key is new. Every send updates the timestamp, not
+  only cold ones, matching the API rule that a cache entry's lifetime
+  restarts at the start of any request that writes or reads it.
+- `tools_seen_ago_ms=`: the same for the tools key.
+- `inflight_same_prefix=`: number of sends with the same prefix key whose
+  response had not **begun** when this one was sent. The API documents that
+  "a cache entry only becomes available after the first response begins",
+  so a send that overlaps only with another request's output generation is
+  not a race and must not be counted. "Begun" is observed as: the first SSE
+  chunk (which carries `message_start`) for streaming responses, the
+  response headers for non-streaming ones, or any failure. For a
+  non-streaming response the headers arrive after generation, so the window
+  is overstated for such clients; both known clients stream, and the
+  `streaming` column lets the report see the share affected.
 
 Invariant: `prefix_seen_ago_ms=-` and `inflight_same_prefix>0` never hold
 together, because an in-flight send inserted the key. The report's buckets
@@ -155,31 +211,53 @@ top to bottom and the first match wins:
 
 | bucket | condition |
 |---|---|
-| `first` | `prefix_seen_ago_ms=-` (a genuine first send) |
+| `first` | `prefix_seen_ago_ms=-` (a genuine first send of this prefix) |
 | `concurrent` | `ttl!=-` and `inflight_same_prefix>0` (B3's target) |
 | `sequential` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_seen_ago_ms` < TTL (same prefix, no hit: cause to investigate) |
 | `expired` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_seen_ago_ms` >= TTL |
-| `no_prefix_bp` | `ttl=-`; sub-classed `no_cache_control` / `top_level_only` / `msgs_only` (B1's target) |
+| `no_prefix_bp` | `ttl=-`; sub-classed `no_cache_control` / `top_level_only` / `msgs_only` |
 
-TTL is 300 000 ms for `5m` and 3 600 000 ms for `1h`. `no_prefix_bp` is
-judged against the 5m window (what B1 would add by default): its tokens
-count as avoidable when `prefix_seen_ago_ms` < 5m, regardless of in-flight
-state, and are reported separately from `concurrent`/`sequential` so B1's
-effect is measured apart from B3's.
+TTL is 300 000 ms for `5m` and 3 600 000 ms for `1h`.
 
-**Avoidable write tokens** = the `creation` tokens of `concurrent` plus
-`sequential`, with `no_prefix_bp`'s within-window tokens listed as a separate
-B1 line. Each figure is reported as raw 5m tokens, raw 1h tokens, and
-`weighted = 5m * 1.25 + 1h * 2` (multiples of the model's base input price),
-so that savings after B1/B3 can be compared with the bill. Everything is
-grouped by `model=`.
+**Prefix estimate.** On a cold start, `creation` covers the whole span up
+to the last breakpoint, which usually includes messages. Had the prefix hit,
+the messages part would still have been written, so only the prefix part is
+avoidable:
+
+```
+prefix_est = creation * prefix_bytes / span_bytes
+tools_est  = creation * tools_bytes  / span_bytes
+```
+
+**Avoidable write tokens (B3 and the sequential investigation)** =
+`prefix_est` summed over `concurrent` plus `sequential`. Reported as raw
+`creation` (upper bound), `prefix_est`, and `prefix_est` split into 5m and
+1h tokens with `weighted = 5m * 1.25 + 1h * 2` (multiples of the model's
+base input price), so that savings after B3 can be compared with the bill.
+
+**B1's target** has two parts, reported on separate lines and never added
+to the figure above:
+
+1. `no_prefix_bp` cold starts with `prefix_seen_ago_ms` < 5m (the TTL B1
+   would add by default), regardless of in-flight state: `prefix_est`.
+2. `tools_bp_missing`: cold starts in the `first` or `expired` bucket whose
+   `bp` has `tools:none`, `tools_count>0` and `tools_seen_ago_ms` < 5m:
+   `tools_est`. This is the runtime's main case (identical tools, a system
+   block that differs by cwd): the prefix is genuinely new, but a tools
+   breakpoint would have hit. `concurrent` and `sequential` cold starts are
+   excluded here because their whole prefix, tools included, is already
+   counted above.
+
+Each part is reported as raw `creation`, the estimate, and the estimate's
+5m/1h split and weighted value. Everything is grouped by `model=`.
 
 **5m/1h split rule.** When the response carries the `cache_creation` object,
 `creation_5m` and `creation_1h` are used directly and `ttl=` is diagnostic
-only. When the object is absent (`creation_5m=-`), the whole `creation` is
-attributed by `ttl=`: `1h` to the 1h column, `5m` or `-` to the 5m column,
-and the line is counted in a `fallback` column so third-bucket weighting is
-never silently mixed with pre-split API data.
+only; the estimate is split in the same proportion. When the object is
+absent (`creation_5m=-`), the whole `creation` is attributed by `ttl=`: `1h`
+to the 1h column, `5m` or `-` to the 5m column, and the line is counted in a
+`fallback` column so third-bucket weighting is never silently mixed with
+pre-split API data.
 
 ## Design
 
@@ -204,54 +282,61 @@ process start, so there is no partial-state toggle problem.
 ```rust
 pub struct Tracker { inner: Mutex<Inner> }          // lives in AppState
 pub struct SendTrace { /* request-side fields of the line */ }
-pub struct InflightGuard { /* key, seq, outcome, emitted, Arc<Tracker> */ }
+pub struct InflightGuard { /* keys, seq, outcome, begun, emitted, Arc<Tracker> */ }
 
 pub fn applies(path: &str) -> bool;                 // /v1/messages[?...]
 pub fn on_send(t: &Arc<Tracker>, client: &str, body: &[u8], compress_on: bool)
     -> Option<(SendTrace, InflightGuard)>;
 impl InflightGuard {
-    pub fn set_status(&mut self, status: u16);
+    pub fn set_status(&mut self, status: u16);      // also marks begun for non-streaming / failures
+    pub fn begun(&mut self);                        // idempotent: decrements inflight once
     pub fn complete(&mut self, usage: Option<&UsageDetail>);   // writes the line
 }
-impl Drop for InflightGuard { /* decrement; rollback on failure; write line if not emitted */ }
+impl Drop for InflightGuard { /* begun(); rollback on failure; write line if not emitted */ }
 ```
 
 `on_send` parses the body with `serde_json::from_slice`, computes the
-per-block hashes and the canonical bytes of tools and system blocks outside
-the lock, then takes the lock once for the compare-and-update described
-under Definitions. Lock hold time is bounded by the block comparisons
-(microseconds); hashing is never done under it.
+per-block hashes, the byte sizes and the canonical bytes of tools and
+system blocks outside the lock, then takes the lock once for the
+compare-and-update described under Definitions. Lock hold time is bounded by
+the block comparisons (microseconds); hashing is never done under it.
 
 ### Tracker state
 
-Two tables, both `lru::LruCache` (already a dependency, used by the compress
-memo):
+Three tables, all `lru::LruCache` (already a dependency, used by the
+compress memo):
 
 - **Previous-request table**, cap 64, key (`client`, request `model`), value:
-  the three hash sequences plus the canonical bytes of tools and system
-  blocks (at most ~150 KB per slot). Needed for `diverged=`. Full table
-  evicts the least recently used client+model; the only effect is that its
-  next request logs `diverged=first`.
-- **Prefix table**, cap 1024, key (request `model`, `prefix_fp`, `bp`
-  tools segment, `bp` system segment), value `{ last_seq, last_sent,
-  prev: Option<(seq, Instant)>, inflight }`. Every send `get_mut`s the entry,
-  which promotes it, so LRU order is send recency; no second index is
-  needed. Eviction on insert when full: loop `peek_lru`; if its
-  `inflight == 0`, `pop_lru` and insert; otherwise `pop_lru` and `push` it
-  back (it becomes most recent, which is harmless: it is in use) and
-  continue; after `cap` iterations with nothing evictable, refuse the
-  insert and return `prefix_seen_ago_ms=-`, `inflight_same_prefix=0` for
-  this request. That case needs 1024 distinct prefixes in flight at once and
-  does not occur in practice; it is handled so the request path can never
-  stall on the table.
+  `ctx_fp`, the three hash sequences, and the canonical bytes of the tools
+  and system blocks. Needed for `diverged=`. The bytes are kept only while
+  tools plus system total at most 512 KB canonical; above that the slot
+  stores hashes only and `diverged` offsets print as `?`. That makes the
+  table's memory a hard bound of 64 × 512 KB = 32 MB plus hash vectors,
+  instead of 64 × `MAX_BODY_BYTES` (32 MiB) in the worst case; typical
+  slots are ~150 KB. Full table evicts the least recently used
+  client+model; the only effect is that its next request logs
+  `diverged=first`.
+- **Prefix table**, cap 1024, key as defined, and **tools table**, cap
+  1024, key as defined; both hold `{ last_seq, last_sent, prev:
+  Option<(seq, Instant)>, inflight }`, a few dozen bytes plus the key. Every
+  send `get_mut`s the entry, which promotes it, so LRU order is send recency;
+  no second index is needed. Eviction on insert when full: loop `peek_lru`;
+  if its `inflight == 0`, `pop_lru` and insert; otherwise `pop_lru` and
+  `push` it back (it becomes most recent, which is harmless: it is in use)
+  and continue; after `cap` iterations with nothing evictable, refuse the
+  insert and return `-` for that table's recency (and `0` in-flight) for
+  this request. That case needs 1024 distinct keys whose responses have all
+  not begun, and does not occur in practice; it is handled so the request
+  path can never stall on a table.
 
 `seq` is a process-wide monotonic counter assigned per send; rollback
-compares sequence numbers, not `Instant`s.
+compares sequence numbers, not `Instant`s. `inflight` counts guards that
+have not yet reported `begun`.
 
 ### Line format
 
 ```
-cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 streaming=true compress_on=1 tools_count=38 system_blocks=3 msgs=27 tools_fp=9f3a… system_fp=… prefix_fp=… bp=tools:none,system:last,msgs:last ttl=5m bp_ttls=5m input=1200 read=0 creation=142579 creation_5m=142579 creation_1h=0 diverged=system:1@45 prefix_seen_ago_ms=4210 inflight_same_prefix=0
+cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 streaming=true compress_on=1 tools_count=38 system_blocks=3 msgs=27 tools_bytes=30534 system_bytes=4120 prefix_bytes=34654 span_bytes=61200 ctx_fp=… tools_fp=9f3a… system_fp=… prefix_fp=… bp=tools:none,system:last,msgs:last ttl=5m bp_ttls=5m input=1200 read=0 creation=142579 creation_5m=142579 creation_1h=0 diverged=system:0@45 prefix_seen_ago_ms=- tools_seen_ago_ms=4210 inflight_same_prefix=0
 ```
 
 | field | source | notes |
@@ -265,13 +350,14 @@ cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 
 | `tools_count` | entries in `tools` | 0 when absent |
 | `system_blocks` | system blocks | 1 for a string `system`, 0 when absent |
 | `msgs` | entries in `messages` | |
-| `tools_fp` `system_fp` `prefix_fp` | Definitions | 16 hex |
+| `tools_bytes` `system_bytes` `prefix_bytes` `span_bytes` | Definitions, Byte sizes | canonical bytes; `span_bytes=-` without any breakpoint |
+| `ctx_fp` `tools_fp` `system_fp` `prefix_fp` | Definitions | 16 hex |
 | `bp` `bp_ttls` `ttl` | Definitions | |
 | `input` `read` `creation` | `usage.input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` | `-` when no usage was seen |
 | `creation_5m` `creation_1h` | `usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` | `-` when the `cache_creation` object is absent |
-| `diverged` `prefix_seen_ago_ms` `inflight_same_prefix` | Definitions | |
+| `diverged` `prefix_seen_ago_ms` `tools_seen_ago_ms` `inflight_same_prefix` | Definitions | |
 
-Hashes and offsets only; no block content is ever logged.
+Hashes, sizes and offsets only; no block content is ever logged.
 
 ### Response side
 
@@ -283,10 +369,13 @@ container (`message_start.message` for SSE, the root for JSON). Its existing
 **The guard is the only writer of the line.** The handler and `UsageTap`
 only call it:
 
-- non-2xx: the handler calls `guard.set_status(status)` then
+- non-2xx: the handler calls `guard.set_status(status)` (which marks the
+  response begun and, being a failure, triggers the rollback below) then
   `guard.complete(None)` and drops the guard. The line goes out with all
   usage fields `-`. The guard is not handed to `UsageTap`.
-- 2xx: the handler calls `set_status` and moves the guard into `UsageTap`.
+- 2xx: the handler calls `set_status` (for a non-streaming response this
+  also marks it begun) and moves the guard into `UsageTap`. For a streaming
+  response the tap calls `guard.begun()` on the first chunk it observes.
   When the tap finds the usage (SSE `message_start`, or the JSON body at
   EOF) it calls `guard.complete(Some(&usage))`. If the tap finishes without
   usage (first frame not `message_start`, buffer cap exceeded, stream error)
@@ -295,6 +384,8 @@ only call it:
 
 `complete` sets an `emitted` flag; `Drop` writes only when the flag is
 clear. Exactly one line per request follows from that single owner.
+`begun` is idempotent and `Drop` calls it too, so an in-flight count is
+released exactly once on every path.
 
 ### Failure handling
 
@@ -303,25 +394,26 @@ clear. Exactly one line per request follows from that single owner.
   untouched. The trace never changes a request or a response.
 - **Failed sends must not pollute recency.** A 401, 429, 529 or connection
   error never ran the model and wrote no cache entry; if its timestamp stayed
-  in the prefix table, the next same-prefix cold start would be mis-bucketed
-  as `sequential`. On drop with a non-2xx outcome (or a send error, which is
-  a drop before any status), after decrementing `inflight`: if the entry's
-  `last_seq` is still this guard's `seq` (nothing was sent since), restore
-  `last_sent` from `prev`; if `prev` is empty this was the key's first send
-  and nothing later touched it, so remove the entry. Rollback is one
-  level deep: `prev` is cleared after the restore.
+  in a recency table, the next same-prefix cold start would be mis-bucketed
+  as `sequential`. When the outcome is known to be a failure (a non-2xx
+  status, or a drop before any status), in both the prefix and the tools
+  table: if the entry's `last_seq` is still this guard's `seq` (nothing was
+  sent since), restore `last_sent` from `prev`; if `prev` is empty this was
+  the key's first send and nothing later touched it, so remove the entry.
+  Rollback is one level deep: `prev` is cleared after the restore.
   - Consecutive failures F1, F2 on a key last seen at t0: F1 rolls back to
     t0; F2 sees t0 (the value from before F1; F1's timestamp is erased), and
     rolls back to t0 again. The log never shows F1's timestamp.
-  - Accepted boundary: F1 sent, S2 sent while F1 is in flight (S2 is
-    bucketed `concurrent`, which under B3 is still right: it would have waited
-    on F1), F1 fails: `last_seq` is S2's, so no rollback. If S2 then fails
-    too, it rolls back to `prev`, which is F1's timestamp, and a third send
-    is judged against a failed send. One level is the design; this case is
-    documented, not handled.
+  - Accepted boundary: F1 sent, S2 sent while F1 has not begun (S2 is
+    bucketed `concurrent`, which under B3 is still right: it would have
+    waited on F1), F1 fails: `last_seq` is S2's, so no rollback. If S2 then
+    fails too, it rolls back to `prev`, which is F1's timestamp, and a third
+    send is judged against a failed send. One level is the design; this
+    case is documented, not handled.
 - **401 retry.** The retry re-sends bytes identical to `final_body` (see
   Assumptions), so the first attempt's `SendTrace` and guard are reused;
-  `set_status` is called with the final attempt's status. One line.
+  `set_status` is called once, with the final attempt's status, so the
+  intermediate 401 triggers no rollback. One line.
 - **Tables full.** Covered under Tracker state; never blocks a request.
 
 ### Report `scripts/cache-trace-report.sh`
@@ -335,16 +427,22 @@ empty match. Only `cache trace` lines are read. Output, one section per
 1. **Totals**: lines, lines with usage, cold starts, total `creation`,
    `creation_5m`, `creation_1h`, weighted; per client within the model.
 2. **Cold-start buckets**: for each of `first`, `concurrent`, `sequential`,
-   `expired`, `no_prefix_bp` (with its three sub-classes): count, `creation`,
-   5m tokens, 1h tokens, weighted, `fallback` count, and share of the model's
-   total weighted writes.
-3. **Avoidable**: `concurrent + sequential` raw 5m, raw 1h, weighted, share
-   of the model's writes; the `no_prefix_bp` within-5m figure on its own
-   line labelled as B1's target.
-4. **Sanity**: lines where `ttl` is not the last element of `bp_ttls`
+   `expired`, `no_prefix_bp` (with its three sub-classes): count, raw
+   `creation`, `prefix_est`, the estimate's 5m and 1h tokens and weighted
+   value, `fallback` count, and share of the model's total weighted writes.
+3. **Avoidable (B3 / sequential)**: `concurrent + sequential` raw
+   `creation`, `prefix_est`, its 5m/1h split, weighted, share of the model's
+   writes.
+4. **B1 target**: two lines, `no_prefix_bp` within 5m (`prefix_est`) and
+   `tools_bp_missing` (`tools_est`), each with raw `creation`, the estimate,
+   its split and weighted value.
+5. **Sanity**: lines where `ttl` is not the last element of `bp_ttls`
    (expect 0), lines where `bp_ttls` has `5m` before `1h` (expect 0), lines
-   with `status` not 2xx, lines with `read=-`, lines violating the
-   `prefix_seen_ago_ms=-` / `inflight>0` invariant (expect 0).
+   where `prefix_bytes > span_bytes` (expect 0), lines with `status` not
+   2xx, lines with `read=-`, lines with `diverged` offsets `?`, lines
+   violating the `prefix_seen_ago_ms=-` / `inflight>0` invariant (expect 0),
+   and the share of non-streaming lines (whose in-flight window is
+   overstated).
 
 ### Cost
 
@@ -353,12 +451,13 @@ canonical re-serialization of every block (about the body's size in bytes)
 and FNV over it. Expected single-digit milliseconds per MB, an order below
 the compress stage's 60 ms average. The implementation plan measures it on
 a 1 MB fixture and records the number; no timing field is added to the line.
-Memory: at most 64 × ~150 KB for the previous-request table plus 1024 small
-prefix entries.
+Memory: a hard 32 MB bound for the previous-request table (typically a few
+MB) plus two tables of 1024 small entries.
 
 ## Assumptions
 
-Recorded because the design leans on them; each has a test.
+Recorded because the design leans on them; each has a test or a labelled
+column.
 
 1. **Billing-prefix injection is deterministic.** `on_send` runs once and the
    401 retry reuses its result, which is only valid if
@@ -366,8 +465,8 @@ Recorded because the design leans on them; each has a test.
    the retry. The private implementation takes only the body and
    `cc_version`; if it ever adds a nonce or a timestamp, the assumption
    breaks and `on_send` would have to run per attempt (and then a failed
-   first attempt must not touch the table). Integration test: a request that
-   triggers the 401 retry arm reaches the mock upstream twice with
+   first attempt must not touch the tables). Integration test: a request
+   that triggers the 401 retry arm reaches the mock upstream twice with
    byte-identical bodies, and the log holds exactly one `cache trace` line
    for it.
 2. **Canonical hashing.** Fingerprints are over serde_json's re-serialization,
@@ -375,48 +474,78 @@ Recorded because the design leans on them; each has a test.
    Unit test: two bodies with the same content and different key order give
    the same `prefix_fp`; one changed character in a system block changes
    `system_fp` and `prefix_fp`.
+3. **Byte share approximates token share within one request.** `prefix_est`
+   and `tools_est` scale `creation` by canonical byte ratios. Tool schemas,
+   prose and tool results tokenize at different rates, so the estimates can
+   be off by tens of percent for a single request; the report always prints
+   the raw `creation` beside them and labels them `est`. If a later
+   sub-project needs exact figures, a `count_tokens` call per distinct prefix
+   is the upgrade path, not a change to this line.
+4. **"Response begun" is when the entry becomes readable.** From the API
+   documentation ("a cache entry only becomes available after the first
+   response begins"). For streaming responses the first SSE chunk is that
+   moment as seen from the gateway; for non-streaming ones the headers come
+   after generation, so the in-flight window is overstated. The `streaming`
+   column and the sanity share make the affected lines visible.
 
 ## Testing
 
 - **`cache_trace.rs` unit tests** on JSON fixtures: fingerprint determinism
-  and key-order insensitivity (Assumption 2); `bp`, `bp_ttls`, `ttl` for six
-  shapes (no `cache_control`; tools only; `system:last`; explicit messages
-  only; top-level automatic; `1h` then `5m` mixed); `diverged` values
-  `first`, `none`, tools and system offsets, message index, `@+`, `@-`;
-  Tracker semantics: A, B, A, B interleaving gives the third send the first
-  send's timestamp; two concurrent sends on one key give the second
-  `inflight_same_prefix=1` and `prefix_seen_ago_ms` near 0; eviction never
-  removes an `inflight>0` entry and refuses when none is evictable; failure
-  rollback (single failure, consecutive failures, the documented
-  F1/S2 boundary).
+  and key-order insensitivity (Assumption 2); `ctx_fp` changes with
+  `thinking`, `output_config.effort`, `speed` and a `citations.enabled`
+  document block, and not with `tool_choice` or an image; `bp`, `bp_ttls`,
+  `ttl` for six shapes (no `cache_control`; tools only; `system:last`;
+  explicit messages only; top-level automatic; `1h` then `5m` mixed);
+  prefix cut: `system:1` on three system blocks gives a `prefix_fp` and
+  `prefix_bytes` that ignore block 2, `tools:last,system:none` gives the
+  tools alone, no prefix breakpoint gives all of both; `span_bytes` through
+  a message breakpoint and `-` without any; `diverged` values `first`,
+  `none`, `ctx`, tools and system offsets, message index, `@+`, `@-`, and
+  `@?` when the previous slot exceeded the 512 KB byte budget; Tracker
+  semantics: A, B, A, B interleaving gives the third send the first send's
+  timestamp; two sends on one key before the first has begun give the
+  second `inflight_same_prefix=1` and `prefix_seen_ago_ms` near 0; a second
+  send after the first has begun but before it finished gives
+  `inflight_same_prefix=0`; the tools table answers `tools_seen_ago_ms` for
+  a request whose prefix key is new; eviction never removes an entry whose
+  response has not begun and refuses when none is evictable; failure
+  rollback in both tables (single failure, consecutive failures, the
+  documented F1/S2 boundary).
 - **`lib.rs` tap tests**: extend the `message_start` fixture with `id`,
   `model` and a nested `cache_creation` object; assert the four new
   `UpstreamUsage` fields for SSE and for a JSON body; `Absent` and the
-  buffer cap produce one line with usage `-` via the guard.
+  buffer cap produce one line with usage `-` via the guard; `begun` is
+  released exactly once when the tap is dropped before the first chunk.
 - **Integration `tests/cache_trace.rs`**, using the global log capture
   pattern of `tests/client_disconnect.rs` and httpmock: two requests with
   the same tools+system give a second line with numeric
   `prefix_seen_ago_ms` and `diverged=msgs:*`; changing one character in the
-  middle of the second system block gives `diverged=system:1@<offset>`; a
-  429 followed by a same-prefix request shows the rolled-back value; a
+  middle of the second system block gives `diverged=system:1@<offset>`, a
+  new prefix key (`prefix_seen_ago_ms=-`) and a numeric `tools_seen_ago_ms`;
+  a 429 followed by a same-prefix request shows the rolled-back value; a
   `count_tokens` request produces no line; compress off still produces the
-  line with `compress_on=0`; the 401 retry case of Assumption 1.
-- **Report**: `tests/fixtures/cache-trace/sample.log`, a hand-written log of
-  a dozen lines covering every bucket and sub-class across two models and
-  both clients, with the fallback rule exercised; a `#[test]` runs the
+  line with `compress_on=0`; a mock upstream that delays its first SSE chunk
+  makes a second concurrent request log `inflight_same_prefix=1`, and one
+  that delays only after `message_start` makes it log `0`; the 401 retry
+  case of Assumption 1.
+- **Report**: `tests/fixtures/cache-trace/sample.log`, a hand-written log
+  covering every bucket and sub-class, both B1 lines, the fallback rule and
+  the `?` offset across two models and both clients; a `#[test]` runs the
   script on it and compares against an expected output file.
 
 ## Estimated size
 
-`src/cache_trace.rs` ~500 lines plus tests; `src/lib.rs` ~80 lines
+`src/cache_trace.rs` ~650 lines plus tests; `src/lib.rs` ~90 lines
 (`AppState` field, hook, `UpstreamUsage` fields, tap wiring);
-`scripts/cache-trace-report.sh` ~150 lines; integration test and fixtures
-~300 lines.
+`scripts/cache-trace-report.sh` ~200 lines; integration test and fixtures
+~400 lines.
 
 ## Out of scope, decided elsewhere
 
 - Renaming `client=none` across the three log lines (one separate commit).
 - `sent_ttl` on the line (with B1).
+- Exact per-prefix token counts via `count_tokens` (only if the byte-share
+  estimates prove too coarse for B1/B3 sizing).
 - A: runtime breakpoint layout, brainstormed in the mur repo once this
   trace has run for a day.
 - B1 and B3: gateway-side breakpoint injection and cold-start coalescing,
