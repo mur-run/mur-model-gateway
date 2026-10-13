@@ -346,10 +346,11 @@ pub fn on_send(t: &Arc<Tracker>, client: &str, body: &[u8], compress_on: bool)
     -> Option<(SendTrace, InflightGuard)>;
 impl InflightGuard {
     pub fn set_status(&mut self, status: u16);      // also marks begun for non-streaming / failures
-    pub fn begun(&mut self);                        // idempotent: releases pending once; on success raises readable_until
+    pub fn begun(&mut self);                        // observed start: releases pending once; on success raises readable_until
+    pub fn abandon(&mut self);                      // no start observed: releases pending once, readable_until untouched
     pub fn complete(&mut self, usage: Option<&UsageDetail>);   // writes the line
 }
-impl Drop for InflightGuard { /* begun(); rollback on failure; write line if not emitted */ }
+impl Drop for InflightGuard { /* abandon() if no start observed; rollback on failure; write line if not emitted */ }
 ```
 
 `on_send` parses the body with `serde_json::from_slice`, computes the
@@ -445,9 +446,13 @@ only call it:
 
 `complete` sets an `emitted` flag; `Drop` writes only when the flag is
 clear. Exactly one line per request follows from that single owner.
-`begun` is idempotent and `Drop` calls it too, so a pending count is
-released exactly once on every path. On a success it also raises
-`readable_until`; on a failure it only releases the count.
+`begun` is idempotent and records an observed start: it releases the
+pending count and, when the status is a success, raises `readable_until`.
+`Drop` never calls `begun`. If the guard is dropped before any start was
+observed (a streaming response whose client went away before the first
+chunk), `Drop` calls `abandon`, which releases the pending count without
+touching `readable_until`: nothing was seen to begin, so nothing is
+declared readable. Either way the count is released exactly once.
 
 ### Failure handling
 
@@ -458,7 +463,7 @@ released exactly once on every path. On a success it also raises
   error never ran the model and wrote no cache entry. The buckets are safe
   by construction, because `readable_until` is raised only when a response
   begins and a failure never begins one; the pending count is released by
-  `begun` on every path. What a failed send would still leave behind is its
+  `begun` or `abandon` on every path. What a failed send would still leave behind is its
   timestamp in `*_seen_ago_ms`. When the outcome is known to be a failure
   (a non-2xx status, or a drop before any status), in both the prefix and
   the tools table: if the entry's `last_seq` is still this guard's `seq`
@@ -606,8 +611,10 @@ column.
 - **`lib.rs` tap tests**: extend the `message_start` fixture with `id`,
   `model` and a nested `cache_creation` object; assert the four new
   `UpstreamUsage` fields for SSE and for a JSON body; `Absent` and the
-  buffer cap produce one line with usage `-` via the guard; `begun` is
-  released exactly once when the tap is dropped before the first chunk.
+  buffer cap produce one line with usage `-` via the guard; a tap
+  dropped before the first chunk releases the pending count through
+  `abandon` without raising `readable_until`, and a tap dropped after it
+  releases nothing twice.
 - **Integration `tests/cache_trace.rs`**, using the global log capture
   pattern of `tests/client_disconnect.rs` and httpmock: two requests with
   the same tools+system give a second line with numeric
