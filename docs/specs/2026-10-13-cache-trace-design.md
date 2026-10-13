@@ -135,9 +135,11 @@ All in canonical bytes, so they are comparable with each other and with the
 fingerprints, not with the wire body:
 
 - `tools_bytes`, `system_bytes`: the whole section.
-- `prefix_bytes`: the prefix blocks only (equals `tools_bytes +
-  system_bytes` when the last prefix breakpoint is on the last system block
-  or there is none).
+- `bp_bytes`: cumulative canonical bytes at each breakpoint inside tools
+  and system, parallel to `bp_ttls` (`bp_bytes=30534,34654` for a tools
+  breakpoint followed by a system one); `-` when there is none.
+- `prefix_bytes`: the prefix blocks only: the last element of `bp_bytes`,
+  or `tools_bytes + system_bytes` when there is no prefix breakpoint.
 - `span_bytes`: every block from the start of the request through the last
   breakpoint anywhere in it (tools, system, messages, or the automatic last
   block). `-` when the request has no breakpoint at all. On a full-cold
@@ -174,40 +176,54 @@ cache hierarchy; the first differing section is reported.
 
 ### Prefix recency, tools recency, concurrency
 
-Two recency tables with the same entry type.
+Two recency tables with the same entry type. An entry models one upstream
+cache entry: `{ last_seq, last_sent, expires_at, prev, inflight }`.
 
-- **Prefix key**: (request `model`, `ctx_fp`, `prefix_fp`, the `tools` and
-  `system` segments of `bp`). The `msgs` segment is excluded on purpose: it
-  says nothing about whether the prefix is a cache unit, and a client that
-  changes its message breakpoint layout would otherwise split one prefix
-  across keys. The `model` is in the key because a cache entry is the model's
-  computed KV state; the same prefix on another model is a guaranteed miss.
-  `ctx_fp` is in the key because the documented settings change the rendered
-  prompt ahead of the content.
-- **Tools key**: (request `model`, `ctx_fp`, `tools_fp`). No `bp` segment:
-  the question it answers is "would a tools-level entry have existed had
-  every request carried a tools breakpoint", which is B1's hypothetical, so
-  the client's actual layout is irrelevant.
+- **Prefix key**: (request `model`, `ctx_fp`, `prefix_fp`). `prefix_fp`
+  already names the exact block set the entry covers, so the breakpoint's
+  position is implied; putting the `bp` segments in the key would split one
+  upstream entry into two keys whenever `last` and an index name the same
+  block, and the `msgs` segment says nothing about the prefix. The `model`
+  is in the key because a cache entry is the model's computed KV state; the
+  same prefix on another model is a guaranteed miss. `ctx_fp` is in the key
+  because the documented settings change the rendered prompt ahead of the
+  content. Only a send with a prefix breakpoint (`ttl!=-`) inserts,
+  refreshes or counts as in flight here, because only such a send writes
+  the entry; a send without one still reads the table (it may hit the entry
+  through the API's lookback) but leaves it untouched. That a lookback hit
+  also refreshes the entry upstream is not modelled; the omission can only
+  under-count recency for breakpoint-less clients.
+- **Tools key**: (request `model`, `ctx_fp`, `tools_fp`). The question it
+  answers is "would a tools-level entry have existed had every request
+  carried a tools breakpoint", which is B1's hypothetical, so every send
+  inserts and refreshes here whatever its actual layout.
 
 At send time, under one lock, in this order: read, classify, update, for
 both tables.
 
-- `prefix_seen_ago_ms=`: milliseconds since the last send with the same
-  prefix key, `-` when the key is new. Every send updates the timestamp, not
-  only cold ones, matching the API rule that a cache entry's lifetime
-  restarts at the start of any request that writes or reads it.
-- `tools_seen_ago_ms=`: the same for the tools key.
-- `inflight_same_tools=`: the same count for the tools key.
-- `inflight_same_prefix=`: number of sends with the same prefix key whose
-  response had not **begun** when this one was sent. The API documents that
-  "a cache entry only becomes available after the first response begins",
-  so a send that overlaps only with another request's output generation is
-  not a race and must not be counted. "Begun" is observed as: the first SSE
-  chunk (which carries `message_start`) for streaming responses, the
-  response headers for non-streaming ones, or any failure. For a
-  non-streaming response the headers arrive after generation, so the window
-  is overstated for such clients; both known clients stream, and the
-  `streaming` column lets the report see the share affected.
+- `prefix_seen_ago_ms=`, `tools_seen_ago_ms=`: milliseconds since the last
+  send that refreshed the key, `-` when the key is new. Human-readable
+  recency; the buckets do not use them.
+- `prefix_ttl_left_ms=`, `tools_ttl_left_ms=`: `expires_at - now` at send
+  time, negative once expired, `-` when the key is new. Every refreshing
+  send sets `expires_at` to `now + ttl` in the prefix table and
+  `now + b1_ttl` in the tools table: an entry's lifetime is the TTL of the
+  request that last wrote or read it, not of the request asking now, so a
+  5m client's entry is dead to a later 1h request after five minutes
+  (Assumption 5). The API's rule that a lifetime restarts at the start of
+  any request that writes or reads the entry is why every refreshing send,
+  not only a cold one, moves `expires_at`.
+- `inflight_same_prefix=`, `inflight_same_tools=`: number of refreshing
+  sends with the same key whose response had not **begun** when this one
+  was sent. The API documents that "a cache entry only becomes available
+  after the first response begins", so a send that overlaps only with
+  another request's output generation is not a race and must not be
+  counted. "Begun" is observed as: the first SSE chunk (which carries
+  `message_start`) for streaming responses, the response headers for
+  non-streaming ones, or any failure. For a non-streaming response the
+  headers arrive after generation, so the window is overstated for such
+  clients; both known clients stream, and the `streaming` column lets the
+  report see the share affected.
 
 Invariant, for each table: a `-` recency and an in-flight count above zero
 never hold together, because an in-flight send inserted the key. The
@@ -222,13 +238,14 @@ top to bottom and the first match wins:
 
 | bucket | condition |
 |---|---|
-| `first` | `prefix_seen_ago_ms=-` (a genuine first send of this prefix) |
+| `first` | `prefix_ttl_left_ms=-` (no breakpoint-carrying send of this prefix yet) |
 | `concurrent` | `ttl!=-` and `inflight_same_prefix>0` (B3's target) |
-| `sequential` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_seen_ago_ms` < TTL (same prefix, no hit: cause to investigate) |
-| `expired` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_seen_ago_ms` >= TTL |
+| `sequential` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_ttl_left_ms>=0` (the entry was alive, no hit: cause to investigate) |
+| `expired` | `ttl!=-`, `inflight_same_prefix=0`, `prefix_ttl_left_ms<0` |
 | `no_prefix_bp` | `ttl=-`; sub-classed `no_cache_control` / `top_level_only` / `msgs_only` |
 
-TTL is 300 000 ms for `5m` and 3 600 000 ms for `1h`.
+The gateway converts `5m` to 300 000 ms and `1h` to 3 600 000 ms when it
+sets `expires_at`.
 
 **Prefix estimate.** On a cold start, `creation` covers the whole span up
 to the last breakpoint, which usually includes messages. Had the prefix hit,
@@ -242,11 +259,20 @@ tools_est  = creation * tools_bytes  / span_bytes
 
 **Weighting an estimate.** An estimate is never split by the response's
 5m/1h proportion: with mixed TTLs the 1h entries sit ahead of the 5m ones,
-so the prefix is written entirely at its own breakpoint's rate and the
-messages at theirs. `prefix_est` is weighted at `ttl` (at `b1_ttl` when
-`ttl=-`, a diagnostic case) and `tools_est` at `b1_ttl`, the rate B1's
-breakpoint would pay. `weighted = tokens * 1.25` for `5m`, `tokens * 2` for
-`1h` (multiples of the model's base input price). The response's own
+so each segment of the prompt is written at the rate of the breakpoint that
+closes it. The prefix itself can hold two rates (a 1h tools breakpoint
+followed by a 5m system one), so `prefix_est` is weighted segment by
+segment from `bp_bytes` and `bp_ttls`:
+
+```
+weighted_prefix_est = creation / span_bytes
+                      * sum_i (bp_bytes[i] - bp_bytes[i-1]) * rate(bp_ttls[i])
+```
+
+with `bp_bytes[-1] = 0`, `rate(5m) = 1.25` and `rate(1h) = 2` (multiples of
+the model's base input price). When `ttl=-` the single segment is the whole
+prefix at `b1_ttl`, a diagnostic case. `tools_est` is weighted at `b1_ttl`,
+the rate B1's breakpoint would pay. The response's own
 `creation_5m`/`creation_1h` feed only the raw totals and a sanity check.
 
 **Avoidable write tokens (B3 and the sequential investigation)** =
@@ -257,9 +283,10 @@ savings after B3 can be compared with the bill.
 **B1's target** is the tools entry only: B1 adds a tools breakpoint, so a
 cold start's system and message writes are not its business even when the
 prefix was seen recently. A cold start counts, whatever its bucket, when
-its `bp` has `tools:none`, `tools_count>0`, `tools_seen_ago_ms` < `b1_ttl`
-and `inflight_same_tools=0` (the earlier request's response had begun, so
-under B1 its tools entry would have been readable). Value: `tools_est`,
+its `bp` has `tools:none`, `tools_count>0`, `tools_ttl_left_ms>=0` and
+`inflight_same_tools=0` (the hypothetical entry, written or refreshed by
+the earlier request at that request's `b1_ttl`, was still alive and its
+writer's response had begun). Value: `tools_est`,
 weighted at `b1_ttl`. This is the runtime's main case (identical tools, a
 system block that differs by cwd): the prefix is genuinely new, but a tools
 breakpoint would have hit. The report prints the figure with its per-bucket
@@ -346,9 +373,9 @@ compress memo):
   recently used client+model; the only effect is that its next request
   logs `diverged=first`.
 - **Prefix table**, cap 1024, key as defined, and **tools table**, cap
-  1024, key as defined; both hold `{ last_seq, last_sent, prev:
-  Option<(seq, Instant)>, inflight }`, a few dozen bytes plus the key. Every
-  send `get_mut`s the entry, which promotes it, so LRU order is send recency;
+  1024, key as defined; both hold `{ last_seq, last_sent, expires_at, prev:
+  Option<(seq, Instant, Instant)>, inflight }`, a few dozen bytes plus the
+  key. Every refreshing send `get_mut`s the entry, which promotes it, so LRU order is send recency;
   no second index is needed. Eviction on insert when full: loop `peek_lru`;
   if its `inflight == 0`, `pop_lru` and insert; otherwise `pop_lru` and
   `push` it back (it becomes most recent, which is harmless: it is in use)
@@ -365,7 +392,7 @@ have not yet reported `begun`.
 ### Line format
 
 ```
-cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 streaming=true compress_on=1 tools_count=38 system_blocks=3 msgs=27 tools_bytes=30534 system_bytes=4120 prefix_bytes=34654 span_bytes=61200 ctx_fp=… tools_fp=9f3a… system_fp=… prefix_fp=… bp=tools:none,system:last,msgs:last ttl=5m bp_ttls=5m ttl_max=5m input=1200 read=0 creation=142579 creation_5m=142579 creation_1h=0 diverged=system:0@45 prefix_seen_ago_ms=- tools_seen_ago_ms=4210 inflight_same_prefix=0 inflight_same_tools=0
+cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 streaming=true compress_on=1 tools_count=38 system_blocks=3 msgs=27 tools_bytes=30534 system_bytes=4120 bp_bytes=34654 prefix_bytes=34654 span_bytes=61200 ctx_fp=… tools_fp=9f3a… system_fp=… prefix_fp=… bp=tools:none,system:last,msgs:last ttl=5m bp_ttls=5m ttl_max=5m input=1200 read=0 creation=142579 creation_5m=142579 creation_1h=0 diverged=system:0@45 prefix_seen_ago_ms=- prefix_ttl_left_ms=- tools_seen_ago_ms=4210 tools_ttl_left_ms=295790 inflight_same_prefix=0 inflight_same_tools=0
 ```
 
 | field | source | notes |
@@ -379,12 +406,12 @@ cache trace client=claude-cli model=claude-opus-5-5 req_id=msg_01… status=200 
 | `tools_count` | entries in `tools` | 0 when absent |
 | `system_blocks` | system blocks | 1 for a string `system`, 0 when absent |
 | `msgs` | entries in `messages` | |
-| `tools_bytes` `system_bytes` `prefix_bytes` `span_bytes` | Definitions, Byte sizes | canonical bytes; `span_bytes=-` without any breakpoint |
+| `tools_bytes` `system_bytes` `bp_bytes` `prefix_bytes` `span_bytes` | Definitions, Byte sizes | canonical bytes; `bp_bytes=-` without a prefix breakpoint, `span_bytes=-` without any |
 | `ctx_fp` `tools_fp` `system_fp` `prefix_fp` | Definitions | 16 hex |
 | `bp` `bp_ttls` `ttl` `ttl_max` | Definitions | |
 | `input` `read` `creation` | `usage.input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` | `-` when no usage was seen |
 | `creation_5m` `creation_1h` | `usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` | `-` when the `cache_creation` object is absent |
-| `diverged` `prefix_seen_ago_ms` `tools_seen_ago_ms` `inflight_same_prefix` `inflight_same_tools` | Definitions | |
+| `diverged` `prefix_seen_ago_ms` `prefix_ttl_left_ms` `tools_seen_ago_ms` `tools_ttl_left_ms` `inflight_same_prefix` `inflight_same_tools` | Definitions | |
 
 Hashes, sizes and offsets only; no block content is ever logged.
 
@@ -427,7 +454,7 @@ released exactly once on every path.
   as `sequential`. When the outcome is known to be a failure (a non-2xx
   status, or a drop before any status), in both the prefix and the tools
   table: if the entry's `last_seq` is still this guard's `seq` (nothing was
-  sent since), restore `last_sent` from `prev`; if `prev` is empty this was
+  sent since), restore `last_sent` and `expires_at` from `prev`; if `prev` is empty this was
   the key's first send and nothing later touched it, so remove the entry.
   Rollback is one level deep: `prev` is cleared after the restore.
   - Consecutive failures F1, F2 on a key last seen at t0: F1 rolls back to
@@ -471,8 +498,11 @@ empty match. Only `cache trace` lines are read. Output, one section per
    (the response's split disagrees with the layout), lines with `status`
    not 2xx, lines with `read=-`, lines with `diverged` offsets `?` or a `+`
    tail, the `fallback` count, lines violating either recency/in-flight
-   invariant (expect 0), and the share of non-streaming lines (whose
-   in-flight window is overstated).
+   invariant (expect 0), lines where `bp_bytes` is not non-decreasing or
+   its last element differs from `prefix_bytes` (expect 0), lines where
+   `prefix_seen_ago_ms < ttl` and `prefix_ttl_left_ms >= 0` disagree
+   (non-zero only when a client changed TTL between sends), and the share
+   of non-streaming lines (whose in-flight window is overstated).
 
 ### Cost
 
@@ -517,6 +547,15 @@ column.
    moment as seen from the gateway; for non-streaming ones the headers come
    after generation, so the in-flight window is overstated. The `streaming`
    column and the sanity share make the affected lines visible.
+5. **A refresh takes the refreshing request's TTL.** The documentation says
+   an entry's lifetime restarts at the start of any request that writes or
+   reads it, and says nothing about which TTL applies when the reader's
+   breakpoint TTL differs from the writer's. The tables set `expires_at`
+   from the touching request's own TTL (`ttl` for the prefix table,
+   `b1_ttl` for the tools table). For a client whose TTL never changes,
+   which is every client seen so far, any reading of the rule gives the
+   same answer; the sanity line counts the lines where readings would
+   differ.
 
 ## Testing
 
@@ -533,17 +572,23 @@ column.
   `none`, `ctx`, tools and system offsets, message index, `@+`, `@-`, and
   `@?` when the previous slot exceeded the 512 KB byte budget, and
   `msgs:4096+` when the difference lies past the hash cap; `ttl_max` across
-  tools, system, message and automatic breakpoints; Tracker
+  tools, system, message and automatic breakpoints; `bp_bytes` for a 1h
+  tools breakpoint followed by a 5m system one; Tracker
   semantics: A, B, A, B interleaving gives the third send the first send's
   timestamp; two sends on one key before the first has begun give the
   second `inflight_same_prefix=1` and `prefix_seen_ago_ms` near 0; a second
   send after the first has begun but before it finished gives
-  `inflight_same_prefix=0`; the tools table answers `tools_seen_ago_ms` for
+  `inflight_same_prefix=0`; `prefix_ttl_left_ms` goes negative once the
+  writer's TTL has elapsed even when the asking request carries `1h` (the
+  Tracker takes `now` as a parameter so tests drive the clock); a send
+  without a prefix breakpoint reads the prefix table but neither inserts
+  nor refreshes; `system:1` of two blocks and `system:last` of the same two
+  map to one prefix key; the tools table answers `tools_seen_ago_ms` for
   a request whose prefix key is new, and `inflight_same_tools=1` while that
   earlier request has not begun; eviction never removes an entry whose
   response has not begun and refuses when none is evictable; failure
   rollback in both tables (single failure, consecutive failures, the
-  documented F1/S2 boundary).
+  documented F1/S2 boundary), restoring `expires_at` as well.
 - **`lib.rs` tap tests**: extend the `message_start` fixture with `id`,
   `model` and a nested `cache_creation` object; assert the four new
   `UpstreamUsage` fields for SSE and for a JSON body; `Absent` and the
@@ -563,8 +608,10 @@ column.
   case of Assumption 1.
 - **Report**: `tests/fixtures/cache-trace/sample.log`, a hand-written log
   covering every bucket and sub-class, the B1 line with its overlap and
-  per-bucket breakdown, a mixed-TTL request whose `prefix_est` is weighted
-  at `ttl` and `tools_est` at `b1_ttl`, the fallback rule, the `?` offset
+  per-bucket breakdown, a mixed-TTL prefix whose `prefix_est` is weighted
+  segment by segment from `bp_bytes` and `bp_ttls` and whose `tools_est` is
+  weighted at `b1_ttl`, a line where `prefix_seen_ago_ms < ttl` yet
+  `prefix_ttl_left_ms < 0`, the fallback rule, the `?` offset
   and a `+` tail across two models and both clients; a `#[test]` runs the
   script on it and compares against an expected output file.
 
