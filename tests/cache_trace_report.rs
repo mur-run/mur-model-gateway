@@ -2,6 +2,8 @@
 //! mixed-TTL weighting, the B1 line with its overlap, the fallback rule and
 //! the sanity counters, with the numbers worked out in the plan
 //! (docs/superpowers/plans/2026-10-13-cache-trace.md, Task 5).
+//! Unix only: on Windows `bash` resolves to the WSL launcher, not Git Bash.
+#![cfg(unix)]
 
 use std::process::Command;
 
