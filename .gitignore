@@ -2,6 +2,7 @@
 /.worktrees
 Cargo.lock
 *.log
+!tests/fixtures/**/*.log
 *.swp
 .DS_Store
 .env
