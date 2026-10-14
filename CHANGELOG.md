@@ -12,6 +12,15 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+### Fixed
+
+- `scripts/setup.sh` waits for the old service to drain before registering the
+  new one. `launchctl bootout` returns while the gateway is still finishing its
+  in-flight requests, so an immediate `bootstrap` failed with
+  `Bootstrap failed: 5: Input/output error` and the script stopped before its
+  post-install check (#45). The wait is bounded by `DRAIN_TIMEOUT` (default
+  300 s) and prints one line while it waits.
+
 ## v0.6.1 — 2026-10-14
 
 **Upgrade: yes** — any client that reads files in slices (Claude Code's `Read`

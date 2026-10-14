@@ -14,6 +14,7 @@
 #   ./scripts/setup.sh -- --token-source env:MUR_MODEL_GATEWAY_OAUTH_TOKEN --bind 127.0.0.1:9099
 #                                   # everything after -- goes to `mur-model-gateway install`
 #   INSTALL_DIR=~/bin ./scripts/setup.sh   # override install location
+#   DRAIN_TIMEOUT=600 ./scripts/setup.sh   # seconds to wait for the old service to drain (default 300)
 
 set -euo pipefail
 
@@ -21,6 +22,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_PATH="$INSTALL_DIR/mur-model-gateway"
 SERVICE_LABEL="run.mur-model-gateway"
+# How long teardown waits for the old service to drain before giving up.
+# Matches the ExitTimeOut the service file asks for (src/install.rs).
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
 # Listen address the post-install check looks at. Set by resolve_bind from
 # `--bind` after `--`; these are the gateway's own defaults (DEFAULT_BIND in
 # src/lib.rs) for when no --bind is given.
@@ -46,6 +50,7 @@ teardown_service() {
     macos)
       if launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1; then
         launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true
+        wait_for_bootout
       fi
       ;;
     linux)
@@ -56,6 +61,29 @@ teardown_service() {
       fi
       ;;
   esac
+}
+
+# `launchctl bootout` returns while the old gateway is still draining its
+# in-flight requests (SIGTERM grace, bounded by the plist's ExitTimeOut), and
+# the label stays registered until that process exits. A `bootstrap` in that
+# window fails with "Bootstrap failed: 5: Input/output error" (#45), so poll
+# until the label is gone. Observed drain: ~3 min while a long stream finished.
+wait_for_bootout() {
+  local waited=0
+  while launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1; do
+    if (( waited == 0 )); then
+      log "waiting for the old service to finish its in-flight requests (up to ${DRAIN_TIMEOUT}s)"
+    fi
+    if (( waited >= DRAIN_TIMEOUT )); then
+      err "old service still registered after ${DRAIN_TIMEOUT}s; bootstrap will likely fail"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if (( waited > 0 )); then
+    ok "old service gone after ${waited}s"
+  fi
 }
 
 start_service() {
