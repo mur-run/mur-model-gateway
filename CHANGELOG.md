@@ -12,6 +12,17 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+### Fixed
+
+- Reading a file in slices no longer collapses the earlier slices. The stale
+  pass treated any later read of the same path as superseding, so reading
+  lines 101-200 turned lines 1-100 into a `superseded` stub and the model went
+  back to re-read them, slice after slice. A later read now supersedes an
+  earlier one only when it is the same view: same tool and identical input
+  (path plus `offset`/`limit`). An edit of the file still supersedes every
+  read of it. Applies to Claude Code's `Read` and the MUR runtime's
+  `read_file` on the Anthropic, OpenAI/Codex and Gemini paths.
+
 ## v0.6.0 — 2026-10-14
 
 **Upgrade: yes** — the MUR agent runtime's `read_file` results reach the model

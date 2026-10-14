@@ -270,6 +270,8 @@ fn stale_stub(
 /// [`compute_stale_reasons`] is shared across Anthropic/OpenAI/Gemini.
 struct StaleCandidate {
     path: Option<String>,
+    /// What the call asked to see, from [`view_key`].
+    view: String,
     is_read: bool,
     text: String,
 }
@@ -292,22 +294,42 @@ fn file_path_of(input: Option<&Value>) -> Option<String> {
         .map(String::from)
 }
 
+/// The identity of what a read asked to see: the tool name plus its whole
+/// input. Two reads with the same view show the same bytes (barring an edit
+/// in between), so the earlier is stale; a different slice of the same file
+/// (`offset`/`limit`) is a different view and stays. Collapsing an earlier
+/// slice because a later one exists sent the model back to re-read lines it
+/// already had, slice after slice. `Value` keeps object keys sorted (no
+/// `preserve_order` feature), so the key is independent of the order the
+/// model emitted them in. Non-read calls are never compared by view, so
+/// their input (a whole file, for `Write`) is not serialised.
+fn view_key(name: &str, input: Option<&Value>) -> String {
+    if !is_read_tool(name) {
+        return String::new();
+    }
+    let input = input.map(Value::to_string).unwrap_or_default();
+    format!("{name}\u{1f}{input}")
+}
+
 /// Decide which `candidates` (in transcript order) are provably stale: a
-/// Read whose file was read or edited again later, or a byte-exact duplicate
-/// of a later result. The most recent view of any given path, and every
-/// non-Read result, is left alone (`None`) — that's the content an in-flight
-/// `Edit`'s `old_string` may still anchor against. Purely a function of the
-/// input order/content, so repeated calls on the same transcript prefix
-/// produce identical decisions (stable under prefix caching); a path's
-/// collapse decision can only flip forward in time, the one turn a
-/// superseding event first appears.
+/// Read whose file was edited later, a Read whose exact view was read again
+/// later, or a byte-exact duplicate of a later result. The most recent copy
+/// of any given view, and every non-Read result, is left alone (`None`) —
+/// that's the content an in-flight `Edit`'s `old_string` may still anchor
+/// against. Purely a function of the input order/content, so repeated calls
+/// on the same transcript prefix produce identical decisions (stable under
+/// prefix caching); a collapse decision can only flip forward in time, the
+/// one turn a superseding event first appears.
 fn compute_stale_reasons(candidates: &[StaleCandidate]) -> Vec<Option<StaleReason>> {
-    // Last event index touching each path, so a Read not in that slot is
-    // provably superseded by something later.
-    let mut path_last_idx: HashMap<&str, usize> = HashMap::new();
+    // Last non-read event (an Edit, a Write, …) per path and last read per
+    // view: a Read behind either slot is provably superseded.
+    let mut path_last_touch: HashMap<&str, usize> = HashMap::new();
+    let mut view_last_idx: HashMap<&str, usize> = HashMap::new();
     for (i, c) in candidates.iter().enumerate() {
-        if let Some(p) = &c.path {
-            path_last_idx.insert(p.as_str(), i);
+        if c.is_read {
+            view_last_idx.insert(c.view.as_str(), i);
+        } else if let Some(p) = &c.path {
+            path_last_touch.insert(p.as_str(), i);
         }
     }
 
@@ -315,7 +337,8 @@ fn compute_stale_reasons(candidates: &[StaleCandidate]) -> Vec<Option<StaleReaso
     for (i, c) in candidates.iter().enumerate() {
         if c.is_read
             && let Some(p) = &c.path
-            && path_last_idx.get(p.as_str()) != Some(&i)
+            && (path_last_touch.get(p.as_str()).is_some_and(|&t| t > i)
+                || view_last_idx.get(c.view.as_str()) != Some(&i))
         {
             reason[i] = Some(StaleReason::SupersededPath(p.clone()));
         }
@@ -349,8 +372,8 @@ fn collapse_stale_tool_results_anthropic(
         return false;
     };
 
-    // tool_use_id -> (tool name, file_path if any)
-    let mut tool_meta: HashMap<String, (String, Option<String>)> = HashMap::new();
+    // tool_use_id -> (tool name, file_path if any, view)
+    let mut tool_meta: HashMap<String, (String, Option<String>, String)> = HashMap::new();
     for msg in messages {
         if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
@@ -370,8 +393,9 @@ fn collapse_stale_tool_results_anthropic(
                 .and_then(|n| n.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let path = file_path_of(block.get("input"));
-            tool_meta.insert(id.to_string(), (name, path));
+            let input = block.get("input");
+            let view = view_key(&name, input);
+            tool_meta.insert(id.to_string(), (name, file_path_of(input), view));
         }
     }
     if tool_meta.is_empty() {
@@ -391,7 +415,7 @@ fn collapse_stale_tool_results_anthropic(
             let Some(tool_use_id) = block.get("tool_use_id").and_then(|t| t.as_str()) else {
                 continue;
             };
-            let Some((name, path)) = tool_meta.get(tool_use_id) else {
+            let Some((name, path, view)) = tool_meta.get(tool_use_id) else {
                 continue;
             };
             let Some(inner) = block.get("content") else {
@@ -406,6 +430,7 @@ fn collapse_stale_tool_results_anthropic(
             locators.push((msg_idx, block_idx));
             candidates.push(StaleCandidate {
                 path: path.clone(),
+                view: view.clone(),
                 is_read: is_read_tool(name),
                 text,
             });
@@ -449,8 +474,8 @@ fn collapse_stale_tool_results_openai(
         return false;
     };
 
-    // tool_call_id -> (function name, file_path if any)
-    let mut tool_meta: HashMap<String, (String, Option<String>)> = HashMap::new();
+    // tool_call_id -> (function name, file_path if any, view)
+    let mut tool_meta: HashMap<String, (String, Option<String>, String)> = HashMap::new();
     for msg in messages {
         let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array()) else {
             continue;
@@ -468,12 +493,12 @@ fn collapse_stale_tool_results_openai(
                 .unwrap_or_default()
                 .to_string();
             // `arguments` is a JSON-encoded string per the OpenAI wire format.
-            let path = func
+            let args = func
                 .get("arguments")
                 .and_then(|a| a.as_str())
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .and_then(|v| file_path_of(Some(&v)));
-            tool_meta.insert(id.to_string(), (name, path));
+                .and_then(|s| serde_json::from_str::<Value>(s).ok());
+            let view = view_key(&name, args.as_ref());
+            tool_meta.insert(id.to_string(), (name, file_path_of(args.as_ref()), view));
         }
     }
     if tool_meta.is_empty() {
@@ -489,7 +514,7 @@ fn collapse_stale_tool_results_openai(
         let Some(tool_call_id) = msg.get("tool_call_id").and_then(|t| t.as_str()) else {
             continue;
         };
-        let Some((name, path)) = tool_meta.get(tool_call_id) else {
+        let Some((name, path, view)) = tool_meta.get(tool_call_id) else {
             continue;
         };
         let Some(content) = msg.get("content") else {
@@ -504,6 +529,7 @@ fn collapse_stale_tool_results_openai(
         locators.push(msg_idx);
         candidates.push(StaleCandidate {
             path: path.clone(),
+            view: view.clone(),
             is_read: is_read_tool(name),
             text,
         });
@@ -544,7 +570,9 @@ fn collapse_stale_tool_results_gemini(
         return false;
     };
 
-    let mut pending_paths: HashMap<String, std::collections::VecDeque<Option<String>>> =
+    // function name -> (file_path if any, view) per call still awaiting its
+    // response, FIFO
+    let mut pending_meta: HashMap<String, std::collections::VecDeque<(Option<String>, String)>> =
         HashMap::new();
     let mut locators: Vec<(usize, usize)> = Vec::new(); // (content_idx, part_idx)
     let mut candidates: Vec<StaleCandidate> = Vec::new();
@@ -559,18 +587,22 @@ fn collapse_stale_tool_results_gemini(
                     .and_then(|n| n.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let path = file_path_of(fc.get("args"));
-                pending_paths.entry(name).or_default().push_back(path);
+                let args = fc.get("args");
+                let view = view_key(&name, args);
+                pending_meta
+                    .entry(name)
+                    .or_default()
+                    .push_back((file_path_of(args), view));
                 continue;
             }
             let Some(fr) = part.get("functionResponse") else {
                 continue;
             };
             let name = fr.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-            let path = pending_paths
+            let (path, view) = pending_meta
                 .get_mut(name)
                 .and_then(|q| q.pop_front())
-                .flatten();
+                .unwrap_or_default();
             let Some(response) = fr.get("response") else {
                 continue;
             };
@@ -588,6 +620,7 @@ fn collapse_stale_tool_results_gemini(
             locators.push((content_idx, part_idx));
             candidates.push(StaleCandidate {
                 path,
+                view,
                 is_read: is_read_tool(name),
                 text,
             });
@@ -1438,6 +1471,130 @@ mod tests {
         assert_eq!(last, "fn main() { x }\n", "latest view untouched");
     }
 
+    /// Two slices of one file are two views: reading lines 101-200 does not
+    /// make lines 1-100 stale. Collapsing the earlier slice is what sent the
+    /// model back to re-read lines it had already seen, slice after slice.
+    #[test]
+    fn sliced_reads_of_the_same_path_are_different_views() {
+        let (_dir, engine) = test_engine();
+        let head = "fn a() {}\n".repeat(5);
+        let tail = "fn b() {}\n".repeat(5);
+        let mut messages = Vec::new();
+        for (id, offset, text) in [
+            ("toolu_s1", 1, head.as_str()),
+            ("toolu_s2", 101, tail.as_str()),
+        ] {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "read_file",
+                 "input": {"path": "src/main.rs", "offset": offset, "limit": 100}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": text}
+            ]}));
+        }
+        let mut root = json!({"messages": messages});
+        assert!(
+            !collapse_stale_tool_results_anthropic(
+                &engine,
+                &Memo::new(1),
+                &mut Summary::default(),
+                &mut root
+            ),
+            "a different slice of the same file is not a superseding read"
+        );
+        let first = root["messages"][1]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(first, head, "earlier slice kept verbatim");
+        let second = root["messages"][3]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(second, tail);
+    }
+
+    /// The same slice read again is the same view, whatever order the model
+    /// wrote the input keys in: the earlier copy is stale.
+    #[test]
+    fn same_slice_read_twice_collapses_the_earlier() {
+        let (_dir, engine) = test_engine();
+        let original = "fn a() {}\n".repeat(5);
+        let mut messages = Vec::new();
+        for (id, input, text) in [
+            (
+                "toolu_r1",
+                json!({"offset": 1, "limit": 100, "path": "src/main.rs"}),
+                original.as_str(),
+            ),
+            (
+                "toolu_r2",
+                json!({"path": "src/main.rs", "limit": 100, "offset": 1}),
+                "fn a() { x }\n",
+            ),
+        ] {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "read_file", "input": input}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": text}
+            ]}));
+        }
+        let mut root = json!({"messages": messages});
+        assert!(collapse_stale_tool_results_anthropic(
+            &engine,
+            &Memo::new(1),
+            &mut Summary::default(),
+            &mut root
+        ));
+        let first = root["messages"][1]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            first.contains("superseded"),
+            "same view read again: {first}"
+        );
+        let second = root["messages"][3]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(second, "fn a() { x }\n", "latest view untouched");
+    }
+
+    /// An edit of the file supersedes every slice of it, as before.
+    #[test]
+    fn sliced_read_followed_by_edit_of_same_path_is_superseded() {
+        let (_dir, engine) = test_engine();
+        let original = "fn a() {}\n".repeat(5);
+        let mut root = json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_s1", "name": "read_file",
+                 "input": {"path": "src/main.rs", "offset": 1, "limit": 100}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_s1", "content": original}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_e1", "name": "Edit",
+                 "input": {"file_path": "src/main.rs", "old_string": "a", "new_string": "b"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_e1", "content": "edited 1 line"}
+            ]},
+        ]});
+        assert!(collapse_stale_tool_results_anthropic(
+            &engine,
+            &Memo::new(1),
+            &mut Summary::default(),
+            &mut root
+        ));
+        let first = root["messages"][1]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(first.contains("superseded"), "edited later: {first}");
+        let second = root["messages"][3]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(second, "edited 1 line");
+    }
+
     #[test]
     fn compresses_fat_string_tool_result_and_preserves_siblings() {
         let (_dir, engine) = test_engine();
@@ -2046,6 +2203,43 @@ mod tests {
     }
 
     #[test]
+    fn openai_sliced_reads_are_different_views() {
+        let (_dir, engine) = test_engine();
+        let head = "def a():\n    pass\n".repeat(5);
+        let tail = "def b():\n    pass\n".repeat(5);
+        let mut root = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {
+                        "name": "Read",
+                        "arguments": "{\"file_path\": \"src/foo.py\", \"offset\": 1, \"limit\": 50}"
+                    }}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": head},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_2", "type": "function", "function": {
+                        "name": "Read",
+                        "arguments": "{\"file_path\": \"src/foo.py\", \"offset\": 51, \"limit\": 50}"
+                    }}
+                ]},
+                {"role": "tool", "tool_call_id": "call_2", "content": tail},
+            ],
+        });
+        assert!(
+            !collapse_stale_tool_results_openai(
+                &engine,
+                &Memo::new(1),
+                &mut Summary::default(),
+                &mut root
+            ),
+            "a different slice of the same file is not a superseding read"
+        );
+        assert_eq!(root["messages"][1]["content"].as_str().unwrap(), head);
+        assert_eq!(root["messages"][3]["content"].as_str().unwrap(), tail);
+    }
+
+    #[test]
     fn openai_exact_duplicate_collapses_to_last() {
         let (_dir, engine) = test_engine();
         let repeated = "npm test\n".to_string() + &"PASS\n".repeat(50);
@@ -2108,6 +2302,48 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(second, "class Foo:\n    x = 1\n");
+    }
+
+    #[test]
+    fn gemini_sliced_reads_are_different_views() {
+        let (_dir, engine) = test_engine();
+        let head = "class A:\n    pass\n".repeat(5);
+        let tail = "class B:\n    pass\n".repeat(5);
+        let mut root = json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "Read",
+                     "args": {"file_path": "src/foo.py", "offset": 1, "limit": 50}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "Read", "response": {"result": head}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "Read",
+                     "args": {"file_path": "src/foo.py", "offset": 51, "limit": 50}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "Read", "response": {"result": tail}}}
+                ]},
+            ]
+        });
+        assert!(
+            !collapse_stale_tool_results_gemini(
+                &engine,
+                &Memo::new(1),
+                &mut Summary::default(),
+                &mut root
+            ),
+            "a different slice of the same file is not a superseding read"
+        );
+        let first = root["contents"][1]["parts"][0]["functionResponse"]["response"]["result"]
+            .as_str()
+            .unwrap();
+        assert_eq!(first, head);
+        let second = root["contents"][3]["parts"][0]["functionResponse"]["response"]["result"]
+            .as_str()
+            .unwrap();
+        assert_eq!(second, tail);
     }
 
     #[test]
