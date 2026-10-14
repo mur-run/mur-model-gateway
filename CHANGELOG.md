@@ -12,6 +12,12 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+## v0.6.1 — 2026-10-14
+
+**Upgrade: yes** — any client that reads files in slices (Claude Code's `Read`
+with `offset`/`limit`, the MUR runtime's `read_file`) was losing the earlier
+slices and re-reading them. Re-run `setup.sh` / `install-release.sh`.
+
 ### Fixed
 
 - Reading a file in slices no longer collapses the earlier slices. The stale
