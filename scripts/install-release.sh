@@ -10,6 +10,7 @@
 #   ./install-release.sh 0.3.0        # a specific version
 #   ./install-release.sh --no-service # install the binary only, don't register
 #   INSTALL_DIR=~/bin ./install-release.sh
+#   DRAIN_TIMEOUT=600 ./install-release.sh  # wait longer for the old service to drain (default 300s)
 set -euo pipefail
 
 REPO=mur-run/mur-model-gateway
@@ -25,6 +26,8 @@ BIND_ADDR=127.0.0.1:8088
 
 VERSION=""
 WITH_SERVICE=1
+# Seconds to wait for the old service to drain before re-registering (#45).
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
 for arg in "$@"; do
   case "$arg" in
     --no-service) WITH_SERVICE=0 ;;
@@ -88,6 +91,18 @@ case "$PLATFORM" in
   macos)
     PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
     launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true
+    # bootout returns while the old gateway is still draining its in-flight
+    # requests; the label stays registered until it exits, and a bootstrap in
+    # that window fails with "Bootstrap failed: 5" (#45). Wait it out.
+    waited=0
+    while launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1; do
+      [ "$waited" -eq 0 ] && log "waiting for the old service to finish its in-flight requests (up to ${DRAIN_TIMEOUT}s)"
+      if [ "$waited" -ge "$DRAIN_TIMEOUT" ]; then
+        err "old service still registered after ${DRAIN_TIMEOUT}s; bootstrap will likely fail"
+        break
+      fi
+      sleep 1; waited=$((waited + 1))
+    done
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     launchctl enable "gui/$(id -u)/$SERVICE_LABEL"
     ;;

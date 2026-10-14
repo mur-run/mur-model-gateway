@@ -19,7 +19,8 @@ release is worth interrupting a working install for; the ones that are say so.
   in-flight requests, so an immediate `bootstrap` failed with
   `Bootstrap failed: 5: Input/output error` and the script stopped before its
   post-install check (#45). The wait is bounded by `DRAIN_TIMEOUT` (default
-  300 s) and prints one line while it waits.
+  300 s) and prints one line while it waits. `scripts/install-release.sh` had
+  the same back-to-back `bootout` / `bootstrap` and gets the same wait.
 
 ## v0.6.1 — 2026-10-14
 
