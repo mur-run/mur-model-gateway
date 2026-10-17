@@ -69,6 +69,7 @@ struct Upstream {
     /// When set, the first 401 rewrites this file with `FRESH` — the other
     /// terminal, mid-request.
     rewrite: Option<PathBuf>,
+    rewrite_delay: Duration,
     seen_auth: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
@@ -82,7 +83,15 @@ async fn messages(State(up): State<Upstream>, headers: HeaderMap) -> impl IntoRe
     );
     if n == 0 {
         if let Some(p) = &up.rewrite {
-            write_credential(p, FRESH, 60 * 60 * 1000);
+            if up.rewrite_delay.is_zero() {
+                write_credential(p, FRESH, 60 * 60 * 1000);
+            } else {
+                let p = p.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(up.rewrite_delay).await;
+                    write_credential(&p, FRESH, 60 * 60 * 1000);
+                });
+            }
         }
         return (
             StatusCode::UNAUTHORIZED,
@@ -138,6 +147,7 @@ async fn a_store_that_changed_under_a_rejection_is_retried() {
     let upstream = spawn_upstream(Upstream {
         hits: hits.clone(),
         rewrite: Some(cred.clone()),
+        rewrite_delay: Duration::ZERO,
         seen_auth: seen.clone(),
     })
     .await;
@@ -168,6 +178,41 @@ async fn a_store_that_changed_under_a_rejection_is_retried() {
     }
 }
 
+/// A background refresh finishes only after the rejected response has arrived.
+#[tokio::test]
+async fn a_store_rotated_after_the_401_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let cred = dir.path().join("credentials.json");
+    write_credential(&cred, STALE, 60 * 60 * 1000);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream = spawn_upstream(Upstream {
+        hits: hits.clone(),
+        rewrite: Some(cred.clone()),
+        rewrite_delay: Duration::from_millis(100),
+        seen_auth: seen.clone(),
+    })
+    .await;
+    let gw = spawn_gateway(upstream, TokenSource::CredentialsFile(cred)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    #[cfg(has_beta_hook)]
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            Some(format!("Bearer {STALE}")),
+            Some(format!("Bearer {FRESH}"))
+        ]
+    );
+}
+
 /// The common case, and the one the old wording got wrong: nothing has
 /// changed, so there is nothing to retry with. The client gets the actionable
 /// body naming its own credential store — not upstream's opaque one, and not
@@ -182,6 +227,7 @@ async fn an_unchanged_store_is_not_retried_and_says_so() {
     let upstream = spawn_upstream(Upstream {
         hits: hits.clone(),
         rewrite: None,
+        rewrite_delay: Duration::ZERO,
         seen_auth: Arc::new(std::sync::Mutex::new(Vec::new())),
     })
     .await;
@@ -227,6 +273,7 @@ async fn a_client_supplied_credential_401_is_forwarded_untouched() {
     let upstream = spawn_upstream(Upstream {
         hits: hits.clone(),
         rewrite: Some(cred.clone()),
+        rewrite_delay: Duration::ZERO,
         seen_auth: Arc::new(std::sync::Mutex::new(Vec::new())),
     })
     .await;
@@ -267,6 +314,7 @@ async fn an_upstream_success_is_left_alone() {
     let upstream = spawn_upstream(Upstream {
         hits: hits.clone(),
         rewrite: None,
+        rewrite_delay: Duration::ZERO,
         seen_auth: Arc::new(std::sync::Mutex::new(Vec::new())),
     })
     .await;

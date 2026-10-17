@@ -11,6 +11,7 @@
 //! `MUR_MODEL_GATEWAY_COMPRESS=1`) applies to tool_result blocks for the other three
 //! providers.
 
+mod anthropic_retry;
 pub mod cache_trace;
 pub mod cc_version;
 pub mod codex;
@@ -1189,8 +1190,10 @@ async fn forward(state: AppState, req: Request) -> anyhow::Result<Response<Body>
     // report NoChange, arm a 15-minute cooldown, and make the client-facing
     // 401 claim a refresh had been tried. The retry itself was the half that
     // worked; it was gated behind the half that could not.
-    let refreshed: Option<String> = match (anthropic_expiry, anthropic_source.resolve()) {
-        (Some(_), Ok(Some(stored))) if Some(&stored) != override_token.as_ref() => Some(stored),
+    let refreshed: Option<String> = match (anthropic_expiry, override_token.as_deref()) {
+        (Some(_), Some(rejected)) => {
+            anthropic_retry::wait_for_rotation(anthropic_source, rejected).await
+        }
         _ => None,
     };
     if let Some(fresh) = refreshed.as_deref() {
