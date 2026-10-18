@@ -12,8 +12,21 @@ release is worth interrupting a working install for; the ones that are say so.
 
 ## Unreleased
 
+## v0.6.2 — 2026-10-18
+
+**Upgrade: yes** — if Claude Code rotates its OAuth token while a request is
+in flight, the gateway now picks up the new token and retries instead of
+passing a 401 to the client. Re-run `setup.sh` / `install-release.sh`.
+
 ### Fixed
 
+- After an Anthropic 401, the gateway waits up to 500 ms for the credential
+  owner (Claude Code, via the keychain or `credentials.json`) to publish a
+  replacement token, then retries once with it (#46). Before, it checked the
+  store only once, right away, and often still saw the rejected token, so the
+  401 went to the client. It still never refreshes credentials itself and never
+  resends the rejected token. The keychain cache is invalidated between polls
+  so a rotated item is actually seen.
 - `scripts/setup.sh` waits for the old service to drain before registering the
   new one. `launchctl bootout` returns while the gateway is still finishing its
   in-flight requests, so an immediate `bootstrap` failed with
